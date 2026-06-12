@@ -22,6 +22,24 @@ eclipse-zenoh = ">=1.0"
 [activation.env]
 PYTHONNOUSERSITE = "1"
 
+# ROS 2 Jazzy via RoboStack (ADR-0006), opt-in: `pixi run -e ros2 ...`.
+# RoboStack pins python to 3.12; the default env solves separately and is unaffected.
+[feature.ros2]
+channels = ["robostack-jazzy"]
+
+[feature.ros2.dependencies]
+python = "3.12.*"
+ros-jazzy-ros-base = "*"
+ros-jazzy-rmw-zenoh-cpp = "*"
+ros-jazzy-demo-nodes-py = "*"
+ros-jazzy-rviz2 = "*"
+
+[feature.ros2.tasks]
+ros2-smoke = "pytest tests/test_ros2_smoke.py -v"
+
+[environments]
+ros2 = ["ros2"]
+
 [tasks]
 test = "pytest tests -v"
 sudo-test = "sudo $(which python) -m pytest tests -v -m sudo"
