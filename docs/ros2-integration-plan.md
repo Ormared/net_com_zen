@@ -1,0 +1,89 @@
+# ROS 2 Jazzy + Isaac Sim 6 integration plan
+
+Decisions in [ADR-0006](adr/0006-ros2-isaac-integration.md): orchestrator stays clock
+master; RoboStack-via-pixi; Isaac replaces mobility only; agent-mediated vs raw
+rmw_zenoh kept as an A/B axis. Phases are ordered so each lands value alone.
+
+## R1 — Environment bootstrap
+
+ROS 2 Jazzy as an opt-in pixi environment; default env untouched.
+
+- `pixi.toml`: `[feature.ros2]` with channel `robostack-jazzy`, deps
+  `ros-jazzy-ros-base`, `ros-jazzy-rmw-zenoh-cpp`, `ros-jazzy-rviz2`; environment
+  `ros2` = default + ros2 features. Python resolves to 3.12 (RoboStack pin) — within
+  the existing `>=3.11,<3.13` constraint, but verify `eclipse-zenoh` and the editable
+  install resolve under 3.12.
+- No colcon/ament packages yet: phase R2 publishes via `rclpy` with standard message
+  types only. Custom messages (and the `setuptools<=58.2` colcon pin) deferred until
+  actually needed.
+- Tasks: `pixi run -e ros2 ros2 ...`; smoke-test task (talker/listener).
+
+**Exit:** `ros2 topic echo` round-trip works in the pixi env on both Fast DDS and
+rmw_zenoh; default-env tests still green.
+
+## R2 — Observability bridge (RViz)
+
+`sim/netcom_zen/ros2_bridge/` — optional module, imported only when the run is
+started with `--ros2-viz` (orchestrator runs inside the `ros2` env then).
+
+- Publishes from the scenario clock: `/clock` (sim time), `/tf` (vehicle poses over
+  the heightmap), `MarkerArray` for links (color = PER/SINR, from the link-state
+  table), jammer entities and their active emissions, drop-cause event markers.
+- RViz config checked into `scenarios/` or `viz/`; `pixi run -e ros2 rviz` task.
+- Complements (does not replace) the viz-dashboard branch; both read the same
+  link-state/metrics surfaces.
+
+**Exit:** live RViz view of a jamming scenario — vehicles moving, links degrading,
+jammer markers — driven entirely by published sim time.
+
+## R3 — ROS 2 nodes in the loop (comms A/B)
+
+ROS 2 processes inside per-vehicle netns'es, telemetry workload crossing the
+emulated channel both ways of the A/B:
+
+- **Wiring A (agent-mediated):** a thin per-vehicle bridge node maps ROS 2 topics to
+  the local Rust agent (localhost zenoh session or unix socket inside the netns —
+  needs a small local-API addition to the agent). Agent remains the only channel
+  crosser: CRDT + MLS + link manager intact.
+- **Wiring B (raw rmw_zenoh):** `RMW_IMPLEMENTATION=rmw_zenoh_cpp` nodes per netns;
+  zenoh routers peer over the TUN interfaces. Router topology/config is the main
+  unknown — spike first.
+- Harness: launch/teardown of ROS 2 processes in netns'es (`ip netns exec` with the
+  pixi env), workload generator node (pose + telemetry publishing at fixed rate),
+  AoI/goodput extraction into the existing parquet pipeline.
+- Benchmark: same jamming sweep as the transport A/B; axis `wiring = agent | rmw_zenoh`.
+
+**Exit:** resilience curves (PDR / latency / AoI vs jammer power) for both wirings
+from one sweep definition; drop attribution still per-packet.
+
+## R4 — Isaac Sim 6 as MobilityProvider
+
+- Separate pixi environment `isaac` (pypi `isaacsim[all,extscache,ros2]==6.0.0.1`,
+  CUDA torch first, `extra-index-url pypi.nvidia.com`); tens of GB, never in default.
+- `IsaacMobilityProvider`: Isaac runs headless as a separate process; per scenario
+  tick the orchestrator steps it (ROS 2 Simulation Control `/step_simulation` with
+  N physics frames per 100 ms tick) and reads poses (`/tf` or entity-state service)
+  → `Pose`. Fallback if service round-trip dominates the tick: embed
+  `SimulationApp` in a dedicated stepper process with a leaner IPC.
+- Scene: flat ground + simple vehicle assets first (poses are all the channel needs);
+  terrain mesh from the existing DEM later so trajectories respect the same heights
+  the propagation model uses.
+- Determinism note recorded per run manifest: trajectories Isaac-sourced, not
+  seed-exact; channel RNG still seeded/replayable.
+
+**Exit:** an existing scenario runs end-to-end with Isaac mobility — same metrics
+pipeline, comparison run vs bicycle-kinematics mobility showing equivalent link-state
+dynamics at matched trajectories.
+
+## Risks / open questions
+
+- **rmw_zenoh router topology in netns'es (R3-B):** how routers discover/peer over
+  the emulated channel without leaking via the host. Mitigation: early spike, mgmt
+  plane stays unix-socket only.
+- **Agent local API (R3-A):** smallest useful surface — likely a localhost zenoh
+  listener with a fixed key-space mapping. Needs its own mini-design.
+- **Isaac step latency (R4):** service-driven lockstep at 10 Hz with rendering off
+  should hold; measure before building on it. Timing-integrity monitor already
+  flags overruns.
+- **Python 3.12 ripple:** if anything in the default env can't do 3.12, the ros2
+  env forks the version pin (pixi handles per-env pins; solve-groups would not).

@@ -9,6 +9,10 @@
 | **M4 — Satellite failover** ✅ | Satlink channel model, agent link manager, outage scenario | **DONE 2026-06-12:** clean fallback seamless (0.27 s swarm failover); under jamming the RF fallback's zenoh-over-TCP goodput collapses (sessions stay up via keepalives, no state crosses) → command isolated, link manager fires `link_down`. Reinforces the zenoh-over-UDP axis. |
 | **Transport A/B** ✅ | zenoh-over-TCP vs UDP/best-effort under jamming | **DONE 2026-06-12:** UDP/best-effort wins app goodput + AoI at every power despite lower frame PDR (TCP head-of-line blocking). See [results/transport-tcp-vs-udp.md](results/transport-tcp-vs-udp.md) |
 | **Sync A/B** ✅ | op-based delta vs state-based single-datagram snapshots | **DONE 2026-06-12:** state-based wins app goodput +21–29 % under jamming (no orphaning, no fragmentation); udp+state is +37 % over the tcp+delta baseline. See [results/sync-delta-vs-state.md](results/sync-delta-vs-state.md) |
+| **R1 — ROS 2 env** | ROS 2 Jazzy via RoboStack as opt-in pixi environment ([ADR-0006](adr/0006-ros2-isaac-integration.md), [plan](ros2-integration-plan.md)) | talker/listener round-trip on Fast DDS + rmw_zenoh in `pixi run -e ros2`; default env unaffected |
+| **R2 — RViz bridge** | Orchestrator publishes `/clock`, `/tf`, link/jammer markers; optional `--ros2-viz` | live RViz view of a jamming scenario on published sim time |
+| **R3 — ROS 2 in the loop** | ROS 2 nodes per netns; agent-mediated vs raw rmw_zenoh as A/B axis | resilience curves for both wirings from one sweep; per-packet drop attribution intact |
+| **R4 — Isaac Sim 6 mobility** | `IsaacMobilityProvider`, lockstep stepping, orchestrator stays clock master | existing scenario end-to-end on Isaac mobility; comparison vs bicycle kinematics |
 | **M5+** | Reactive jamming, routing comparisons, frequency-band sweeps, FEC/interleaving axis, Sionna RT pathloss backend | per-feature |
 
 Testing discipline throughout: unit tests per module; the model validation suite
