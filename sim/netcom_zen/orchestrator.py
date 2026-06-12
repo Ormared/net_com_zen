@@ -60,7 +60,9 @@ class ScenarioEngine:
                    "--listen", f"tcp/{self.topo.addrs[nid]}:{cfg.port}",
                    "--metrics", str(self.out_dir / f"agent_{nid}.jsonl"),
                    "--period-ms", str(cfg.period_ms),
-                   "--duration-s", str(self.scenario.duration_s)]
+                   "--duration-s", str(self.scenario.duration_s),
+                   "--full-every", str(cfg.full_every),
+                   "--wait-peers", str(len(self.topo.nodes) - 1)]
             for o in others:
                 cmd += ["--connect", o]
             agents[nid] = subprocess.Popen(cmd)

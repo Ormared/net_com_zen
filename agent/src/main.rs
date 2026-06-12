@@ -37,9 +37,16 @@ struct Args {
     /// Run duration in seconds
     #[arg(long, default_value_t = 10.0)]
     duration_s: f64,
+    /// Publish a full snapshot every N ticks (heals peers that missed
+    /// increments; lower = faster recovery, more bytes)
+    #[arg(long, default_value_t = 10)]
+    full_every: u64,
+    /// Wait for this many zenoh peers before starting telemetry (0 = no wait).
+    /// Increments published before links exist are lost and orphan all
+    /// subsequent increments at the receiver until the next full snapshot.
+    #[arg(long, default_value_t = 0)]
+    wait_peers: usize,
 }
-
-const FULL_EVERY: u64 = 20;
 
 fn now_us() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as u64
@@ -123,6 +130,21 @@ async fn main() -> Result<()> {
         "type": "start", "id": args.id, "ts_us": now_us()
     }));
 
+    if args.wait_peers > 0 {
+        let wait_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let n = session.info().peers_zid().await.count();
+            if n >= args.wait_peers || tokio::time::Instant::now() >= wait_deadline {
+                metrics.log(serde_json::json!({
+                    "type": "peers_ready", "id": args.id, "ts_us": now_us(),
+                    "n": n, "waited_for": args.wait_peers
+                }));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(args.duration_s);
     let mut ticker = tokio::time::interval(Duration::from_millis(args.period_ms));
     let mut peer_probe = tokio::time::interval(Duration::from_secs(1));
@@ -133,7 +155,7 @@ async fn main() -> Result<()> {
             _ = ticker.tick() => {
                 seq += 1;
                 update_own_entry(&mut doc, &args.id, seq)?;
-                let (kind, bytes) = if seq % FULL_EVERY == 0 {
+                let (kind, bytes) = if seq % args.full_every == 0 {
                     ("full", doc.save())
                 } else {
                     ("inc", doc.save_incremental())
