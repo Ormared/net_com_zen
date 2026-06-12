@@ -276,6 +276,13 @@ async fn main() -> Result<()> {
     metrics.log(serde_json::json!({
         "type": "final_state", "id": args.id, "ts_us": now_us(), "known": known
     }));
-    session.close().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    // best-effort: peers all close simultaneously over slow emulated links, so
+    // a close timeout is expected occasionally and must not fail the run
+    if let Err(e) = session.close().await {
+        metrics.log(serde_json::json!({
+            "type": "close_error", "id": args.id, "ts_us": now_us(),
+            "error": e.to_string()
+        }));
+    }
     Ok(())
 }

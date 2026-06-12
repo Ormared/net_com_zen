@@ -56,6 +56,8 @@ def test_aggregate_on_run_artifacts(tmp_path):
     (run / "agent_v2.jsonl").write_text(
         '{"type":"recv","from":"v1","peer_ts_us":900000,"ts_us":1000000}\n'
         '{"type":"final_state","ts_us":2000000}\n')
+    (run / "manifest.json").write_text(json.dumps(
+        {"scenario": {"jammers": [{"start_s": 0.25}]}}))
     (tmp_path / "sweep_manifest.json").write_text(json.dumps({
         "sweep": {"axes": {"a": [1]}},
         "cells": [{"name": "a=1__seed=7", "overrides": {"a": 1}, "seed": 7}]}))
@@ -64,3 +66,5 @@ def test_aggregate_on_run_artifacts(tmp_path):
     assert rows[0]["frame_pdr"] == pytest.approx(2 / 3)
     assert rows[0]["drop_counts"] == {"jam": 1}
     assert rows[0]["update_delivery"] == pytest.approx(1.0)
+    assert rows[0]["frame_pdr_prejam"] == pytest.approx(1.0)   # t=0.1,0.2 delivered
+    assert rows[0]["frame_pdr_postjam"] == pytest.approx(0.0)  # t=0.3 jammed

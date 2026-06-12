@@ -26,6 +26,18 @@ def run_metrics(run_dir: Path) -> dict:
     delivered = verdicts.get("delivered", 0)
     delays = sorted(r["delay_s"] for r in t if r["verdict"] == "delivered")
 
+    # pre/post-jam split: whole-run averages dilute the jamming effect
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    jam_start = min((j["start_s"] for j in manifest["scenario"]["jammers"]),
+                    default=None)
+    pdr_phase = {}
+    if jam_start is not None:
+        for phase, sel in (("prejam", lambda r: r["t"] < jam_start),
+                           ("postjam", lambda r: r["t"] >= jam_start)):
+            ph = [r for r in t if sel(r) and r["verdict"] != "no_link"]
+            dlv = sum(1 for r in ph if r["verdict"] == "delivered")
+            pdr_phase[f"frame_pdr_{phase}"] = dlv / len(ph) if ph else None
+
     aoi = aoi_summary(run_dir)
     aoi_means = [s["mean_s"] for peers in aoi.values() for s in peers.values()]
     pair_count = sum(len(peers) for peers in aoi.values())
@@ -41,6 +53,7 @@ def run_metrics(run_dir: Path) -> dict:
 
     return {
         "frame_pdr": delivered / relevant if relevant else None,
+        **pdr_phase,
         "drop_counts": {v: n for v, n in verdicts.items() if v != "delivered"},
         "median_delay_ms": delays[len(delays) // 2] * 1e3 if delays else None,
         "mean_aoi_s": statistics.mean(aoi_means) if aoi_means else None,
@@ -71,6 +84,7 @@ def plot_curves(rows: list[dict], sweep_dir: Path, x_axis: str,
 
     written = []
     for metric, label in [("frame_pdr", "Frame PDR"),
+                          ("frame_pdr_postjam", "Frame PDR (jammer active)"),
                           ("update_delivery", "State-update delivery ratio"),
                           ("mean_aoi_s", "Mean age of information (s)"),
                           ("median_delay_ms", "Median delivery latency (ms)")]:
@@ -111,7 +125,9 @@ def main() -> None:
     args = ap.parse_args()
     sweep_dir = Path(args.sweep_dir)
     manifest = json.loads((sweep_dir / "sweep_manifest.json").read_text())
-    axes = list(manifest["sweep"].get("axes", {}))
+    # default plot axes: the sweep axes that actually vary
+    axes = [a for a, vals in manifest["sweep"].get("axes", {}).items()
+            if len(set(map(str, vals))) > 1]
     x_axis = args.x or (axes[0] if axes else "seed")
     series_axis = args.series or (axes[1] if len(axes) > 1 else None)
 

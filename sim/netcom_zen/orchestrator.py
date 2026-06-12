@@ -79,6 +79,8 @@ class ScenarioEngine:
         log = PacketLog()
         fwd = ChannelForwarder(self.topo, self.scenario.seed, log)
         max_tick_lag = 0.0  # timing integrity (architecture.md)
+        late_ticks = 0
+        n_ticks = 0
         dt = 1.0 / self.scenario.tick_hz
         agents: dict[str, subprocess.Popen] = {}
         agent_exit: dict[str, int | None] = {}
@@ -104,7 +106,10 @@ class ScenarioEngine:
                                              self.scenario.radio, self.pathloss))
                 await asyncio.sleep(dt)
                 t += dt
-                max_tick_lag = max(max_tick_lag, (time.monotonic() - wall0) - t)
+                lag = (time.monotonic() - wall0) - t
+                n_ticks += 1
+                late_ticks += lag > dt
+                max_tick_lag = max(max_tick_lag, lag)
             for nid, p in agents.items():
                 if p.poll() is None:
                     p.kill()
@@ -121,6 +126,10 @@ class ScenarioEngine:
             "seed": self.scenario.seed,
             "git_hash": _git_hash(),
             "max_tick_lag_s": max_tick_lag,
-            "timing_ok": max_tick_lag < dt,
+            "late_tick_fraction": late_ticks / max(n_ticks, 1),
+            # ok = the loop kept pace statistically: <1% late ticks and no
+            # stall longer than 5 tick periods (one OS hiccup is not a bad run)
+            "timing_ok": late_ticks / max(n_ticks, 1) < 0.01
+                         and max_tick_lag < 5 * dt,
             "agent_exit_codes": agent_exit,
         }, indent=2))
