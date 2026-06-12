@@ -1,0 +1,26 @@
+[project]
+name = "net_com_zen"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = ">=3.11,<3.13"
+numpy = ">=1.26"
+pydantic = ">=2.7"
+pyyaml = ">=6"
+pytest = ">=8"
+pyarrow = ">=16"
+pip = "*"
+
+[pypi-dependencies]
+netcom-zen = { path = ".", editable = true }
+eclipse-zenoh = ">=1.0"
+
+[activation.env]
+PYTHONNOUSERSITE = "1"
+
+[tasks]
+test = "pytest tests -v"
+sudo-test = "sudo $(which python) -m pytest tests -v -m sudo"
+validate = "pytest validation -v && python validation/report.py"
+setup-check = "python -m netcom_zen.setup_check"
