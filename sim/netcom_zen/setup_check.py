@@ -17,6 +17,8 @@ def main() -> None:
         ok &= check(f"import {mod}", importlib.util.find_spec(mod) is not None,
                     "run `pixi install`")
     ok &= check("`ip` available", shutil.which("ip") is not None, "install iproute2")
+    ok &= check("`ethtool` available", os.path.exists("/usr/sbin/ethtool"),
+                "install ethtool (needed to disable veth checksum offload)")
     if os.geteuid() == 0:
         probe = subprocess.run(["ip", "netns", "add", "ncz-probe"], capture_output=True)
         subprocess.run(["ip", "netns", "del", "ncz-probe"], capture_output=True)

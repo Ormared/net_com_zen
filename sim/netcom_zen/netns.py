@@ -5,6 +5,7 @@ import secrets
 import subprocess
 
 PREFIX = "ncz"
+ETHTOOL = "/usr/sbin/ethtool"
 
 
 def _run(*args: str) -> str:
@@ -35,6 +36,13 @@ class NetnsTopology:
             _run("ip", "-n", ns, "link", "set", inner, "up")
             _run("ip", "-n", ns, "link", "set", "lo", "up")
             _run("ip", "link", "set", host, "up")
+            # veth leaves TCP/UDP checksums to "hardware" (CHECKSUM_PARTIAL), so
+            # frames captured by the AF_PACKET forwarder would carry invalid
+            # checksums and be dropped on re-injection; GSO/TSO/GRO would hand us
+            # coalesced >MTU super-frames, distorting serialization delays.
+            for args in ((["ip", "netns", "exec", ns, ETHTOOL, "-K", inner]),
+                         ([ETHTOOL, "-K", host])):
+                _run(*args, "tx", "off", "gso", "off", "tso", "off", "gro", "off")
             info = json.loads(_run("ip", "-n", ns, "-j", "link", "show", inner))
             self.macs[n] = bytes.fromhex(info[0]["address"].replace(":", ""))
 
