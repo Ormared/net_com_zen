@@ -54,12 +54,13 @@ class IsaacMobilityProvider:
     def _connect(path: Path) -> socket.socket:
         deadline = time.monotonic() + CONNECT_TIMEOUT_S
         while True:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
-                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 s.connect(str(path))
                 s.settimeout(STEP_TIMEOUT_S)
                 return s
             except (FileNotFoundError, ConnectionRefusedError):
+                s.close()
                 if time.monotonic() > deadline:
                     raise IsaacStepperError(
                         f"no Isaac stepper listening on {path} — start it "
