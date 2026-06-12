@@ -20,7 +20,8 @@ def test_four_agents_localhost(tmp_path):
                "--listen", f"tcp/127.0.0.1:{port}",
                "--metrics", str(tmp_path / f"agent_{nid}.jsonl"),
                "--period-ms", "100", "--duration-s", "5",
-               "--full-every", "10", "--wait-peers", "3"]
+               "--full-every", "10", "--wait-peers", "3",
+               "--members", ",".join(PORTS)]
         for other, oport in PORTS.items():
             if other != nid:
                 cmd += ["--connect", f"tcp/127.0.0.1:{oport}"]
@@ -30,6 +31,9 @@ def test_four_agents_localhost(tmp_path):
         p.wait(timeout=max(1.0, deadline - time.time()))
         assert p.returncode == 0
     for nid in PORTS:
+        log = (tmp_path / f"agent_{nid}.jsonl").read_text()
+        assert '"type":"mls_ready"' in log, f"{nid} never established MLS group"
+        assert '"type":"mls_decrypt_error"' not in log
         stats = aoi_for_agent(tmp_path / f"agent_{nid}.jsonl")
         assert set(stats) == set(PORTS) - {nid}
         for peer, s in stats.items():

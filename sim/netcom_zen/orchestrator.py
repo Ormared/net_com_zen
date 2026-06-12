@@ -62,7 +62,10 @@ class ScenarioEngine:
                    "--period-ms", str(cfg.period_ms),
                    "--duration-s", str(self.scenario.duration_s),
                    "--full-every", str(cfg.full_every),
-                   "--wait-peers", str(len(self.topo.nodes) - 1)]
+                   "--wait-peers", str(len(self.topo.nodes) - 1),
+                   "--members", ",".join(self.topo.nodes)]
+            if not cfg.mls:
+                cmd.append("--plaintext")
             for o in others:
                 cmd += ["--connect", o]
             agents[nid] = subprocess.Popen(cmd)

@@ -17,6 +17,8 @@ use automerge::transaction::Transactable;
 use automerge::{AutoCommit, ObjType, ReadDoc};
 use clap::Parser;
 
+mod mls;
+
 #[derive(Parser, Debug)]
 struct Args {
     /// Node id (e.g. v1)
@@ -46,6 +48,12 @@ struct Args {
     /// subsequent increments at the receiver until the next full snapshot.
     #[arg(long, default_value_t = 0)]
     wait_peers: usize,
+    /// Comma-separated ids of ALL group members (incl. self); required for MLS
+    #[arg(long, value_delimiter = ',')]
+    members: Vec<String>,
+    /// Disable MLS encryption (A/B benchmarking baseline)
+    #[arg(long, default_value_t = false)]
+    plaintext: bool,
 }
 
 fn now_us() -> u64 {
@@ -145,6 +153,22 @@ async fn main() -> Result<()> {
         }
     }
 
+    let mut mls_layer = if args.plaintext {
+        None
+    } else {
+        if args.members.is_empty() {
+            anyhow::bail!("--members required unless --plaintext");
+        }
+        let t0 = now_us();
+        let layer = mls::setup(&session, &args.id, &args.members).await?;
+        metrics.log(serde_json::json!({
+            "type": "mls_ready", "id": args.id, "ts_us": now_us(),
+            "epoch": layer.epoch(), "handshake_ms": (now_us() - t0) / 1000,
+            "committer": args.members.iter().min() == Some(&args.id)
+        }));
+        Some(layer)
+    };
+
     let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(args.duration_s);
     let mut ticker = tokio::time::interval(Duration::from_millis(args.period_ms));
     let mut peer_probe = tokio::time::interval(Duration::from_secs(1));
@@ -163,12 +187,16 @@ async fn main() -> Result<()> {
                 if bytes.is_empty() {
                     continue;
                 }
-                session.put(format!("ncz/state/{}/{}", args.id, kind), bytes.clone())
+                let wire = match mls_layer.as_mut() {
+                    Some(layer) => layer.encrypt(&bytes)?,
+                    None => bytes,
+                };
+                session.put(format!("ncz/state/{}/{}", args.id, kind), wire.clone())
                     .await
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
                 metrics.log(serde_json::json!({
                     "type": "pub", "id": args.id, "seq": seq, "kind": kind,
-                    "ts_us": now_us(), "bytes": bytes.len()
+                    "ts_us": now_us(), "bytes": wire.len()
                 }));
             }
             sample = subscriber.recv_async() => {
@@ -179,8 +207,22 @@ async fn main() -> Result<()> {
                 if from == args.id {
                     continue;
                 }
-                let payload = sample.payload().to_bytes().to_vec();
+                let wire = sample.payload().to_bytes().to_vec();
                 let recv_us = now_us();
+                let payload = match mls_layer.as_mut() {
+                    Some(layer) => match layer.decrypt(&wire) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            metrics.log(serde_json::json!({
+                                "type": "mls_decrypt_error", "id": args.id,
+                                "from": from, "kind": kind, "ts_us": recv_us,
+                                "error": e.to_string()
+                            }));
+                            continue;
+                        }
+                    },
+                    None => wire.clone(),
+                };
                 let merged = if kind == "full" {
                     AutoCommit::load(&payload)
                         .and_then(|mut other| doc.merge(&mut other).map(|_| ()))
@@ -198,7 +240,7 @@ async fn main() -> Result<()> {
                                 metrics.log(serde_json::json!({
                                     "type": "recv", "id": args.id, "from": from,
                                     "kind": kind, "peer_seq": pseq, "peer_ts_us": pts,
-                                    "ts_us": recv_us, "bytes": payload.len()
+                                    "ts_us": recv_us, "bytes": wire.len()
                                 }));
                             }
                         }

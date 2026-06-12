@@ -71,6 +71,7 @@ class AgentConfig(BaseModel):
     period_ms: int = Field(gt=0, default=500)
     port: int = 7447
     full_every: int = Field(gt=0, default=10)  # snapshot cadence = loss-heal latency
+    mls: bool = True
 
 
 class Scenario(BaseModel):
