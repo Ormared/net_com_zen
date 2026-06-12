@@ -10,7 +10,7 @@ class PacketRecord:
     src: str
     dst: str
     length: int
-    verdict: str  # delivered | range | foliage | jam | queue | no_link | tx_error
+    verdict: str  # delivered|range|foliage|jam|satloss|queue|no_link|tx_error
     delay_s: float
 
 

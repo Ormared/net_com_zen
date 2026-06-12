@@ -54,6 +54,11 @@ struct Args {
     /// Disable MLS encryption (A/B benchmarking baseline)
     #[arg(long, default_value_t = false)]
     plaintext: bool,
+    /// M4 link manager: id of the command node to track. When updates from it
+    /// go stale (satellite uplink presumed lost), log a link_down transition and
+    /// push a full snapshot to accelerate mesh resync; log link_up on recovery.
+    #[arg(long)]
+    command_id: Option<String>,
 }
 
 fn now_us() -> u64 {
@@ -174,6 +179,12 @@ async fn main() -> Result<()> {
     let mut peer_probe = tokio::time::interval(Duration::from_secs(1));
     let mut seq: u64 = 0;
 
+    // M4 link manager: track freshness of updates from the command node.
+    // stale => satellite uplink presumed lost => link_down.
+    let mut last_command_us: Option<u64> = None;
+    let mut command_link_up = true;
+    let command_stale_us: u64 = args.period_ms * 1000 * 4;
+
     loop {
         tokio::select! {
             _ = ticker.tick() => {
@@ -242,6 +253,9 @@ async fn main() -> Result<()> {
                                     "kind": kind, "peer_seq": pseq, "peer_ts_us": pts,
                                     "ts_us": recv_us, "bytes": wire.len()
                                 }));
+                                if args.command_id.as_deref() == Some(from.as_str()) {
+                                    last_command_us = Some(recv_us);
+                                }
                             }
                         }
                     }
@@ -261,6 +275,35 @@ async fn main() -> Result<()> {
                     "type": "zenoh_peers", "id": args.id, "ts_us": now_us(),
                     "n": peers.len(), "zids": peers
                 }));
+                // link manager: detect command-link up/down transitions
+                if args.command_id.is_some() {
+                    let now = now_us();
+                    // no contact yet = still warming up (treat as up, not down)
+                    let fresh = last_command_us
+                        .map(|t| now.saturating_sub(t) < command_stale_us)
+                        .unwrap_or(true);
+                    if !fresh && command_link_up {
+                        command_link_up = false;
+                        metrics.log(serde_json::json!({
+                            "type": "link_down", "id": args.id, "ts_us": now,
+                            "command": args.command_id
+                        }));
+                        // push a full snapshot to accelerate mesh resync at command
+                        let snap = doc.save();
+                        let wire = match mls_layer.as_mut() {
+                            Some(layer) => layer.encrypt(&snap)?,
+                            None => snap,
+                        };
+                        let _ = session.put(
+                            format!("ncz/state/{}/full", args.id), wire).await;
+                    } else if fresh && !command_link_up {
+                        command_link_up = true;
+                        metrics.log(serde_json::json!({
+                            "type": "link_up", "id": args.id, "ts_us": now,
+                            "command": args.command_id
+                        }));
+                    }
+                }
             }
             _ = tokio::time::sleep_until(deadline) => {
                 break;

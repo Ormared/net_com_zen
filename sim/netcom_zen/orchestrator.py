@@ -66,6 +66,10 @@ class ScenarioEngine:
                    "--members", ",".join(self.topo.nodes)]
             if not cfg.mls:
                 cmd.append("--plaintext")
+            # M4: vehicles track the command node's link; command tracks none
+            cmd_id = self.scenario.command_id
+            if cmd_id and nid != cmd_id:
+                cmd += ["--command-id", cmd_id]
             for o in others:
                 cmd += ["--connect", o]
             agents[nid] = subprocess.Popen(cmd)
@@ -89,8 +93,10 @@ class ScenarioEngine:
             # install the initial link-state table BEFORE agents spawn, so their
             # first connection attempts don't die as no_link
             positions0 = {nid: (v.x, v.y) for nid, v in self.vehicles.items()}
-            fwd.update_links(build_table(positions0, self.jammers, 0.0,
-                                         self.scenario.radio, self.pathloss))
+            fwd.update_links(build_table(
+                positions0, self.jammers, 0.0, self.scenario.radio, self.pathloss,
+                command_id=self.scenario.command_id,
+                satellite=self.scenario.satellite))
             agents = self._spawn_agents() if self.scenario.agent.enabled else {}
             self.ready.set()
             t = 0.0
@@ -102,8 +108,10 @@ class ScenarioEngine:
                     t < grace and any(p.poll() is None for p in agents.values())):
                 poses = {nid: v.step(dt) for nid, v in self.vehicles.items()}
                 positions = {nid: (p.x, p.y) for nid, p in poses.items()}
-                fwd.update_links(build_table(positions, self.jammers, t,
-                                             self.scenario.radio, self.pathloss))
+                fwd.update_links(build_table(
+                    positions, self.jammers, t, self.scenario.radio, self.pathloss,
+                    command_id=self.scenario.command_id,
+                    satellite=self.scenario.satellite))
                 await asyncio.sleep(dt)
                 t += dt
                 lag = (time.monotonic() - wall0) - t

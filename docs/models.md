@@ -79,6 +79,20 @@ Modeled as a channel in the same engine: fixed propagation delay (default LEO
 (the M4 failover trigger). No orbital mechanics — outage is the phenomenon under
 test, not visibility geometry.
 
+**M4 implementation:** one node has `role: command`. While the satellite is up,
+every vehicle⇄command link uses the satellite overlay (`medium="sat"`, jammer-
+immune, low latency), overriding the RF mesh. During an outage window those
+links fall back to the normal RF model — exposing the fallback path to range,
+foliage, and jamming. Command is an RF mesh node, so swarm state reaches it over
+vehicle⇄command RF links once the uplink drops. The vehicle agent's **link
+manager** tracks command-update freshness; if command goes stale (uplink
+presumed lost) it logs `link_down` and pushes a full snapshot to accelerate
+mesh resync, logging `link_up` on recovery.
+
+**Failover-time metric** (`harness/failover.py`): per vehicle, the wall time
+from outage start until command applies that vehicle's first post-outage state
+update; the swarm value is the max over vehicles.
+
 ## Known fidelity limits
 
 - No sub-dwell signal simulation (no I/Q); PHY effects enter via the waterfall curve.

@@ -1,0 +1,39 @@
+# M4 failover under jamming: same as failover_4node, but a barrage jammer near
+# command activates at the outage, so the RF fallback is contested. Failover is
+# slower and the vehicles' link manager detects the loss (link_down) because
+# command's own updates over RF now go stale.
+name: failover-jammed-4node
+duration_s: 45
+tick_hz: 10
+seed: 0
+radio:
+  freq_hz: 433.0e6
+  bandwidth_hz: 250.0e3
+  tx_power_dbm: 27.0
+  noise_figure_db: 7.0
+  data_rate_bps: 250.0e3
+  hop: {n_channels: 50, hop_rate_hz: 100.0}
+nodes:
+  - {id: v1, waypoints: [[150, 480], [350, 480]], speed_mps: 3.0}
+  - {id: v2, waypoints: [[150, 520], [350, 520]], speed_mps: 3.0}
+  - {id: v3, waypoints: [[250, 500]], speed_mps: 0.1}
+  - {id: cmd, role: command, waypoints: [[520, 500]], speed_mps: 0.1}
+environment:
+  extent_m: [1000, 1000]
+satellite:
+  enabled: true
+  delay_ms: 40.0
+  bandwidth_bps: 2.0e6
+  outages:
+    - {start_s: 20.0}
+jammers:
+  - id: j1
+    kind: barrage
+    position: [560, 500]      # right next to command
+    tx_power_dbm: 33.0
+    bandwidth_hz: 12.5e6
+    start_s: 20.0             # jams the RF fallback exactly when the uplink drops
+agent:
+  enabled: true
+  period_ms: 500
+  full_every: 10

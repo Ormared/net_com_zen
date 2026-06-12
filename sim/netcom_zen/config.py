@@ -26,6 +26,7 @@ class NodeConfig(BaseModel):
     id: str
     waypoints: list[tuple[float, float]] = Field(min_length=1)
     speed_mps: float = Field(gt=0, default=5.0)
+    role: Literal["vehicle", "command"] = "vehicle"  # M4: command = uplink sink
 
 
 class FoliageRect(BaseModel):
@@ -66,6 +67,35 @@ class JammerConfig(BaseModel):
         return self
 
 
+class OutageWindow(BaseModel):
+    start_s: float = Field(ge=0)
+    stop_s: float | None = None  # None = until end of run
+
+    @model_validator(mode="after")
+    def _ordered(self):
+        if self.stop_s is not None and self.stop_s <= self.start_s:
+            raise ValueError("outage stop_s must be > start_s")
+        return self
+
+
+class SatelliteConfig(BaseModel):
+    """Bent-pipe uplink from every vehicle to the command node (M4).
+
+    While up, vehicle<->command links use these (low-latency) parameters,
+    overriding the RF mesh; during an outage window the link falls back to RF.
+    """
+    enabled: bool = False
+    delay_ms: float = Field(gt=0, default=40.0)   # LEO ~40 ms RTT default
+    bandwidth_bps: float = Field(gt=0, default=2.0e6)
+    loss: float = Field(ge=0, le=1, default=0.0)  # clear-sky packet loss
+    outages: list[OutageWindow] = []
+
+    def active(self, t: float) -> bool:
+        return not any(
+            o.start_s <= t and (o.stop_s is None or t < o.stop_s)
+            for o in self.outages)
+
+
 class AgentConfig(BaseModel):
     enabled: bool = False
     period_ms: int = Field(gt=0, default=500)
@@ -84,6 +114,7 @@ class Scenario(BaseModel):
     environment: EnvironmentConfig = EnvironmentConfig()
     jammers: list[JammerConfig] = []
     agent: AgentConfig = AgentConfig()
+    satellite: SatelliteConfig = SatelliteConfig()
 
     @model_validator(mode="after")
     def _unique_ids(self):
@@ -91,6 +122,19 @@ class Scenario(BaseModel):
         if len(set(ids)) != len(ids):
             raise ValueError("duplicate node ids")
         return self
+
+    @model_validator(mode="after")
+    def _command_requires_sat(self):
+        commands = [n.id for n in self.nodes if n.role == "command"]
+        if len(commands) > 1:
+            raise ValueError("at most one command node")
+        if self.satellite.enabled and not commands:
+            raise ValueError("satellite.enabled requires a command node")
+        return self
+
+    @property
+    def command_id(self) -> str | None:
+        return next((n.id for n in self.nodes if n.role == "command"), None)
 
 
 def load_scenario(path: str | Path) -> Scenario:
