@@ -12,3 +12,11 @@
   - [0005](adr/0005-emane-spike-decision.md) — EMANE spike outcome: keep hand-rolled, retain EMANE for cross-validation
 
 See also [emane_spike/FINDINGS.md](../emane_spike/FINDINGS.md) for the full spike report.
+
+## Tooling
+
+- **Run dashboard** ([sim/netcom_zen/viz/](../sim/netcom_zen/viz/README.md)) —
+  `pixi run dashboard`: animated map of swarm behaviour (vehicles, jammer,
+  satellite, live link quality) + AoI/PDR panels, with A/B compare mode.
+- A/B result write-ups in [results/](results/): transport (TCP vs UDP), sync
+  (delta vs state).
