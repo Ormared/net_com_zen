@@ -43,8 +43,44 @@ ros2-sudo-test = "sudo $(which python) -m pytest tests -v -m sudo -k ros2"
 rviz = "rviz2 -d scenarios/netcom.rviz --ros-args -p use_sim_time:=true"
 viz-demo = "python -m netcom_zen.ros2_bridge.demo"
 
+# Isaac Sim 6 (ADR-0006, plan R4), opt-in: `pixi run -e isaac ...`. Tens of GB,
+# never part of the default env. Standalone (no default feature): isaacsim pins
+# exact pypi versions (requests etc.) that conflict with conda-solved defaults;
+# the stepper process needs only stdlib + netcom_zen + isaacsim anyway.
+[feature.isaac]
+
+# isaacsim wheels are manylinux_2_35; pixi's default assumption is older.
+# Host floor: Ubuntu 24.04 = glibc 2.39 (ADR-0006 verified facts).
+[feature.isaac.system-requirements]
+libc = { family = "glibc", version = "2.35" }
+
+[feature.isaac.dependencies]
+python = "3.12.*"
+
+[feature.isaac.pypi-options]
+extra-index-urls = ["https://pypi.nvidia.com"]
+# some isaacsim deps (e.g. mujoco-usd-converter) need versions that live on
+# pypi.org while pypi.nvidia.com also publishes the name; first-index-wins
+# can't see them. Both indexes are trusted.
+index-strategy = "unsafe-best-match"
+
+[feature.isaac.pypi-dependencies]
+netcom-zen = { path = ".", editable = true }
+pytest = ">=8"
+isaacsim = { version = "==6.0.0.1", extras = ["all", "extscache", "ros2"] }
+# isaacsim-core needs this prerelease; an explicit pin is how the resolver
+# is told prereleases are acceptable for the package
+tinyobjloader = "==2.0.0rc13"
+
+[feature.isaac.tasks]
+# Stepper owns the GPU/Isaac process; the (root) orchestrator only connects to
+# the socket, so Isaac caches stay under the invoking user, not root.
+isaac-stepper = "python -m netcom_zen.isaac_stepper"
+isaac-smoke = "pytest tests -v -k isaac"
+
 [environments]
 ros2 = ["ros2"]
+isaac = { features = ["isaac"], no-default-feature = true }
 
 [tasks]
 test = "pytest tests -v"

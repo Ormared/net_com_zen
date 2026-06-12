@@ -79,6 +79,24 @@ from one sweep definition; drop attribution still per-packet.
 pipeline, comparison run vs bicycle-kinematics mobility showing equivalent link-state
 dynamics at matched trajectories.
 
+*Implementation note (as built):* the "leaner IPC" fallback was chosen up front
+instead of ROS 2 Simulation Control services. Reasons: the orchestrator runs as
+root in any env, and a service client would force rclpy + `simulation_interfaces`
+into it (coupling it to the ros2/isaac envs); Sim Control stepping means an
+action/service round-trip per 100 ms tick; and a socket protocol is trivially
+fakeable for CI. Shape: `netcom_zen.isaac_stepper` (isaac env, user-owned, one
+process reused across sweep runs) embeds headless `SimulationApp` and serves
+newline-JSON over a unix socket; `IsaacMobilityProvider` (stdlib-only) drives it
+in lockstep — `mobility.physics_hz / tick_hz` PhysX frames per tick. Vehicles
+are dynamic cuboids velocity-controlled by the same unicycle law as
+`WaypointVehicle`, with the controller fed PhysX ground-truth positions, so
+trajectories track waypoint kinematics closely but are Isaac-integrated
+(manifest: `trajectories_seed_exact: false`). `--backend kinematic` serves the
+same wire protocol without Isaac for tests/dry-runs. Step latency lands in the
+existing timing monitor (`max_tick_lag_s`, `timing_ok`). The isaac pixi env is
+standalone (no default feature): isaacsim's exact pypi pins conflict with
+conda-solved defaults; the stepper needs only stdlib + `netcom_zen` + isaacsim.
+
 ## Risks / open questions
 
 - **rmw_zenoh router topology in netns'es (R3-B):** how routers discover/peer over

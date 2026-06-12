@@ -28,7 +28,7 @@ def main() -> None:
           f"({sc.duration_s}s sim) -- ctrl-c to stop")
     try:
         while t < sc.duration_s:
-            poses = {nid: v.step(dt) for nid, v in world.vehicles.items()}
+            poses = world.mobility.step(dt)
             positions = {nid: (p.x, p.y) for nid, p in poses.items()}
             table = build_table(
                 positions, world.jammers, t, sc.radio, world.pathloss,
@@ -40,6 +40,7 @@ def main() -> None:
         pass
     finally:
         bridge.close()
+        world.mobility.close()
 
 
 if __name__ == "__main__":

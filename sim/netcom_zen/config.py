@@ -118,6 +118,16 @@ class Ros2WorkloadConfig(BaseModel):
     port: int = 7447  # router port inside each netns
 
 
+class MobilityConfig(BaseModel):
+    """Plan R4 (ADR-0006): poses from closed-form waypoint kinematics or from
+    a headless Isaac Sim stepper driven in lockstep by the orchestrator."""
+    provider: Literal["waypoint", "isaac"] = "waypoint"
+    # isaac: unix socket where the stepper (netcom_zen.isaac_stepper, isaac
+    # pixi env, started by the user -- it owns the GPU process) listens
+    socket: Path = Path("/tmp/ncz_isaac.sock")
+    physics_hz: float = Field(gt=0, default=60.0)  # PhysX frames per sim second
+
+
 class Scenario(BaseModel):
     name: str
     duration_s: float = Field(gt=0)
@@ -128,6 +138,7 @@ class Scenario(BaseModel):
     environment: EnvironmentConfig = EnvironmentConfig()
     jammers: list[JammerConfig] = []
     workload: Literal["agent", "ros2"] = "agent"  # what crosses the channel
+    mobility: MobilityConfig = MobilityConfig()
     agent: AgentConfig = AgentConfig()
     ros2: Ros2WorkloadConfig = Ros2WorkloadConfig()
     satellite: SatelliteConfig = SatelliteConfig()
@@ -137,6 +148,16 @@ class Scenario(BaseModel):
         ids = [n.id for n in self.nodes]
         if len(set(ids)) != len(ids):
             raise ValueError("duplicate node ids")
+        return self
+
+    @model_validator(mode="after")
+    def _physics_divides_tick(self):
+        # lockstep needs a whole number of physics frames per scenario tick
+        frames = self.mobility.physics_hz / self.tick_hz
+        if self.mobility.provider == "isaac" and abs(frames - round(frames)) > 1e-9:
+            raise ValueError(
+                f"mobility.physics_hz ({self.mobility.physics_hz}) must be an "
+                f"integer multiple of tick_hz ({self.tick_hz})")
         return self
 
     @model_validator(mode="after")
