@@ -1,0 +1,20 @@
+[package]
+name = "ncz-agent"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+automerge = "0.5"
+openmls = "0.7"
+openmls_basic_credential = "0.4"
+openmls_rust_crypto = "0.4"
+tls_codec = "0.4"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "signal"] }
+zenoh = "1"
+
+[profile.release]
+opt-level = 2

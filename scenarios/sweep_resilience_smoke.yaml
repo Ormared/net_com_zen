@@ -1,0 +1,6 @@
+# Small first sweep (~8 min): 2 hop rates x 3 jammer powers x 2 seeds, 60 s runs
+base: resilience_4node.yaml
+axes:
+  jammers.0.tx_power_dbm: [30.0, 45.0, 60.0]
+  radio.hop.hop_rate_hz: [10.0, 1000.0]
+seeds: [1, 2]

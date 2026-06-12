@@ -9,3 +9,6 @@
   - [0002](adr/0002-no-gazebo-single-clock.md) — no physics co-simulator; single clock
   - [0003](adr/0003-rust-agent-python-sim.md) — Rust agent, Python sim
   - [0004](adr/0004-empirical-propagation-first.md) — empirical propagation first, Sionna RT later
+  - [0005](adr/0005-emane-spike-decision.md) — EMANE spike outcome: keep hand-rolled, retain EMANE for cross-validation
+
+See also [emane_spike/FINDINGS.md](../emane_spike/FINDINGS.md) for the full spike report.

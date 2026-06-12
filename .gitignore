@@ -1,0 +1,5 @@
+.pixi/
+__pycache__/
+*.egg-info/
+results/
+validation/report.md

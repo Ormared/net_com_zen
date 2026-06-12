@@ -1,0 +1,15 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "netcom-zen"
+version = "0.1.0"
+description = "EW-resilient swarm comms simulation environment"
+requires-python = ">=3.11"
+
+[tool.hatch.build.targets.wheel]
+packages = ["sim/netcom_zen"]
+
+[tool.pytest.ini_options]
+markers = ["sudo: requires root/CAP_NET_ADMIN; run via `pixi run sudo-test`"]

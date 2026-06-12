@@ -1,0 +1,14 @@
+/home/mdemid/Projects/Experimnets/net_com_zen/agent/target/release/deps/thiserror-f04455902fc3332f.d: /home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/lib.rs /home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/aserror.rs /home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/display.rs /home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/var.rs /home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/private.rs /home/mdemid/Projects/Experimnets/net_com_zen/agent/target/release/build/thiserror-0c1208b029b2e789/out/private.rs
+
+/home/mdemid/Projects/Experimnets/net_com_zen/agent/target/release/deps/libthiserror-f04455902fc3332f.rlib: /home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/lib.rs /home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/aserror.rs /home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/display.rs /home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/var.rs /home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/private.rs /home/mdemid/Projects/Experimnets/net_com_zen/agent/target/release/build/thiserror-0c1208b029b2e789/out/private.rs
+
+/home/mdemid/Projects/Experimnets/net_com_zen/agent/target/release/deps/libthiserror-f04455902fc3332f.rmeta: /home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/lib.rs /home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/aserror.rs /home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/display.rs /home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/var.rs /home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/private.rs /home/mdemid/Projects/Experimnets/net_com_zen/agent/target/release/build/thiserror-0c1208b029b2e789/out/private.rs
+
+/home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/lib.rs:
+/home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/aserror.rs:
+/home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/display.rs:
+/home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/var.rs:
+/home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/private.rs:
+/home/mdemid/Projects/Experimnets/net_com_zen/agent/target/release/build/thiserror-0c1208b029b2e789/out/private.rs:
+
+# env-dep:OUT_DIR=/home/mdemid/Projects/Experimnets/net_com_zen/agent/target/release/build/thiserror-0c1208b029b2e789/out

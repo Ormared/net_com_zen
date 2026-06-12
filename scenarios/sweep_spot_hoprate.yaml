@@ -1,0 +1,9 @@
+# Hop-rate sensitivity vs partial-band (spot) jamming: the jammer holds 8 of 50
+# channels; hopping statistics decide how often packets land on them.
+# 4 hop rates x 2 powers x 2 seeds x 60 s ~ 18 min.
+base: resilience_4node.yaml
+axes:
+  jammers.0.kind: [spot]
+  radio.hop.hop_rate_hz: [10.0, 100.0, 500.0, 1000.0]
+  jammers.0.tx_power_dbm: [45.0, 60.0]
+seeds: [1, 2]
