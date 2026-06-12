@@ -1,4 +1,4 @@
-[project]
+[workspace]
 name = "net_com_zen"
 channels = ["conda-forge"]
 platforms = ["linux-64"]
