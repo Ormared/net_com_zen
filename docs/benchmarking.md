@@ -9,7 +9,7 @@
 | State staleness (AoI) | age of information: now − timestamp of last applied CRDT update, per peer | agent metrics |
 | Drop attribution | loss decomposed by cause: range / foliage / jam / hop_collision / queue | channel engine logs |
 | MLS health | rekey success rate, time-to-rekey under loss | agent metrics |
-| Failover time (M4) | satellite outage → first state update over mesh | agent + engine logs |
+| Failover time (M4) | per vehicle: outage start → command applies that vehicle's first post-outage state update; swarm = max over vehicles | `harness/failover.py` from command's recv log + manifest |
 
 Per-packet channel verdicts and agent events are merged on a shared monotonic
 timebase into parquet; every run writes a manifest (full config, seeds, git hash,

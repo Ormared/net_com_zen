@@ -31,9 +31,14 @@ class LinkState:
     prop_delay_s: float
     foliage_db: float
     terrain_db: float
+    medium: str = "rf"        # "rf" | "sat" (M4 satellite overlay)
+    sat_loss: float = 0.0     # clear-sky packet loss for a satellite link
 
     def verdict(self, length_bytes: int, u_thermal: float, u_jam: float) -> str:
         """'deliver' or drop cause. u_*: uniforms from the seeded per-link stream."""
+        if self.medium == "sat":
+            # bent-pipe uplink: flat loss, immune to the RF jammer (different band)
+            return "deliver" if u_thermal >= self.sat_loss else "satloss"
         s_clear = sinr_db(self.prx_dbm, self.noise_dbm)
         if u_thermal < fsk_per(s_clear, length_bytes):
             return "foliage" if self.foliage_db > max(self.terrain_db, 3.0) else "range"
@@ -46,17 +51,35 @@ class LinkState:
         return "deliver"
 
 
+def _sat_link(src: str, dst: str, sat) -> LinkState:
+    """A satellite (bent-pipe) link overriding the RF model on this pair."""
+    return LinkState(
+        src=src, dst=dst, prx_dbm=0.0, noise_dbm=0.0, rho=0.0,
+        jam_inchannel_dbm=None, data_rate_bps=sat.bandwidth_bps,
+        hop_rate_hz=1.0, prop_delay_s=sat.delay_ms / 1e3,
+        foliage_db=0.0, terrain_db=0.0, medium="sat", sat_loss=sat.loss)
+
+
 def build_table(positions: dict[str, tuple[float, float]], jammers: list[Jammer],
-                t: float, radio: RadioProfile,
-                pathloss: CompositePathloss) -> dict[tuple[str, str], LinkState]:
+                t: float, radio: RadioProfile, pathloss: CompositePathloss,
+                command_id: str | None = None, satellite=None
+                ) -> dict[tuple[str, str], LinkState]:
     """Per-tick directed link-state table. M1 simplification: the single
-    highest-impact jammer per link is applied (documented in models.md)."""
+    highest-impact jammer per link is applied (documented in models.md).
+
+    M4: while the satellite is up, vehicle<->command pairs use the satellite
+    overlay (low latency, jammer-immune); during an outage they fall back to the
+    RF mesh computed here, exposing them to range/foliage/jamming."""
     n0 = noise_dbm(radio.bandwidth_hz, radio.noise_figure_db)
     active = [j for j in jammers if j.active(t)]
+    sat_up = satellite is not None and satellite.enabled and satellite.active(t)
     table: dict[tuple[str, str], LinkState] = {}
     for src, sp in positions.items():
         for dst, dp in positions.items():
             if src == dst:
+                continue
+            if sat_up and command_id in (src, dst):
+                table[(src, dst)] = _sat_link(src, dst, satellite)
                 continue
             bd = pathloss.loss(sp, dp, radio.freq_hz)
             prx = radio.tx_power_dbm + 2 * radio.antenna_gain_dbi - bd.total_db
