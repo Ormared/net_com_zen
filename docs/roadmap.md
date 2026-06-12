@@ -9,7 +9,8 @@
 | **M4 — Satellite failover** ✅ | Satlink channel model, agent link manager, outage scenario | **DONE 2026-06-12:** clean fallback seamless (0.27 s swarm failover); under jamming the RF fallback's zenoh-over-TCP goodput collapses (sessions stay up via keepalives, no state crosses) → command isolated, link manager fires `link_down`. Reinforces the zenoh-over-UDP axis. |
 | **Transport A/B** ✅ | zenoh-over-TCP vs UDP/best-effort under jamming | **DONE 2026-06-12:** UDP/best-effort wins app goodput + AoI at every power despite lower frame PDR (TCP head-of-line blocking). See [results/transport-tcp-vs-udp.md](results/transport-tcp-vs-udp.md) |
 | **Sync A/B** ✅ | op-based delta vs state-based single-datagram snapshots | **DONE 2026-06-12:** state-based wins app goodput +21–29 % under jamming (no orphaning, no fragmentation); udp+state is +37 % over the tcp+delta baseline. See [results/sync-delta-vs-state.md](results/sync-delta-vs-state.md) |
-| **M5+** | Reactive jamming, routing comparisons, frequency-band sweeps, FEC/interleaving axis, Sionna RT pathloss backend | per-feature |
+| **FEC axis** ✅ | FEC + interleaving over FHSS dwells (`radio.fec_fraction`) | **DONE 2026-06-13:** flips the M3 slow-vs-fast-hop result — with FEC, fast hopping survives partial-band jamming (1000 hop/s frame PDR 0.37→0.92). See [results/fec-flips-hop-rate.md](results/fec-flips-hop-rate.md) |
+| **M5+** | Reactive jamming, routing comparisons, frequency-band sweeps, Sionna RT pathloss backend | per-feature |
 
 Testing discipline throughout: unit tests per module; the model validation suite
 (`validation/`) reproduces published propagation curves and closed-form FHSS/SINR

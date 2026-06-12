@@ -9,7 +9,7 @@ import numpy as np
 from ..config import RadioProfile
 from ..ew import Jammer
 from ..propagation import CompositePathloss
-from .fhss import dwells_per_packet
+from .fhss import dwells_per_packet, jam_survival_prob
 from .linkbudget import dbm_to_mw, fsk_per, noise_dbm, per_threshold_sinr_db, sinr_db
 
 
@@ -33,6 +33,7 @@ class LinkState:
     terrain_db: float
     medium: str = "rf"        # "rf" | "sat" (M4 satellite overlay)
     sat_loss: float = 0.0     # clear-sky packet loss for a satellite link
+    fec_fraction: float = 0.0  # FEC erasure-correction across dwells (0 = none)
 
     def verdict(self, length_bytes: int, u_thermal: float, u_jam: float) -> str:
         """'deliver' or drop cause. u_*: uniforms from the seeded per-link stream."""
@@ -46,7 +47,8 @@ class LinkState:
             s_jam = sinr_db(self.prx_dbm, self.noise_dbm, [self.jam_inchannel_dbm])
             lost = 1.0 if s_jam < per_threshold_sinr_db(length_bytes) else 0.0
             k = dwells_per_packet(length_bytes, self.data_rate_bps, self.hop_rate_hz)
-            if u_jam < 1.0 - (1.0 - self.rho * lost) ** k:
+            jam_loss = 1.0 - jam_survival_prob(self.rho * lost, k, self.fec_fraction)
+            if u_jam < jam_loss:
                 return "jam"
         return "deliver"
 
@@ -95,5 +97,6 @@ def build_table(positions: dict[str, tuple[float, float]], jammers: list[Jammer]
                 src=src, dst=dst, prx_dbm=prx, noise_dbm=n0, rho=rho,
                 jam_inchannel_dbm=jam_dbm, data_rate_bps=radio.data_rate_bps,
                 hop_rate_hz=radio.hop.hop_rate_hz, prop_delay_s=d / 3e8,
-                foliage_db=bd.foliage_db, terrain_db=bd.terrain_db)
+                foliage_db=bd.foliage_db, terrain_db=bd.terrain_db,
+                fec_fraction=radio.fec_fraction)
     return table
