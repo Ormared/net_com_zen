@@ -14,3 +14,11 @@
   - [0006](adr/0006-ros2-isaac-integration.md) — ROS 2 Jazzy integration; Isaac Sim 6 behind MobilityProvider
 
 See also [emane_spike/FINDINGS.md](../emane_spike/FINDINGS.md) for the full spike report.
+
+## Tooling
+
+- **Run dashboard** ([sim/netcom_zen/viz/](../sim/netcom_zen/viz/README.md)) —
+  `pixi run dashboard`: animated map of swarm behaviour (vehicles, jammer,
+  satellite, live link quality) + AoI/PDR panels, with A/B compare mode.
+- A/B result write-ups in [results/](results/): transport (TCP vs UDP), sync
+  (delta vs state).

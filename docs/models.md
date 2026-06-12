@@ -49,15 +49,32 @@ model covers both):
 - A packet of duration `T_pkt` spans `k = ceil(T_pkt / T_dwell)` dwells.
 - A dwell is "hit" if the jammer's in-channel power drives SINR below the waterfall
   threshold for that dwell.
-- `P(packet survives jamming) = (1 − ρ_eff)^k`, where `ρ_eff` is the hit probability
-  per dwell given current geometry and jammer power.
-- `PER_total = 1 − (1 − PER_thermal) · (1 − ρ_eff)^k`
+- `ρ_eff` is the per-dwell hit probability given current geometry and jammer power.
+
+**FEC + interleaving** (`radio.fec_fraction`, 0 = none). With an interleaved
+erasure code that recovers up to a fraction `f` of erased dwells, a packet
+survives jamming as long as no more than `e = floor(f·k)` of its `k` dwells are
+jammed. With interleaving the erasures are independent, so survival is a
+binomial CDF:
+
+- `P(survive jamming) = P(B ≤ e)`, `B ~ Binomial(k, ρ_eff)`, `e = floor(f·k)`
+- `PER_total = 1 − (1 − PER_thermal) · P(survive jamming)`
+- `f = 0` ⇒ `e = 0` ⇒ survival `(1 − ρ_eff)^k` (every dwell must be clean — the
+  original no-FEC model).
+
+This is the axis that **flips the slow-vs-fast-hop trade-off**: without FEC a
+single jammed dwell kills the packet, so slow hopping (fewer dwells) wins;
+with FEC, once `k` is large enough that `floor(f·k) ≥ 1`, fast hopping spreads a
+partial-band jammer's hits across many dwells and the code corrects them, so
+fast hopping wins whenever the jammed fraction stays below `f`. See
+[results/fec-flips-hop-rate.md](results/fec-flips-hop-rate.md).
 
 Friendly same-dwell collisions between own nodes are folded into the same model
 (uniform random hop sequences, ≤ 5 nodes ⇒ rare); contention-MAC effects are out of
 scope and documented as a known fidelity limit.
 
-Validated against closed-form binomial expectations for fixed geometries.
+Validated against closed-form binomial expectations and direct dwell-erasure
+Monte-Carlo (with and without FEC).
 
 ## Jammer models
 

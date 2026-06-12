@@ -20,6 +20,9 @@ class RadioProfile(BaseModel):
     noise_figure_db: float = 7.0
     data_rate_bps: float = Field(gt=0)
     hop: HopConfig
+    # FEC erasure-correction capability across interleaved dwells (0 = no FEC);
+    # a packet survives jamming if <= floor(fec_fraction * dwells) are jammed
+    fec_fraction: float = Field(ge=0.0, lt=1.0, default=0.0)
 
 
 class NodeConfig(BaseModel):

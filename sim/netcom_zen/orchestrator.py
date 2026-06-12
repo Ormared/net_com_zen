@@ -172,6 +172,7 @@ class ScenarioEngine:
         agents: dict[str, subprocess.Popen] = {}
         agent_exit: dict[str, int | None] = {}
         self._routers: dict[str, subprocess.Popen] = {}
+        track: list[tuple] = []  # per-tick (t, id, x, y, heading) for visualization
         bridge = None
         if self.ros2_viz:
             # lazy: rclpy exists only in the ros2 pixi env (ADR-0006)
@@ -199,6 +200,9 @@ class ScenarioEngine:
                     t < grace and any(p.poll() is None for p in agents.values())):
                 poses = {nid: v.step(dt) for nid, v in self.vehicles.items()}
                 positions = {nid: (p.x, p.y) for nid, p in poses.items()}
+                for nid, p in poses.items():
+                    track.append((round(t, 3), nid, round(p.x, 2), round(p.y, 2),
+                                  round(p.heading, 4)))
                 table = build_table(
                     positions, self.jammers, t, self.scenario.radio, self.pathloss,
                     command_id=self.scenario.command_id,
@@ -225,6 +229,13 @@ class ScenarioEngine:
                 bridge.close()
             self.topo.teardown()
         log.to_parquet(self.out_dir / "packets.parquet")
+        if track:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+            cols = list(zip(*track))
+            pq.write_table(pa.table({
+                "t": cols[0], "id": cols[1], "x": cols[2], "y": cols[3],
+                "heading": cols[4]}), self.out_dir / "positions.parquet")
         (self.out_dir / "manifest.json").write_text(json.dumps({
             "scenario": self.scenario.model_dump(mode="json"),
             "seed": self.scenario.seed,
