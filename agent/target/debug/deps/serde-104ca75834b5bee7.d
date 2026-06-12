@@ -1,0 +1,14 @@
+/home/mdemid/Projects/Experimnets/net_com_zen/agent/target/debug/deps/serde-104ca75834b5bee7.d: /home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/mdemid/Projects/Experimnets/net_com_zen/agent/target/debug/build/serde-5ebc86328f2ebc40/out/private.rs
+
+/home/mdemid/Projects/Experimnets/net_com_zen/agent/target/debug/deps/libserde-104ca75834b5bee7.rlib: /home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/mdemid/Projects/Experimnets/net_com_zen/agent/target/debug/build/serde-5ebc86328f2ebc40/out/private.rs
+
+/home/mdemid/Projects/Experimnets/net_com_zen/agent/target/debug/deps/libserde-104ca75834b5bee7.rmeta: /home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/mdemid/Projects/Experimnets/net_com_zen/agent/target/debug/build/serde-5ebc86328f2ebc40/out/private.rs
+
+/home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/home/mdemid/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/home/mdemid/Projects/Experimnets/net_com_zen/agent/target/debug/build/serde-5ebc86328f2ebc40/out/private.rs:
+
+# env-dep:OUT_DIR=/home/mdemid/Projects/Experimnets/net_com_zen/agent/target/debug/build/serde-5ebc86328f2ebc40/out

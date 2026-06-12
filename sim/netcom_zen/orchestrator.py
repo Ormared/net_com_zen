@@ -52,12 +52,13 @@ class ScenarioEngine:
         cfg = self.scenario.agent
         bin_path = os.environ.get("NCZ_AGENT_BIN", "agent/target/release/ncz-agent")
         agents: dict[str, subprocess.Popen] = {}
+        proto = cfg.transport  # "tcp" | "udp"
         for nid in self.topo.nodes:
-            others = [f"tcp/{self.topo.addrs[n]}:{cfg.port}"
+            others = [f"{proto}/{self.topo.addrs[n]}:{cfg.port}"
                       for n in self.topo.nodes if n != nid]
             cmd = ["ip", "netns", "exec", self.topo.ns_names[nid], bin_path,
                    "--id", nid,
-                   "--listen", f"tcp/{self.topo.addrs[nid]}:{cfg.port}",
+                   "--listen", f"{proto}/{self.topo.addrs[nid]}:{cfg.port}",
                    "--metrics", str(self.out_dir / f"agent_{nid}.jsonl"),
                    "--period-ms", str(cfg.period_ms),
                    "--duration-s", str(self.scenario.duration_s),
@@ -66,6 +67,10 @@ class ScenarioEngine:
                    "--members", ",".join(self.topo.nodes)]
             if not cfg.mls:
                 cmd.append("--plaintext")
+            # best-effort over UDP is the point of the A/B: avoid retransmit
+            # stalls under loss (CRDT snapshots heal the gaps). TCP is reliable.
+            cmd += ["--reliability",
+                    "best-effort" if cfg.transport == "udp" else "reliable"]
             # M4: vehicles track the command node's link; command tracks none
             cmd_id = self.scenario.command_id
             if cmd_id and nid != cmd_id:
