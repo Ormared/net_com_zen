@@ -35,7 +35,9 @@ ros-jazzy-demo-nodes-py = "*"
 ros-jazzy-rviz2 = "*"
 
 [feature.ros2.tasks]
-ros2-smoke = "pytest tests/test_ros2_smoke.py -v"
+ros2-smoke = "pytest tests -v -k ros2"
+rviz = "rviz2 -d scenarios/netcom.rviz --ros-args -p use_sim_time:=true"
+viz-demo = "python -m netcom_zen.ros2_bridge.demo"
 
 [environments]
 ros2 = ["ros2"]

@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -28,25 +29,45 @@ def _git_hash() -> str:
         return "unknown"
 
 
+@dataclass
+class World:
+    """Scenario-derived simulation state, buildable without root (the netns
+    dataplane is separate). Shared by the engine and the ROS 2 viz demo."""
+    terrain: Terrain
+    pathloss: CompositePathloss
+    vehicles: dict[str, WaypointVehicle]
+    jammers: list[Jammer]
+
+
+def build_world(scenario: Scenario) -> World:
+    env = scenario.environment
+    hm = np.load(env.heightmap) if env.heightmap else None
+    terrain = Terrain(env.extent_m, hm,
+                      [FoliageRegion(**f.model_dump()) for f in env.foliage])
+    return World(
+        terrain=terrain,
+        pathloss=CompositePathloss(terrain),
+        vehicles={n.id: WaypointVehicle(n.waypoints, n.speed_mps)
+                  for n in scenario.nodes},
+        jammers=[Jammer(j) for j in scenario.jammers])
+
+
 class ScenarioEngine:
     """Owns the single clock: tick loop driving mobility -> pathloss ->
     link-state -> forwarder (architecture.md)."""
 
-    def __init__(self, scenario: Scenario, out_dir: str | Path):
+    def __init__(self, scenario: Scenario, out_dir: str | Path,
+                 ros2_viz: bool = False):
         self.scenario = scenario
         self.out_dir = Path(out_dir)
+        self.ros2_viz = ros2_viz
         self.ready = asyncio.Event()
         self.topo: NetnsTopology | None = None
 
     def _build(self) -> None:
-        env = self.scenario.environment
-        hm = np.load(env.heightmap) if env.heightmap else None
-        terrain = Terrain(env.extent_m, hm,
-                          [FoliageRegion(**f.model_dump()) for f in env.foliage])
-        self.pathloss = CompositePathloss(terrain)
-        self.vehicles = {n.id: WaypointVehicle(n.waypoints, n.speed_mps)
-                         for n in self.scenario.nodes}
-        self.jammers = [Jammer(j) for j in self.scenario.jammers]
+        w = build_world(self.scenario)
+        self.terrain, self.pathloss = w.terrain, w.pathloss
+        self.vehicles, self.jammers = w.vehicles, w.jammers
 
     def _spawn_agents(self) -> dict[str, subprocess.Popen]:
         cfg = self.scenario.agent
@@ -94,6 +115,11 @@ class ScenarioEngine:
         dt = 1.0 / self.scenario.tick_hz
         agents: dict[str, subprocess.Popen] = {}
         agent_exit: dict[str, int | None] = {}
+        bridge = None
+        if self.ros2_viz:
+            # lazy: rclpy exists only in the ros2 pixi env (ADR-0006)
+            from .ros2_bridge import RosVizBridge
+            bridge = RosVizBridge(self.terrain)
         try:
             fwd.start()
             # install the initial link-state table BEFORE agents spawn, so their
@@ -114,10 +140,13 @@ class ScenarioEngine:
                     t < grace and any(p.poll() is None for p in agents.values())):
                 poses = {nid: v.step(dt) for nid, v in self.vehicles.items()}
                 positions = {nid: (p.x, p.y) for nid, p in poses.items()}
-                fwd.update_links(build_table(
+                table = build_table(
                     positions, self.jammers, t, self.scenario.radio, self.pathloss,
                     command_id=self.scenario.command_id,
-                    satellite=self.scenario.satellite))
+                    satellite=self.scenario.satellite)
+                fwd.update_links(table)
+                if bridge:
+                    bridge.publish_tick(t, poses, table, self.jammers)
                 await asyncio.sleep(dt)
                 t += dt
                 lag = (time.monotonic() - wall0) - t
@@ -133,6 +162,8 @@ class ScenarioEngine:
             for p in agents.values():
                 if p.poll() is None:
                     p.kill()
+            if bridge:
+                bridge.close()
             self.topo.teardown()
         log.to_parquet(self.out_dir / "packets.parquet")
         (self.out_dir / "manifest.json").write_text(json.dumps({

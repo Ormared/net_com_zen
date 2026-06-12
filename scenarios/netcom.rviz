@@ -1,0 +1,56 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded: ~
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Cell Size: 100
+      Plane Cell Count: 10
+      Color: 80; 80; 90
+      Offset:
+        X: 500
+        Y: 500
+        Z: 0
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+      Show Names: false
+      Marker Scale: 30
+    - Class: rviz_default_plugins/MarkerArray
+      Name: NetCom
+      Enabled: true
+      Topic:
+        Value: /netcom/markers
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+  Global Options:
+    Background Color: 25; 25; 35
+    Fixed Frame: map
+    Frame Rate: 30
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Name: Current View
+      Distance: 900
+      Pitch: 1.2
+      Yaw: 4.71
+      Focal Point:
+        X: 500
+        Y: 500
+        Z: 0
+    Saved: ~
+Window Geometry:
+  Height: 900
+  Width: 1400

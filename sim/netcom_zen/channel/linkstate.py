@@ -50,6 +50,21 @@ class LinkState:
                 return "jam"
         return "deliver"
 
+    def delivery_prob(self, length_bytes: int) -> float:
+        """Expected delivery probability: verdict() with the uniforms
+        integrated out. Drives link colouring in the ROS 2 bridge (R2)."""
+        if self.medium == "sat":
+            return 1.0 - self.sat_loss
+        s_clear = sinr_db(self.prx_dbm, self.noise_dbm)
+        p = 1.0 - fsk_per(s_clear, length_bytes)
+        if self.rho > 0 and self.jam_inchannel_dbm is not None:
+            s_jam = sinr_db(self.prx_dbm, self.noise_dbm, [self.jam_inchannel_dbm])
+            if s_jam < per_threshold_sinr_db(length_bytes):
+                k = dwells_per_packet(length_bytes, self.data_rate_bps,
+                                      self.hop_rate_hz)
+                p *= (1.0 - self.rho) ** k
+        return p
+
 
 def _sat_link(src: str, dst: str, sat) -> LinkState:
     """A satellite (bent-pipe) link overriding the RF model on this pair."""
