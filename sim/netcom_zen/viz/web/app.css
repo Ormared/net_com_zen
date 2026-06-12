@@ -1,0 +1,253 @@
+/* net_com_zen — tactical instrumentation theme.
+   Command-console aesthetic: dark substrate, phosphor accents, technical mono. */
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Oswald:wght@500;600;700&display=swap');
+
+:root {
+  --bg:        #070b0e;
+  --panel:     #0c1318;
+  --panel-2:   #101a21;
+  --grid:      #15242c;
+  --line:      #1d3038;
+  --ink:       #cfe3e0;
+  --ink-dim:   #6f8a8c;
+  --ink-faint: #46595c;
+  --phosphor:  #34f5b0;   /* live / delivering */
+  --phosphor-d:#0fae7a;
+  --amber:     #ffb648;   /* warning / sat */
+  --red:       #ff5c5c;   /* jammed / lost */
+  --cyan:      #4fd0ff;   /* vehicle */
+  --command:   #ffd54f;   /* command node */
+  --violet:    #b48cff;
+  --shadow:    0 0 0 1px var(--line), 0 18px 40px -24px #000;
+  --mono: 'IBM Plex Mono', ui-monospace, monospace;
+  --display: 'Oswald', var(--mono);
+}
+
+* { box-sizing: border-box; }
+html, body {
+  margin: 0; height: 100%;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+}
+body {
+  background-image:
+    radial-gradient(1200px 600px at 80% -10%, #0c1a1f 0%, transparent 60%),
+    linear-gradient(transparent 0, var(--bg) 100%);
+  background-attachment: fixed;
+}
+
+.app { max-width: 1680px; margin: 0 auto; padding: 18px 22px 40px; }
+
+/* ---- masthead ---- */
+header.mast {
+  display: flex; align-items: baseline; gap: 18px;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 12px; margin-bottom: 16px;
+}
+.mast .glyph {
+  font-family: var(--display); font-weight: 700; letter-spacing: 2px;
+  font-size: 22px; color: var(--ink);
+  text-transform: uppercase;
+}
+.mast .glyph b { color: var(--phosphor); }
+.mast .tagline { color: var(--ink-dim); font-size: 12px; letter-spacing: .5px; }
+.mast .spacer { flex: 1; }
+.mast .clock {
+  font-family: var(--display); font-size: 26px; font-weight: 600;
+  color: var(--phosphor); letter-spacing: 1px;
+  text-shadow: 0 0 12px rgba(52,245,176,.35);
+}
+.mast .clock small { color: var(--ink-faint); font-size: 12px; font-weight: 400; }
+
+/* ---- mode switch ---- */
+.controls-bar {
+  display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+.seg {
+  display: inline-flex; border: 1px solid var(--line); border-radius: 3px;
+  overflow: hidden; background: var(--panel);
+}
+.seg button {
+  font-family: var(--mono); font-size: 12px; letter-spacing: .6px;
+  background: transparent; color: var(--ink-dim); border: 0;
+  padding: 6px 14px; cursor: pointer; text-transform: uppercase;
+  transition: background .12s, color .12s;
+}
+.seg button.on { background: var(--phosphor); color: #04140e; font-weight: 600; }
+.seg button:not(.on):hover { color: var(--ink); background: var(--panel-2); }
+
+select.run-pick {
+  font-family: var(--mono); font-size: 12px;
+  background: var(--panel); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 3px;
+  padding: 6px 10px; min-width: 220px;
+}
+label.pick-lbl { color: var(--ink-faint); letter-spacing: 1px;
+  text-transform: uppercase; font-size: 11px; }
+
+/* ---- transport ---- */
+.transport {
+  display: flex; align-items: center; gap: 12px; margin: 4px 0 18px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 4px;
+  padding: 10px 14px;
+}
+.transport button.play {
+  font-family: var(--display); font-size: 14px; font-weight: 600;
+  background: var(--phosphor); color: #04140e; border: 0; border-radius: 3px;
+  width: 86px; padding: 8px 0; cursor: pointer; letter-spacing: 1px;
+}
+.transport button.play.paused { background: var(--phosphor); }
+.transport button.play:hover { box-shadow: 0 0 16px rgba(52,245,176,.4); }
+.transport .speed {
+  display: inline-flex; gap: 4px;
+}
+.transport .speed button {
+  font-family: var(--mono); font-size: 11px; background: var(--panel-2);
+  color: var(--ink-dim); border: 1px solid var(--line); border-radius: 3px;
+  padding: 5px 8px; cursor: pointer;
+}
+.transport .speed button.on { color: var(--phosphor); border-color: var(--phosphor-d); }
+
+/* the scrub track with event ticks */
+.track-wrap { flex: 1; position: relative; height: 38px; }
+.track {
+  position: absolute; inset: 14px 0 auto 0; height: 8px;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px;
+  cursor: pointer;
+}
+.track .fill {
+  position: absolute; left: 0; top: 0; bottom: 0; border-radius: 4px;
+  background: linear-gradient(90deg, var(--phosphor-d), var(--phosphor));
+  width: 0;
+}
+.track .head {
+  position: absolute; top: -4px; width: 3px; height: 16px; margin-left: -1px;
+  background: var(--ink); box-shadow: 0 0 8px rgba(255,255,255,.5);
+}
+.track .jamspan {
+  position: absolute; top: 0; bottom: 0; background: rgba(255,92,92,.22);
+  border-left: 1px solid var(--red); border-right: 1px solid var(--red);
+}
+.tick {
+  position: absolute; top: 26px; width: 2px; height: 9px; margin-left: -1px;
+}
+.tick.jammer_on { background: var(--red); }
+.tick.sat_outage { background: var(--amber); }
+.tick.mls_ready { background: var(--phosphor); }
+.tick.link_down { background: var(--amber); }
+.tick.link_up { background: var(--cyan); }
+.tick:hover::after {
+  content: attr(data-label); position: absolute; bottom: 14px; left: 50%;
+  transform: translateX(-50%); white-space: nowrap;
+  background: #04140e; color: var(--ink); border: 1px solid var(--line);
+  padding: 3px 7px; font-size: 11px; border-radius: 3px; z-index: 5;
+}
+
+/* ---- layout grids ---- */
+.stage { display: grid; grid-template-columns: 1fr; gap: 16px; }
+.stage.compare { grid-template-columns: 1fr 1fr; }
+
+/* one run = config row across the top, then map (wide) beside a metric column */
+.runpanel {
+  display: grid; gap: 14px;
+  grid-template-columns: minmax(0, 1fr) 330px;
+  grid-template-areas: "cfg cfg" "map metrics";
+  align-content: start;
+}
+.stage.compare .runpanel { grid-template-columns: minmax(0, 1fr) 290px; }
+.runpanel > .cfg { grid-area: cfg; }
+.runpanel > .mapwrap { grid-area: map; align-self: start; }
+.runpanel > .metric-stack { grid-area: metrics; }
+/* when the viewport is tight (A/B), stack map over metrics */
+@media (max-width: 1100px) {
+  .runpanel { grid-template-columns: 1fr; grid-template-areas: "cfg" "map" "metrics"; }
+}
+
+.panel {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 5px;
+  box-shadow: var(--shadow); overflow: hidden;
+}
+.panel .ph {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 12px; border-bottom: 1px solid var(--line);
+  background: linear-gradient(var(--panel-2), var(--panel));
+}
+.panel .ph h2 {
+  font-family: var(--display); font-size: 13px; font-weight: 600;
+  letter-spacing: 1.5px; text-transform: uppercase; margin: 0; color: var(--ink);
+}
+.panel .ph .sub { color: var(--ink-faint); font-size: 11px; letter-spacing: .5px; }
+.panel .ph .spacer { flex: 1; }
+.panel .body { padding: 10px 12px; }
+
+/* config badges */
+.badges { display: flex; flex-wrap: wrap; gap: 6px; }
+.badge {
+  font-size: 11px; letter-spacing: .4px;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 3px;
+  padding: 3px 8px; color: var(--ink-dim);
+}
+.badge b { color: var(--ink); }
+.badge.win { border-color: var(--phosphor-d); }
+.badge.win b { color: var(--phosphor); }
+
+/* the map canvas */
+.mapwrap { position: relative; }
+canvas.map { display: block; width: 100%; background: #05090b; }
+.map-legend {
+  position: absolute; left: 10px; bottom: 10px;
+  display: flex; flex-direction: column; gap: 3px;
+  background: rgba(5,11,13,.78); border: 1px solid var(--line);
+  border-radius: 4px; padding: 7px 9px; font-size: 11px; color: var(--ink-dim);
+  backdrop-filter: blur(3px);
+}
+.map-legend .row { display: flex; align-items: center; gap: 7px; }
+.map-legend .sw { width: 14px; height: 0; border-top-width: 3px; border-top-style: solid; }
+.map-legend .dot { width: 9px; height: 9px; border-radius: 50%; }
+.map-legend .sq { width: 9px; height: 9px; }
+.statline {
+  position: absolute; right: 10px; top: 10px; text-align: right;
+  font-size: 11px; color: var(--ink-dim); line-height: 1.5;
+}
+.statline .on { color: var(--phosphor); }
+.statline .off { color: var(--red); }
+.statline .warn { color: var(--amber); }
+
+/* metric cards (sidebar) */
+.metric-stack { display: flex; flex-direction: column; gap: 14px; }
+.kpi-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.kpi {
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px;
+  padding: 8px 10px;
+}
+.kpi .k { font-size: 10px; letter-spacing: 1px; text-transform: uppercase;
+  color: var(--ink-faint); }
+.kpi .v { font-family: var(--display); font-size: 22px; font-weight: 600;
+  color: var(--ink); }
+.kpi .v small { font-size: 12px; color: var(--ink-dim); font-family: var(--mono); }
+.kpi.good .v { color: var(--phosphor); }
+.kpi.bad .v { color: var(--red); }
+
+canvas.chart { display: block; width: 100%; }
+.chart-cap { color: var(--ink-faint); font-size: 11px; margin-top: 4px; }
+
+.explain {
+  font-size: 11px; line-height: 1.55; color: var(--ink-dim);
+  border-top: 1px dashed var(--line); padding-top: 9px; margin-top: 4px;
+}
+.explain b { color: var(--ink); }
+
+footer.foot {
+  margin-top: 22px; padding-top: 12px; border-top: 1px solid var(--line);
+  color: var(--ink-faint); font-size: 11px; display: flex; gap: 18px;
+  flex-wrap: wrap;
+}
+.obs-pick {
+  font-family: var(--mono); font-size: 11px; background: var(--panel-2);
+  color: var(--ink); border: 1px solid var(--line); border-radius: 3px;
+  padding: 3px 6px;
+}

@@ -84,3 +84,74 @@ def test_events_timeline_orders_jammer_and_links(tmp_path):
     kinds = list(ev["kind"])
     assert "sat_outage" in kinds and "jammer_on" in kinds and "link_down" in kinds
     assert ev["t"].is_monotonic_increasing
+
+
+def test_pdr_series_aggregates_over_links(tmp_path):
+    run = _make_run(tmp_path, positions=[], agents={}, packets=[
+        (0.1, "v1", "cmd", 64, "delivered", 0.01),
+        (0.2, "v1", "v2", 64, "jam", 0.0),
+        (0.3, "v2", "cmd", 64, "delivered", 0.01),
+        (1.1, "v1", "cmd", 64, "jam", 0.0),
+    ])
+    pdr = D.pdr_series(run, window_s=1.0)
+    b0 = pdr[pdr["t"] == 0.0].iloc[0]
+    assert b0["attempts"] == 3 and abs(b0["pdr"] - 2 / 3) < 1e-9
+    b1 = pdr[pdr["t"] == 1.0].iloc[0]
+    assert b1["pdr"] == 0.0
+
+
+def test_update_delivery_counts_landed_publishes(tmp_path):
+    # v1 publishes seq 1,2,3; cmd receives 1 and 3 (2 lost). 2/3 delivery.
+    run = _make_run(tmp_path, positions=[], packets=[], agents={
+        "v1": [
+            {"type": "start", "id": "v1", "ts_us": 0},
+            {"type": "pub", "id": "v1", "seq": 1, "ts_us": 1_000_000},
+            {"type": "pub", "id": "v1", "seq": 2, "ts_us": 1_500_000},
+            {"type": "pub", "id": "v1", "seq": 3, "ts_us": 1_800_000},
+        ],
+        "cmd": [
+            {"type": "start", "id": "cmd", "ts_us": 0},
+            {"type": "recv", "from": "v1", "peer_seq": 1,
+             "peer_ts_us": 1_000_000, "ts_us": 1_100_000},
+            {"type": "recv", "from": "v1", "peer_seq": 3,
+             "peer_ts_us": 1_800_000, "ts_us": 1_900_000},
+        ],
+    })
+    upd = D.update_delivery_series(run, window_s=10.0)
+    row = upd.iloc[0]
+    assert row["published"] == 3 and row["delivered"] == 2
+    assert abs(row["delivery"] - 2 / 3) < 1e-9
+
+
+def test_aoi_mean_time_average(tmp_path):
+    # single reset at t=1 (aoi 0.1) over a 10s run: area under sawtooth / 10.
+    run = _make_run(tmp_path, positions=[], packets=[], agents={"cmd": [
+        {"type": "start", "id": "cmd", "ts_us": 0},
+        {"type": "recv", "from": "v1", "peer_ts_us": 900_000, "ts_us": 1_000_000},
+    ]})
+    m = D.aoi_mean(run, "cmd")
+    assert m is not None and m > 0
+
+
+def test_export_run_is_json_serialisable(tmp_path):
+    run = _make_run(tmp_path,
+                    positions=[(0.0, "v1", 1.0, 2.0, 0.0),
+                               (0.0, "cmd", 5.0, 6.0, 0.0),
+                               (0.1, "v1", 1.5, 2.0, 0.1),
+                               (0.1, "cmd", 5.0, 6.0, 0.0)],
+                    packets=[(0.1, "v1", "cmd", 64, "delivered", 0.01)],
+                    scenario_extra={"jammers": [
+                        {"id": "j1", "kind": "barrage", "tx_power_dbm": 40,
+                         "position": [10.0, 20.0], "start_s": 0.0,
+                         "stop_s": None}]},
+                    agents={"v1": [{"type": "start", "id": "v1", "ts_us": 0},
+                                   {"type": "pub", "id": "v1", "seq": 1,
+                                    "ts_us": 500_000}]})
+    bundle = D.export_run(run, stride=1)
+    json.dumps(bundle)  # must not raise
+    assert bundle["extent"] == [1000, 1000]
+    assert len(bundle["frames"]) == 2
+    f0 = bundle["frames"][0]
+    assert {n["id"] for n in f0["nodes"]} == {"v1", "cmd"}
+    assert f0["jammers"][0]["active"] is True
+    assert bundle["drop_attribution"] == {"delivered": 1}

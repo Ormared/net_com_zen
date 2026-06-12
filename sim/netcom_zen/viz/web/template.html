@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>net_com_zen — swarm comms under EW</title>
+  <style>/*__CSS__*/</style>
+</head>
+<body>
+  <div class="app">
+    <header class="mast">
+      <div>
+        <div class="glyph">NET<b>·</b>COM<b>·</b>ZEN</div>
+        <div class="tagline">secure swarm radio under electronic warfare — run telemetry replay</div>
+      </div>
+      <div class="spacer"></div>
+      <div class="clock" id="clock">T+0.0<small>s</small></div>
+    </header>
+
+    <div class="controls-bar">
+      <div class="seg">
+        <button data-mode="single" class="on">single run</button>
+        <button data-mode="compare">compare A/B</button>
+      </div>
+      <label class="pick-lbl">run A</label>
+      <select class="run-pick" id="runA"></select>
+      <span id="runBWrap" style="display:none">
+        <label class="pick-lbl">run B</label>
+        <select class="run-pick" id="runB"></select>
+      </span>
+    </div>
+
+    <div class="transport" id="transport">
+      <button class="play paused" id="playBtn">▶ PLAY</button>
+      <div class="speed">
+        <button data-speed="0.5">0.5×</button>
+        <button data-speed="1" class="on">1×</button>
+        <button data-speed="2">2×</button>
+        <button data-speed="4">4×</button>
+      </div>
+      <div class="track-wrap">
+        <div class="track">
+          <div class="fill"></div>
+          <div class="head"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="stage" id="stage">
+      <div id="panelA" style="display:contents"></div>
+      <div id="panelB" style="display:none"></div>
+    </div>
+
+    <footer class="foot">
+      <span><b style="color:var(--phosphor)">update delivery</b> = fraction of published state updates applied at peers (application goodput) — the metric that matters for swarm coordination.</span>
+      <span><b style="color:var(--ink-dim)">frame PDR</b> = raw channel delivered/attempted.</span>
+      <span><b style="color:var(--amber)">AoI</b> = age of information: seconds since the freshest peer update was applied.</span>
+      <span>scrub the timeline or press <b>Space</b> to play · <b>←/→</b> to step.</span>
+    </footer>
+  </div>
+
+  <script>window.NCZ = /*__DATA__*/;</script>
+  <script>/*__JS__*/</script>
+</body>
+</html>
