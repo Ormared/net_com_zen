@@ -1,0 +1,9 @@
+pub (crate) const RUSTC_COMMIT: &str = "ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96";
+pub (crate) const RUSTC_MAJOR: u16 = 1;
+pub (crate) const RUSTC_MINOR: u16 = 96;
+pub (crate) const RUSTC_PATCH: u16 = 0;
+pub (crate) const OPT_LEVEL: &str = "0";
+pub (crate) const DEBUG: &str = "false";
+pub (crate) const NUM_JOBS: &str = "24";
+pub (crate) const TARGET: &str = "x86_64-unknown-linux-gnu";
+pub (crate) const HOST: &str = "x86_64-unknown-linux-gnu";
