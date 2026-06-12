@@ -18,9 +18,12 @@ def test_smoke_run_produces_artifacts(tmp_path):
         run_task = asyncio.create_task(engine.run())
         await asyncio.wait_for(engine.ready.wait(), timeout=10)
         ns1 = engine.topo.ns_names["v1"]
-        # generate traffic: ping v2 from v1 through the channel
-        subprocess.run(["ip", "netns", "exec", ns1, "ping", "-c", "3", "-W", "2",
-                        "10.99.0.2"], check=True, capture_output=True)
+        # generate traffic: ping v2 from v1 through the channel; to_thread so the
+        # event loop (and with it the forwarder) keeps running meanwhile
+        await asyncio.to_thread(
+            subprocess.run,
+            ["ip", "netns", "exec", ns1, "ping", "-c", "3", "-W", "2", "10.99.0.2"],
+            check=True, capture_output=True)
         await run_task
 
     asyncio.run(go())

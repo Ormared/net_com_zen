@@ -22,9 +22,12 @@ def test_zenoh_pubsub_through_channel(tmp_path):
                                 "tests/helpers/zsub.py"],
                                stdout=subprocess.PIPE, text=True)
         await asyncio.sleep(1.5)
-        subprocess.run(["ip", "netns", "exec", ns2, sys.executable,
-                        "tests/helpers/zpub.py", "10.99.0.1"], check=True, timeout=30)
-        out, _ = sub.communicate(timeout=30)
+        # to_thread: blocking the event loop would freeze the forwarder
+        await asyncio.to_thread(
+            subprocess.run,
+            ["ip", "netns", "exec", ns2, sys.executable,
+             "tests/helpers/zpub.py", "10.99.0.1"], check=True, timeout=30)
+        out, _ = await asyncio.to_thread(sub.communicate, timeout=30)
         assert int(out.strip()) > 0  # zenoh messages crossed the emulated channel
         await run_task
 

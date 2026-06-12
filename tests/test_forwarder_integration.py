@@ -1,5 +1,6 @@
 import asyncio
 import subprocess
+import sys
 
 import pytest
 
@@ -27,19 +28,22 @@ def test_udp_through_channel():
             fwd.update_links({("v1", "v2"): good_link("v1", "v2"),
                               ("v2", "v1"): good_link("v2", "v1")})
             fwd.start()
+            # NOTE: subprocess calls go through to_thread — blocking the event
+            # loop would freeze the forwarder and nothing would be delivered.
             recv = subprocess.Popen(
-                ["ip", "netns", "exec", topo.ns_names["v2"], "python", "-c",
+                ["ip", "netns", "exec", topo.ns_names["v2"], sys.executable, "-c",
                  "import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);"
-                 "s.bind(('10.99.0.2',9000));s.settimeout(5);print(len(s.recv(100)))"],
+                 "s.bind(('10.99.0.2',9000));s.settimeout(8);print(len(s.recv(100)))"],
                 stdout=subprocess.PIPE, text=True)
             await asyncio.sleep(1.0)
             for _ in range(5):  # first sends may race ARP resolution
-                subprocess.run(
-                    ["ip", "netns", "exec", topo.ns_names["v1"], "python", "-c",
+                await asyncio.to_thread(
+                    subprocess.run,
+                    ["ip", "netns", "exec", topo.ns_names["v1"], sys.executable, "-c",
                      "import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);"
                      "s.sendto(b'x'*64,('10.99.0.2',9000))"], check=True)
                 await asyncio.sleep(0.2)
-            out, _ = recv.communicate(timeout=10)
+            out, _ = await asyncio.to_thread(recv.communicate, timeout=10)
             assert out.strip() == "64"
             fwd.stop()
 
