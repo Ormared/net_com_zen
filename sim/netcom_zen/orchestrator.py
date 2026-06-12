@@ -79,6 +79,11 @@ class ScenarioEngine:
         agent_exit: dict[str, int | None] = {}
         try:
             fwd.start()
+            # install the initial link-state table BEFORE agents spawn, so their
+            # first connection attempts don't die as no_link
+            positions0 = {nid: (v.x, v.y) for nid, v in self.vehicles.items()}
+            fwd.update_links(build_table(positions0, self.jammers, 0.0,
+                                         self.scenario.radio, self.pathloss))
             agents = self._spawn_agents() if self.scenario.agent.enabled else {}
             self.ready.set()
             t = 0.0

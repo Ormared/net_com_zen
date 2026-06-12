@@ -125,6 +125,7 @@ async fn main() -> Result<()> {
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(args.duration_s);
     let mut ticker = tokio::time::interval(Duration::from_millis(args.period_ms));
+    let mut peer_probe = tokio::time::interval(Duration::from_secs(1));
     let mut seq: u64 = 0;
 
     loop {
@@ -188,6 +189,14 @@ async fn main() -> Result<()> {
                         }));
                     }
                 }
+            }
+            _ = peer_probe.tick() => {
+                let peers: Vec<String> = session.info().peers_zid().await
+                    .map(|z| z.to_string()).collect();
+                metrics.log(serde_json::json!({
+                    "type": "zenoh_peers", "id": args.id, "ts_us": now_us(),
+                    "n": peers.len(), "zids": peers
+                }));
             }
             _ = tokio::time::sleep_until(deadline) => {
                 break;
