@@ -10,8 +10,11 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Run a net_com_zen scenario (needs root)")
     ap.add_argument("scenario")
     ap.add_argument("-o", "--out", default="results/latest")
+    ap.add_argument("--ros2-viz", action="store_true",
+                    help="publish live state for RViz (needs the ros2 pixi env)")
     args = ap.parse_args()
-    engine = ScenarioEngine(load_scenario(args.scenario), Path(args.out))
+    engine = ScenarioEngine(load_scenario(args.scenario), Path(args.out),
+                            ros2_viz=args.ros2_viz)
     asyncio.run(engine.run())
 
 

@@ -54,6 +54,32 @@ def test_build_table_directed_pairs():
     assert st.jam_inchannel_dbm is not None
 
 
+def _empirical_delivery(st, n=4000):
+    rng = link_rng(seed=7, src="a", dst="b")
+    hits = sum(st.verdict(255, rng.random(), rng.random()) == "deliver"
+               for _ in range(n))
+    return hits / n
+
+
+@pytest.mark.parametrize("kw", [
+    {},                                                  # strong, clear
+    {"prx_dbm": -104},                                   # marginal
+    {"prx_dbm": -90, "rho": 0.3, "jam_inchannel_dbm": -70},   # jammed
+    {"medium": "sat", "sat_loss": 0.15},                 # satellite
+])
+def test_delivery_prob_matches_verdict_stats(kw):
+    st = make_state(**kw)
+    p = st.delivery_prob(255)
+    assert 0.0 <= p <= 1.0
+    assert _empirical_delivery(st) == pytest.approx(p, abs=0.03)
+
+
+def test_delivery_prob_falls_under_jamming():
+    clear = make_state().delivery_prob(255)
+    jammed = make_state(rho=0.5, jam_inchannel_dbm=-60).delivery_prob(255)
+    assert jammed < clear
+
+
 def test_replay_determinism():
     st = make_state(prx_dbm=-105, rho=0.3, jam_inchannel_dbm=-95)
 

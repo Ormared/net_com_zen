@@ -109,6 +109,15 @@ class AgentConfig(BaseModel):
     sync_mode: Literal["delta", "state"] = "delta"  # CRDT sync strategy (A/B)
 
 
+class Ros2WorkloadConfig(BaseModel):
+    """R3 wiring B (ADR-0006): stock ROS 2 telemetry over rmw_zenoh, peering
+    across the emulated channel via one zenoh router per netns."""
+    period_ms: int = Field(gt=0, default=500)
+    payload_bytes: int = Field(gt=0, default=255)  # ~ one state-sync snapshot
+    reliability: Literal["reliable", "best_effort"] = "reliable"  # stock default
+    port: int = 7447  # router port inside each netns
+
+
 class Scenario(BaseModel):
     name: str
     duration_s: float = Field(gt=0)
@@ -118,7 +127,9 @@ class Scenario(BaseModel):
     nodes: list[NodeConfig] = Field(min_length=2, max_length=8)
     environment: EnvironmentConfig = EnvironmentConfig()
     jammers: list[JammerConfig] = []
+    workload: Literal["agent", "ros2"] = "agent"  # what crosses the channel
     agent: AgentConfig = AgentConfig()
+    ros2: Ros2WorkloadConfig = Ros2WorkloadConfig()
     satellite: SatelliteConfig = SatelliteConfig()
 
     @model_validator(mode="after")

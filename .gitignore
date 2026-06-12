@@ -1,7 +1,8 @@
 .pixi/
 __pycache__/
 *.egg-info/
-results/
+# run outputs at the repo root only -- docs/results/ is tracked
+/results/
 validation/report.md
 # Rust build artifacts (regenerable)
 target/

@@ -4,7 +4,9 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -28,25 +30,45 @@ def _git_hash() -> str:
         return "unknown"
 
 
+@dataclass
+class World:
+    """Scenario-derived simulation state, buildable without root (the netns
+    dataplane is separate). Shared by the engine and the ROS 2 viz demo."""
+    terrain: Terrain
+    pathloss: CompositePathloss
+    vehicles: dict[str, WaypointVehicle]
+    jammers: list[Jammer]
+
+
+def build_world(scenario: Scenario) -> World:
+    env = scenario.environment
+    hm = np.load(env.heightmap) if env.heightmap else None
+    terrain = Terrain(env.extent_m, hm,
+                      [FoliageRegion(**f.model_dump()) for f in env.foliage])
+    return World(
+        terrain=terrain,
+        pathloss=CompositePathloss(terrain),
+        vehicles={n.id: WaypointVehicle(n.waypoints, n.speed_mps)
+                  for n in scenario.nodes},
+        jammers=[Jammer(j) for j in scenario.jammers])
+
+
 class ScenarioEngine:
     """Owns the single clock: tick loop driving mobility -> pathloss ->
     link-state -> forwarder (architecture.md)."""
 
-    def __init__(self, scenario: Scenario, out_dir: str | Path):
+    def __init__(self, scenario: Scenario, out_dir: str | Path,
+                 ros2_viz: bool = False):
         self.scenario = scenario
         self.out_dir = Path(out_dir)
+        self.ros2_viz = ros2_viz
         self.ready = asyncio.Event()
         self.topo: NetnsTopology | None = None
 
     def _build(self) -> None:
-        env = self.scenario.environment
-        hm = np.load(env.heightmap) if env.heightmap else None
-        terrain = Terrain(env.extent_m, hm,
-                          [FoliageRegion(**f.model_dump()) for f in env.foliage])
-        self.pathloss = CompositePathloss(terrain)
-        self.vehicles = {n.id: WaypointVehicle(n.waypoints, n.speed_mps)
-                         for n in self.scenario.nodes}
-        self.jammers = [Jammer(j) for j in self.scenario.jammers]
+        w = build_world(self.scenario)
+        self.terrain, self.pathloss = w.terrain, w.pathloss
+        self.vehicles, self.jammers = w.vehicles, w.jammers
 
     def _spawn_agents(self) -> dict[str, subprocess.Popen]:
         cfg = self.scenario.agent
@@ -81,6 +103,61 @@ class ScenarioEngine:
             agents[nid] = subprocess.Popen(cmd)
         return agents
 
+    def _spawn_ros2(self) -> dict[str, subprocess.Popen]:
+        """Wiring B (ADR-0006): per netns one zenoh router (explicit TCP mesh
+        over the TUN addresses; multicast scouting is off in rmw_zenoh's
+        defaults, so no traffic can bypass the channel) plus a stock-ROS2
+        telemetry node that reaches its router over loopback."""
+        cfg = self.scenario.ros2
+        prefix = Path(sys.executable).resolve().parents[1]
+        zenohd = prefix / "lib" / "rmw_zenoh_cpp" / "rmw_zenohd"
+        if not zenohd.exists():
+            raise RuntimeError(
+                f"{zenohd} not found: workload=ros2 must run with the ros2 "
+                "pixi env python (sudo .pixi/envs/ros2/bin/python ...)")
+        log_dir = self.out_dir / "ros_logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        # sudo strips the activation env; children need only these (verified
+        # against a bare `env -i`)
+        base_env = {
+            "AMENT_PREFIX_PATH": str(prefix),
+            "ROS_LOG_DIR": str(log_dir),
+            "RMW_IMPLEMENTATION": "rmw_zenoh_cpp",
+            "PYTHONNOUSERSITE": "1",
+            "PATH": os.environ.get("PATH", "/usr/sbin:/usr/bin:/sbin:/bin"),
+        }
+        nodes = list(self.topo.nodes)
+        for i, nid in enumerate(nodes):
+            # lower-index mesh: exactly one router-router TCP link per pair
+            connect = [f'"tcp/{self.topo.addrs[p]}:{cfg.port}"'
+                       for p in nodes[:i]]
+            override = (
+                f'listen/endpoints=["tcp/{self.topo.addrs[nid]}:{cfg.port}",'
+                f'"tcp/127.0.0.1:{cfg.port}"]'
+                + (f';connect/endpoints=[{",".join(connect)}]'
+                   if connect else ""))
+            self._routers[nid] = subprocess.Popen(
+                ["ip", "netns", "exec", self.topo.ns_names[nid], str(zenohd)],
+                env={**base_env, "ZENOH_CONFIG_OVERRIDE": override},
+                stdout=(self.out_dir / f"router_{nid}.log").open("w"),
+                stderr=subprocess.STDOUT)
+        time.sleep(1.0)  # let routers accept before sessions dial in
+        agents: dict[str, subprocess.Popen] = {}
+        for nid in nodes:
+            cmd = ["ip", "netns", "exec", self.topo.ns_names[nid],
+                   sys.executable, "-m", "netcom_zen.ros2_workload",
+                   "--id", nid,
+                   "--peers", ",".join(p for p in nodes if p != nid),
+                   "--period-ms", str(cfg.period_ms),
+                   "--payload-bytes", str(cfg.payload_bytes),
+                   "--reliability", cfg.reliability,
+                   "--duration-s", str(self.scenario.duration_s),
+                   "--metrics", str(self.out_dir / f"agent_{nid}.jsonl")]
+            env = {**base_env, "ZENOH_CONFIG_OVERRIDE":
+                   f'connect/endpoints=["tcp/127.0.0.1:{cfg.port}"]'}
+            agents[nid] = subprocess.Popen(cmd, env=env)
+        return agents
+
     async def run(self) -> None:
         self._build()
         self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -94,7 +171,13 @@ class ScenarioEngine:
         dt = 1.0 / self.scenario.tick_hz
         agents: dict[str, subprocess.Popen] = {}
         agent_exit: dict[str, int | None] = {}
+        self._routers: dict[str, subprocess.Popen] = {}
         track: list[tuple] = []  # per-tick (t, id, x, y, heading) for visualization
+        bridge = None
+        if self.ros2_viz:
+            # lazy: rclpy exists only in the ros2 pixi env (ADR-0006)
+            from .ros2_bridge import RosVizBridge
+            bridge = RosVizBridge(self.terrain)
         try:
             fwd.start()
             # install the initial link-state table BEFORE agents spawn, so their
@@ -104,7 +187,9 @@ class ScenarioEngine:
                 positions0, self.jammers, 0.0, self.scenario.radio, self.pathloss,
                 command_id=self.scenario.command_id,
                 satellite=self.scenario.satellite))
-            agents = self._spawn_agents() if self.scenario.agent.enabled else {}
+            agents = (self._spawn_ros2() if self.scenario.workload == "ros2"
+                      else self._spawn_agents()
+                      if self.scenario.agent.enabled else {})
             self.ready.set()
             t = 0.0
             wall0 = time.monotonic()
@@ -118,10 +203,13 @@ class ScenarioEngine:
                 for nid, p in poses.items():
                     track.append((round(t, 3), nid, round(p.x, 2), round(p.y, 2),
                                   round(p.heading, 4)))
-                fwd.update_links(build_table(
+                table = build_table(
                     positions, self.jammers, t, self.scenario.radio, self.pathloss,
                     command_id=self.scenario.command_id,
-                    satellite=self.scenario.satellite))
+                    satellite=self.scenario.satellite)
+                fwd.update_links(table)
+                if bridge:
+                    bridge.publish_tick(t, poses, table, self.jammers)
                 await asyncio.sleep(dt)
                 t += dt
                 lag = (time.monotonic() - wall0) - t
@@ -134,9 +222,11 @@ class ScenarioEngine:
                 agent_exit[nid] = p.wait(timeout=10)
             fwd.stop()
         finally:
-            for p in agents.values():
+            for p in list(agents.values()) + list(self._routers.values()):
                 if p.poll() is None:
                     p.kill()
+            if bridge:
+                bridge.close()
             self.topo.teardown()
         log.to_parquet(self.out_dir / "packets.parquet")
         if track:
