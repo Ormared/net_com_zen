@@ -3,3 +3,6 @@ __pycache__/
 *.egg-info/
 results/
 validation/report.md
+# Rust build artifacts (regenerable)
+target/
+agent/target/
