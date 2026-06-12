@@ -25,5 +25,16 @@ def test_scenario_carries_transport():
                   "data_rate_bps": 250e3, "hop": {"n_channels": 50, "hop_rate_hz": 100}},
         "nodes": [{"id": "v1", "waypoints": [[0, 0]]},
                   {"id": "v2", "waypoints": [[1, 1]]}],
-        "agent": {"enabled": True, "transport": "udp"}})
+        "agent": {"enabled": True, "transport": "udp", "sync_mode": "state"}})
     assert s.agent.transport == "udp"
+    assert s.agent.sync_mode == "state"
+
+
+def test_sync_mode_defaults_delta():
+    assert AgentConfig().sync_mode == "delta"
+
+
+def test_invalid_sync_mode_rejected():
+    import pytest
+    with pytest.raises(Exception):
+        AgentConfig.model_validate({"sync_mode": "telepathy"})

@@ -8,6 +8,7 @@
 //! are merged (CRDT). Every publish/receive is logged as a JSONL metrics event
 //! for the harness (age-of-information is computed offline from timestamps).
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -65,6 +66,14 @@ struct Args {
     /// meaningful over an unreliable link (udp). CRDT snapshots heal the gaps.
     #[arg(long, default_value = "reliable")]
     reliability: String,
+    /// CRDT sync strategy:
+    ///   delta = automerge op-deltas + periodic full snapshot (op-based; a lost
+    ///           delta orphans successors until the next full snapshot)
+    ///   state = each tick ships the node's full compact view of all peers
+    ///           ({id:[seq,ts]} map, one datagram, self-contained); a lost
+    ///           message is simply superseded by the next (state-based CRDT)
+    #[arg(long, default_value = "delta")]
+    sync_mode: String,
 }
 
 fn now_us() -> u64 {
@@ -197,14 +206,24 @@ async fn main() -> Result<()> {
     let mut command_link_up = true;
     let command_stale_us: u64 = args.period_ms * 1000 * 4;
 
+    // state-based sync store (sync_mode=state): peer -> (seq, ts_us)
+    let state_mode = args.sync_mode == "state";
+    let mut known: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    known.insert(args.id.clone(), (0, now_us()));
+
     loop {
         tokio::select! {
             _ = ticker.tick() => {
                 seq += 1;
-                update_own_entry(&mut doc, &args.id, seq)?;
-                let (kind, bytes) = if seq % args.full_every == 0 {
+                let (kind, bytes) = if state_mode {
+                    // ship the full compact view (gossip relay); one datagram
+                    known.insert(args.id.clone(), (seq, now_us()));
+                    ("snap", serde_json::to_vec(&known)?)
+                } else if seq % args.full_every == 0 {
+                    update_own_entry(&mut doc, &args.id, seq)?;
                     ("full", doc.save())
                 } else {
+                    update_own_entry(&mut doc, &args.id, seq)?;
                     ("inc", doc.save_incremental())
                 };
                 if bytes.is_empty() {
@@ -247,6 +266,38 @@ async fn main() -> Result<()> {
                     },
                     None => wire.clone(),
                 };
+                if state_mode {
+                    // state-based merge: apply each strictly-newer peer entry,
+                    // logging recv per entry (from = that entry's origin peer, so
+                    // relayed state still credits the originator for AoI/failover)
+                    match serde_json::from_slice::<BTreeMap<String, (u64, u64)>>(&payload) {
+                        Ok(incoming) => {
+                            for (peer, (pseq, pts)) in incoming {
+                                if peer == args.id {
+                                    continue;
+                                }
+                                let cur = known.get(&peer).map(|v| v.0).unwrap_or(0);
+                                if pseq > cur {
+                                    known.insert(peer.clone(), (pseq, pts));
+                                    metrics.log(serde_json::json!({
+                                        "type": "recv", "id": args.id, "from": peer,
+                                        "kind": "snap", "peer_seq": pseq,
+                                        "peer_ts_us": pts, "ts_us": recv_us,
+                                        "bytes": wire.len()
+                                    }));
+                                    if args.command_id.as_deref() == Some(peer.as_str()) {
+                                        last_command_us = Some(recv_us);
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => metrics.log(serde_json::json!({
+                            "type": "decode_error", "id": args.id, "from": from,
+                            "kind": "snap", "ts_us": recv_us, "error": e.to_string()
+                        })),
+                    }
+                    continue;
+                }
                 let merged = if kind == "full" {
                     AutoCommit::load(&payload)
                         .and_then(|mut other| doc.merge(&mut other).map(|_| ()))
@@ -301,14 +352,18 @@ async fn main() -> Result<()> {
                             "type": "link_down", "id": args.id, "ts_us": now,
                             "command": args.command_id
                         }));
-                        // push a full snapshot to accelerate mesh resync at command
-                        let snap = doc.save();
+                        // push a snapshot to accelerate mesh resync at command
+                        let (snap_kind, snap) = if state_mode {
+                            ("snap", serde_json::to_vec(&known)?)
+                        } else {
+                            ("full", doc.save())
+                        };
                         let wire = match mls_layer.as_mut() {
                             Some(layer) => layer.encrypt(&snap)?,
                             None => snap,
                         };
                         let _ = session.put(
-                            format!("ncz/state/{}/full", args.id), wire)
+                            format!("ncz/state/{}/{}", args.id, snap_kind), wire)
                             .reliability(reliability).await;
                     } else if fresh && !command_link_up {
                         command_link_up = true;
@@ -326,12 +381,18 @@ async fn main() -> Result<()> {
     }
 
     // final state summary: what this node knows about everyone
-    let known: Vec<_> = peer_entries(&doc)
-        .into_iter()
-        .map(|(p, s, t)| serde_json::json!({"peer": p, "seq": s, "ts_us": t}))
-        .collect();
+    let final_known: Vec<_> = if state_mode {
+        known.iter()
+            .map(|(p, (s, t))| serde_json::json!({"peer": p, "seq": s, "ts_us": t}))
+            .collect()
+    } else {
+        peer_entries(&doc)
+            .into_iter()
+            .map(|(p, s, t)| serde_json::json!({"peer": p, "seq": s, "ts_us": t}))
+            .collect()
+    };
     metrics.log(serde_json::json!({
-        "type": "final_state", "id": args.id, "ts_us": now_us(), "known": known
+        "type": "final_state", "id": args.id, "ts_us": now_us(), "known": final_known
     }));
     // best-effort: peers all close simultaneously over slow emulated links, so
     // a close timeout is expected occasionally and must not fail the run
