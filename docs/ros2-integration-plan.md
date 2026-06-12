@@ -41,17 +41,21 @@ jammer markers — driven entirely by published sim time.
 ROS 2 processes inside per-vehicle netns'es, telemetry workload crossing the
 emulated channel both ways of the A/B:
 
-- **Wiring A (agent-mediated):** a thin per-vehicle bridge node maps ROS 2 topics to
-  the local Rust agent (localhost zenoh session or unix socket inside the netns —
-  needs a small local-API addition to the agent). Agent remains the only channel
-  crosser: CRDT + MLS + link manager intact.
-- **Wiring B (raw rmw_zenoh):** `RMW_IMPLEMENTATION=rmw_zenoh_cpp` nodes per netns;
-  zenoh routers peer over the TUN interfaces. Router topology/config is the main
-  unknown — spike first.
-- Harness: launch/teardown of ROS 2 processes in netns'es (`ip netns exec` with the
-  pixi env), workload generator node (pose + telemetry publishing at fixed rate),
-  AoI/goodput extraction into the existing parquet pipeline.
-- Benchmark: same jamming sweep as the transport A/B; axis `wiring = agent | rmw_zenoh`.
+- **Wiring A (agent-mediated):** the Rust agent's own telemetry workload (CRDT +
+  MLS, udp+state champion config) at matched period/payload. *Scoping decision:*
+  the original idea of ROS 2 nodes feeding the agent through a local API adds a
+  loopback hop that doesn't cross the channel and can't move the comparison; the
+  local API is deferred until a real autonomy workload exists (R4+/Isaac era).
+- **Wiring B (raw rmw_zenoh):** `RMW_IMPLEMENTATION=rmw_zenoh_cpp` nodes per netns
+  (`ros2_workload` package); one zenoh router per netns, explicit TCP mesh over
+  the TUN addresses (multicast scouting off — nothing bypasses the channel),
+  sessions reach their router over loopback. Spiked successfully on localhost
+  before integration.
+- Harness: the workload node emits the agent's JSONL metrics schema
+  (`pub`/`recv`/`final_state` into `agent_<id>.jsonl`), so AoI/report/sweep
+  consume ROS 2 runs unchanged; `workload: agent | ros2` is a sweep axis.
+- Benchmark: `scenarios/sweep_ros2_vs_agent.yaml` — workload × jammer power,
+  paired seeds.
 
 **Exit:** resilience curves (PDR / latency / AoI vs jammer power) for both wirings
 from one sweep definition; drop attribution still per-packet.

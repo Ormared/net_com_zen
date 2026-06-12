@@ -1,0 +1,41 @@
+# R3 A/B base (ADR-0006): the resilient agent config (udp + state sync) vs
+# stock ROS2-over-rmw_zenoh, same vehicles/jammer as resilience_4node.
+# `workload` is the sweep axis.
+name: ros2-vs-agent-4node
+duration_s: 60
+tick_hz: 10
+seed: 0
+radio:
+  freq_hz: 433.0e6
+  bandwidth_hz: 250.0e3
+  tx_power_dbm: 27.0
+  noise_figure_db: 7.0
+  data_rate_bps: 250.0e3
+  hop: {n_channels: 50, hop_rate_hz: 100.0}
+nodes:
+  - {id: v1, waypoints: [[150, 300], [400, 300]], speed_mps: 3.0}
+  - {id: v2, waypoints: [[150, 500], [400, 500]], speed_mps: 3.0}
+  - {id: v3, waypoints: [[150, 700], [400, 700]], speed_mps: 3.0}
+  - {id: v4, waypoints: [[600, 500], [850, 500]], speed_mps: 3.0}
+environment:
+  extent_m: [1000, 1000]
+  foliage:
+    - {x_min: 450, x_max: 550, y_min: 0, y_max: 1000}
+jammers:
+  - id: j1
+    kind: barrage
+    position: [500, 900]
+    tx_power_dbm: 40.0      # sweep axis
+    bandwidth_hz: 12.5e6
+    start_s: 20.0
+workload: agent             # sweep axis: agent | ros2
+agent:
+  enabled: true
+  period_ms: 500
+  full_every: 10
+  transport: udp            # the transport/sync A/B champion
+  sync_mode: state
+ros2:
+  period_ms: 500            # matched workload
+  payload_bytes: 255        # ~ one state snapshot
+  reliability: reliable     # stock ROS2 default QoS

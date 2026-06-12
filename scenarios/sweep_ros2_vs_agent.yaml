@@ -1,0 +1,7 @@
+# R3 headline sweep (~25 min): what does the purpose-built agent buy over
+# stock ROS2 middleware under EW? 2 workloads x 3 powers x 2 seeds, 60 s runs.
+base: ros2_vs_agent_4node.yaml
+axes:
+  workload: [agent, ros2]
+  jammers.0.tx_power_dbm: [45.0, 55.0, 65.0]
+seeds: [1, 2]

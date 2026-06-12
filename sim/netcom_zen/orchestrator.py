@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -102,6 +103,61 @@ class ScenarioEngine:
             agents[nid] = subprocess.Popen(cmd)
         return agents
 
+    def _spawn_ros2(self) -> dict[str, subprocess.Popen]:
+        """Wiring B (ADR-0006): per netns one zenoh router (explicit TCP mesh
+        over the TUN addresses; multicast scouting is off in rmw_zenoh's
+        defaults, so no traffic can bypass the channel) plus a stock-ROS2
+        telemetry node that reaches its router over loopback."""
+        cfg = self.scenario.ros2
+        prefix = Path(sys.executable).resolve().parents[1]
+        zenohd = prefix / "lib" / "rmw_zenoh_cpp" / "rmw_zenohd"
+        if not zenohd.exists():
+            raise RuntimeError(
+                f"{zenohd} not found: workload=ros2 must run with the ros2 "
+                "pixi env python (sudo .pixi/envs/ros2/bin/python ...)")
+        log_dir = self.out_dir / "ros_logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        # sudo strips the activation env; children need only these (verified
+        # against a bare `env -i`)
+        base_env = {
+            "AMENT_PREFIX_PATH": str(prefix),
+            "ROS_LOG_DIR": str(log_dir),
+            "RMW_IMPLEMENTATION": "rmw_zenoh_cpp",
+            "PYTHONNOUSERSITE": "1",
+            "PATH": os.environ.get("PATH", "/usr/sbin:/usr/bin:/sbin:/bin"),
+        }
+        nodes = list(self.topo.nodes)
+        for i, nid in enumerate(nodes):
+            # lower-index mesh: exactly one router-router TCP link per pair
+            connect = [f'"tcp/{self.topo.addrs[p]}:{cfg.port}"'
+                       for p in nodes[:i]]
+            override = (
+                f'listen/endpoints=["tcp/{self.topo.addrs[nid]}:{cfg.port}",'
+                f'"tcp/127.0.0.1:{cfg.port}"]'
+                + (f';connect/endpoints=[{",".join(connect)}]'
+                   if connect else ""))
+            self._routers[nid] = subprocess.Popen(
+                ["ip", "netns", "exec", self.topo.ns_names[nid], str(zenohd)],
+                env={**base_env, "ZENOH_CONFIG_OVERRIDE": override},
+                stdout=(self.out_dir / f"router_{nid}.log").open("w"),
+                stderr=subprocess.STDOUT)
+        time.sleep(1.0)  # let routers accept before sessions dial in
+        agents: dict[str, subprocess.Popen] = {}
+        for nid in nodes:
+            cmd = ["ip", "netns", "exec", self.topo.ns_names[nid],
+                   sys.executable, "-m", "netcom_zen.ros2_workload",
+                   "--id", nid,
+                   "--peers", ",".join(p for p in nodes if p != nid),
+                   "--period-ms", str(cfg.period_ms),
+                   "--payload-bytes", str(cfg.payload_bytes),
+                   "--reliability", cfg.reliability,
+                   "--duration-s", str(self.scenario.duration_s),
+                   "--metrics", str(self.out_dir / f"agent_{nid}.jsonl")]
+            env = {**base_env, "ZENOH_CONFIG_OVERRIDE":
+                   f'connect/endpoints=["tcp/127.0.0.1:{cfg.port}"]'}
+            agents[nid] = subprocess.Popen(cmd, env=env)
+        return agents
+
     async def run(self) -> None:
         self._build()
         self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -115,6 +171,7 @@ class ScenarioEngine:
         dt = 1.0 / self.scenario.tick_hz
         agents: dict[str, subprocess.Popen] = {}
         agent_exit: dict[str, int | None] = {}
+        self._routers: dict[str, subprocess.Popen] = {}
         bridge = None
         if self.ros2_viz:
             # lazy: rclpy exists only in the ros2 pixi env (ADR-0006)
@@ -129,7 +186,9 @@ class ScenarioEngine:
                 positions0, self.jammers, 0.0, self.scenario.radio, self.pathloss,
                 command_id=self.scenario.command_id,
                 satellite=self.scenario.satellite))
-            agents = self._spawn_agents() if self.scenario.agent.enabled else {}
+            agents = (self._spawn_ros2() if self.scenario.workload == "ros2"
+                      else self._spawn_agents()
+                      if self.scenario.agent.enabled else {})
             self.ready.set()
             t = 0.0
             wall0 = time.monotonic()
@@ -159,7 +218,7 @@ class ScenarioEngine:
                 agent_exit[nid] = p.wait(timeout=10)
             fwd.stop()
         finally:
-            for p in agents.values():
+            for p in list(agents.values()) + list(self._routers.values()):
                 if p.poll() is None:
                     p.kill()
             if bridge:
