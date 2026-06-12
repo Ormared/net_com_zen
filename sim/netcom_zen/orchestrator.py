@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -47,20 +48,46 @@ class ScenarioEngine:
                          for n in self.scenario.nodes}
         self.jammers = [Jammer(j) for j in self.scenario.jammers]
 
+    def _spawn_agents(self) -> dict[str, subprocess.Popen]:
+        cfg = self.scenario.agent
+        bin_path = os.environ.get("NCZ_AGENT_BIN", "agent/target/release/ncz-agent")
+        agents: dict[str, subprocess.Popen] = {}
+        for nid in self.topo.nodes:
+            others = [f"tcp/{self.topo.addrs[n]}:{cfg.port}"
+                      for n in self.topo.nodes if n != nid]
+            cmd = ["ip", "netns", "exec", self.topo.ns_names[nid], bin_path,
+                   "--id", nid,
+                   "--listen", f"tcp/{self.topo.addrs[nid]}:{cfg.port}",
+                   "--metrics", str(self.out_dir / f"agent_{nid}.jsonl"),
+                   "--period-ms", str(cfg.period_ms),
+                   "--duration-s", str(self.scenario.duration_s)]
+            for o in others:
+                cmd += ["--connect", o]
+            agents[nid] = subprocess.Popen(cmd)
+        return agents
+
     async def run(self) -> None:
         self._build()
+        self.out_dir.mkdir(parents=True, exist_ok=True)
         self.topo = NetnsTopology([n.id for n in self.scenario.nodes])
         self.topo.setup()
         log = PacketLog()
         fwd = ChannelForwarder(self.topo, self.scenario.seed, log)
         max_tick_lag = 0.0  # timing integrity (architecture.md)
         dt = 1.0 / self.scenario.tick_hz
+        agents: dict[str, subprocess.Popen] = {}
+        agent_exit: dict[str, int | None] = {}
         try:
             fwd.start()
+            agents = self._spawn_agents() if self.scenario.agent.enabled else {}
             self.ready.set()
             t = 0.0
             wall0 = time.monotonic()
-            while t < self.scenario.duration_s:
+            # keep the channel alive until duration elapsed AND agents exited
+            # (a dead agent mid-run is a logged event, not an abort)
+            grace = self.scenario.duration_s + 10.0
+            while t < self.scenario.duration_s or (
+                    t < grace and any(p.poll() is None for p in agents.values())):
                 poses = {nid: v.step(dt) for nid, v in self.vehicles.items()}
                 positions = {nid: (p.x, p.y) for nid, p in poses.items()}
                 fwd.update_links(build_table(positions, self.jammers, t,
@@ -68,10 +95,16 @@ class ScenarioEngine:
                 await asyncio.sleep(dt)
                 t += dt
                 max_tick_lag = max(max_tick_lag, (time.monotonic() - wall0) - t)
+            for nid, p in agents.items():
+                if p.poll() is None:
+                    p.kill()
+                agent_exit[nid] = p.wait(timeout=10)
             fwd.stop()
         finally:
+            for p in agents.values():
+                if p.poll() is None:
+                    p.kill()
             self.topo.teardown()
-        self.out_dir.mkdir(parents=True, exist_ok=True)
         log.to_parquet(self.out_dir / "packets.parquet")
         (self.out_dir / "manifest.json").write_text(json.dumps({
             "scenario": self.scenario.model_dump(mode="json"),
@@ -79,4 +112,5 @@ class ScenarioEngine:
             "git_hash": _git_hash(),
             "max_tick_lag_s": max_tick_lag,
             "timing_ok": max_tick_lag < dt,
+            "agent_exit_codes": agent_exit,
         }, indent=2))

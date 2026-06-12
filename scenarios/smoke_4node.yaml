@@ -1,0 +1,21 @@
+name: smoke-4node
+duration_s: 10
+tick_hz: 10
+seed: 42
+radio:
+  freq_hz: 433.0e6
+  bandwidth_hz: 250.0e3
+  tx_power_dbm: 27.0
+  noise_figure_db: 7.0
+  data_rate_bps: 250.0e3
+  hop: {n_channels: 50, hop_rate_hz: 100.0}
+nodes:
+  - {id: v1, waypoints: [[100, 500]], speed_mps: 0.1}
+  - {id: v2, waypoints: [[200, 500]], speed_mps: 0.1}
+  - {id: v3, waypoints: [[150, 580]], speed_mps: 0.1}
+  - {id: v4, waypoints: [[150, 420]], speed_mps: 0.1}
+environment:
+  extent_m: [1000, 1000]
+agent:
+  enabled: true
+  period_ms: 500

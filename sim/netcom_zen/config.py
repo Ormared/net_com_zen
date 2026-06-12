@@ -66,6 +66,12 @@ class JammerConfig(BaseModel):
         return self
 
 
+class AgentConfig(BaseModel):
+    enabled: bool = False
+    period_ms: int = Field(gt=0, default=500)
+    port: int = 7447
+
+
 class Scenario(BaseModel):
     name: str
     duration_s: float = Field(gt=0)
@@ -75,6 +81,7 @@ class Scenario(BaseModel):
     nodes: list[NodeConfig] = Field(min_length=2, max_length=8)
     environment: EnvironmentConfig = EnvironmentConfig()
     jammers: list[JammerConfig] = []
+    agent: AgentConfig = AgentConfig()
 
     @model_validator(mode="after")
     def _unique_ids(self):
