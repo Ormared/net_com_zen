@@ -7,7 +7,8 @@
 | **M3 — MVP benchmark** | Jammer scenarios, sweep harness, paired-seed replay, plotting | Jamming resilience curves produced (PDR / latency / AoI vs jammer power × hop rate) |
 | **M-gate — EMANE spike** ✅ | Reproduced one M3 cell in EMANE + emane-jammer-simple | **DONE 2026-06-12:** [ADR-0005](adr/0005-emane-spike-decision.md) — proceed hand-rolled, retain EMANE for cross-validation; weak-link calibration + MLS hardening logged as follow-ups |
 | **M4 — Satellite failover** ✅ | Satlink channel model, agent link manager, outage scenario | **DONE 2026-06-12:** clean fallback seamless (0.27 s swarm failover); under jamming the RF fallback's zenoh-over-TCP goodput collapses (sessions stay up via keepalives, no state crosses) → command isolated, link manager fires `link_down`. Reinforces the zenoh-over-UDP axis. |
-| **M5+** | Reactive jamming, routing comparisons, frequency-band sweeps, Sionna RT pathloss backend | per-feature |
+| **Transport A/B** ✅ | zenoh-over-TCP vs UDP/best-effort under jamming | **DONE 2026-06-12:** UDP/best-effort wins app goodput + AoI at every power despite lower frame PDR (TCP head-of-line blocking). See [results/transport-tcp-vs-udp.md](results/transport-tcp-vs-udp.md) |
+| **M5+** | Reactive jamming, routing comparisons, frequency-band sweeps, FEC/interleaving axis, delta-state snapshots, Sionna RT pathloss backend | per-feature |
 
 Testing discipline throughout: unit tests per module; the model validation suite
 (`validation/`) reproduces published propagation curves and closed-form FHSS/SINR

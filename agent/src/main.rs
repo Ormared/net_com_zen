@@ -16,6 +16,7 @@ use anyhow::Result;
 use automerge::transaction::Transactable;
 use automerge::{AutoCommit, ObjType, ReadDoc};
 use clap::Parser;
+use zenoh::qos::Reliability;
 
 mod mls;
 
@@ -59,6 +60,11 @@ struct Args {
     /// push a full snapshot to accelerate mesh resync; log link_up on recovery.
     #[arg(long)]
     command_id: Option<String>,
+    /// Publication reliability. best-effort (fire-and-forget) avoids the
+    /// retransmit stalls that collapse reliable goodput under heavy loss; only
+    /// meaningful over an unreliable link (udp). CRDT snapshots heal the gaps.
+    #[arg(long, default_value = "reliable")]
+    reliability: String,
 }
 
 fn now_us() -> u64 {
@@ -174,6 +180,12 @@ async fn main() -> Result<()> {
         Some(layer)
     };
 
+    let reliability = if args.reliability == "best-effort" {
+        Reliability::BestEffort
+    } else {
+        Reliability::Reliable
+    };
+
     let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(args.duration_s);
     let mut ticker = tokio::time::interval(Duration::from_millis(args.period_ms));
     let mut peer_probe = tokio::time::interval(Duration::from_secs(1));
@@ -203,6 +215,7 @@ async fn main() -> Result<()> {
                     None => bytes,
                 };
                 session.put(format!("ncz/state/{}/{}", args.id, kind), wire.clone())
+                    .reliability(reliability)
                     .await
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
                 metrics.log(serde_json::json!({
@@ -295,7 +308,8 @@ async fn main() -> Result<()> {
                             None => snap,
                         };
                         let _ = session.put(
-                            format!("ncz/state/{}/full", args.id), wire).await;
+                            format!("ncz/state/{}/full", args.id), wire)
+                            .reliability(reliability).await;
                     } else if fresh && !command_link_up {
                         command_link_up = true;
                         metrics.log(serde_json::json!({
