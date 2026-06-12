@@ -31,4 +31,9 @@ sudo-test = "sudo $(which python) -m pytest tests -v -m sudo"
 validate = "pytest validation -v && python validation/report.py"
 setup-check = "python -m netcom_zen.setup_check"
 build-agent = "cargo build --release --manifest-path agent/Cargo.toml"
-dashboard = "streamlit run sim/netcom_zen/viz/app.py"
+# Standalone tactical dashboard (self-contained HTML, smooth synced playback).
+dashboard = "python -m netcom_zen.viz.serve"
+# Write the portable dashboard to a file (default dashboard.html, all playable runs).
+viz-export = "python -m netcom_zen.viz.export"
+# Legacy Streamlit/Plotly front end, kept for reference.
+dashboard-streamlit = "streamlit run sim/netcom_zen/viz/app.py"

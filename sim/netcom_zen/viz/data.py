@@ -13,6 +13,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 DROP_CAUSES = ["range", "foliage", "jam", "satloss", "queue", "no_link", "tx_error"]
@@ -186,3 +187,165 @@ def events_timeline(run: RunData) -> pd.DataFrame:
                              "kind": e["type"], "label": f"{nid}: {e['type']}"})
     df = pd.DataFrame(rows)
     return df.sort_values("t").reset_index(drop=True) if not df.empty else df
+
+
+def pdr_series(run: RunData, window_s: float = 1.0) -> pd.DataFrame:
+    """Network-wide frame PDR per time-window: delivered/attempts over all links.
+
+    Returns t, pdr, attempts (one row per non-empty bin)."""
+    lq = link_quality(run, window_s=window_s)
+    if lq.empty:
+        return pd.DataFrame(columns=["t", "pdr", "attempts"])
+    g = lq.groupby("bin").agg(delivered=("delivered", "sum"),
+                              attempts=("attempts", "sum")).reset_index()
+    g["pdr"] = g["delivered"] / g["attempts"]
+    return g.rename(columns={"bin": "t"})[["t", "pdr", "attempts"]]
+
+
+def update_delivery_series(run: RunData, window_s: float = 2.0) -> pd.DataFrame:
+    """Application goodput over time: fraction of *published state updates* that
+    actually land at a peer, binned by the receiver's run-time.
+
+    This is the headline metric of the A/B write-ups (it, not raw frame PDR,
+    is what UDP+state wins on). A published (src, seq) counts as delivered if any
+    other node received it; we attribute the landing to the bin of the first
+    receive. Denominator = published updates whose origin time falls in the bin.
+    Returns t, delivery, published, delivered."""
+    # published updates keyed by (src, seq) -> origin run-time
+    pub_t: dict[tuple[str, int], float] = {}
+    starts: dict[str, float] = {}
+    for nid, events in run.agent_events.items():
+        s = next((e["ts_us"] for e in events if e["type"] == "start"), None)
+        if s is None:
+            continue
+        starts[nid] = s
+        for e in events:
+            if e["type"] == "pub":
+                pub_t[(nid, e["seq"])] = (e["ts_us"] - s) / 1e6
+    if not pub_t:
+        return pd.DataFrame(columns=["t", "delivery", "published", "delivered"])
+    # first landing per published update
+    landed: set[tuple[str, int]] = set()
+    for obs, events in run.agent_events.items():
+        for e in events:
+            if e["type"] == "recv" and e.get("peer_seq", -1) > 0:
+                landed.add((e["from"], e["peer_seq"]))
+    rows = []
+    for (src, seq), t0 in pub_t.items():
+        rows.append({"t": (t0 // window_s) * window_s,
+                     "delivered": 1 if (src, seq) in landed else 0})
+    df = pd.DataFrame(rows)
+    g = df.groupby("t").agg(published=("delivered", "size"),
+                            delivered=("delivered", "sum")).reset_index()
+    g["delivery"] = g["delivered"] / g["published"]
+    return g[["t", "delivery", "published", "delivered"]]
+
+
+def aoi_mean(run: RunData, observer: str) -> float | None:
+    """Time-averaged AoI (s) over all peers at one observer (area under the
+    sawtooth / duration). None if no data."""
+    df = aoi_series(run, observer)
+    if df.empty:
+        return None
+    dur = run.duration_s or float(df["t"].max() or 1.0)
+    means = []
+    for _peer, g in df.groupby("peer"):
+        g = g.sort_values("t")
+        ts = g["t"].to_numpy()
+        aoi = g["aoi_s"].to_numpy()
+        # piecewise-linear sawtooth: between resets AoI grows at slope 1
+        area = 0.0
+        prev_t, prev_a = 0.0, aoi[0]
+        for t, a in zip(ts, aoi):
+            dt = t - prev_t
+            if dt > 0:  # AoI grew from prev_a to prev_a+dt, then reset to a
+                area += (prev_a + prev_a + dt) / 2 * dt
+            prev_t, prev_a = t, a
+        # tail to end of run
+        dt = max(dur - prev_t, 0.0)
+        area += (prev_a + prev_a + dt) / 2 * dt
+        means.append(area / dur if dur else prev_a)
+    return float(np.mean(means)) if means else None
+
+
+def map_frames(run: RunData, stride: int = 2, window_s: float = 1.0) -> list[dict]:
+    """Per sampled tick: everything the map needs to render one frame.
+
+    Each frame: {t, nodes:[{id,x,y,heading}], links:[{a,b,pdr,attempts}],
+    jammers:[{id,x,y,active,kind,power}], sat_up}. Links use the PDR window the
+    tick falls in. Self-contained so a static frontend can scrub without joins."""
+    pos = run.positions
+    if pos.empty:
+        return []
+    lq = link_quality(run, window_s=window_s)
+    roles = run.roles
+    times = np.sort(pos["t"].unique())[::max(stride, 1)]
+    frames = []
+    for t in times:
+        snap = pos[np.isclose(pos["t"], t)]
+        xy = {r["id"]: (float(r["x"]), float(r["y"])) for _, r in snap.iterrows()}
+        nodes = [{"id": r["id"], "x": float(r["x"]), "y": float(r["y"]),
+                  "heading": float(r["heading"]),
+                  "role": roles.get(r["id"], "vehicle")}
+                 for _, r in snap.iterrows()]
+        bin_t = (t // window_s) * window_s
+        lb = lq[np.isclose(lq["bin"], bin_t)] if not lq.empty else lq
+        links, seen = [], set()
+        for _, r in lb.iterrows():
+            a, b = r["src"], r["dst"]
+            if (b, a) in seen or a not in xy or b not in xy:
+                continue
+            seen.add((a, b))
+            links.append({"a": a, "b": b, "pdr": float(r["pdr"]),
+                          "attempts": int(r["attempts"])})
+        jammers = [{"id": j["id"], "x": float(j["position"][0]),
+                    "y": float(j["position"][1]), "kind": j["kind"],
+                    "power": float(j["tx_power_dbm"]),
+                    "active": bool(run.jammer_active(j, float(t)))}
+                   for j in run.jammers]
+        frames.append({"t": round(float(t), 3), "nodes": nodes, "links": links,
+                       "jammers": jammers, "sat_up": bool(run.sat_up(float(t)))})
+    return frames
+
+
+def export_run(run: RunData, *, stride: int = 2) -> dict:
+    """Assemble a single JSON-serialisable bundle describing a run for the
+    self-contained HTML frontend. Pulls together geometry, per-frame map state,
+    and the metric series so the browser needs no further computation."""
+    obs_default = max(run.agent_events, key=lambda k: len(run.agent_events[k]),
+                      default=None) if run.agent_events else None
+    aoi = {obs: aoi_series(run, obs).to_dict("records")
+           for obs in run.agent_events}
+    aoi_means = {obs: aoi_mean(run, obs) for obs in run.agent_events}
+    pdr = pdr_series(run).to_dict("records")
+    upd = update_delivery_series(run).to_dict("records")
+    ev = events_timeline(run)
+    drops = (run.packets[run.packets["verdict"] != "no_link"]["verdict"]
+             .value_counts().to_dict() if not run.packets.empty else {})
+    ext = run.extent
+    return {
+        "name": run.name,
+        "config": run.config,
+        "scenario_name": run.scenario.get("name"),
+        "duration_s": run.duration_s,
+        "extent": [float(ext[0]), float(ext[1])],
+        "foliage": [{"x_min": float(f["x_min"]), "x_max": float(f["x_max"]),
+                     "y_min": float(f["y_min"]), "y_max": float(f["y_max"])}
+                    for f in run.foliage],
+        "roles": run.roles,
+        "frames": map_frames(run, stride=stride),
+        "events": ev.to_dict("records") if not ev.empty else [],
+        "pdr": pdr,
+        "update_delivery": upd,
+        "aoi": aoi,
+        "aoi_mean": aoi_means,
+        "aoi_default_observer": obs_default,
+        "drop_attribution": {k: int(v) for k, v in drops.items()},
+        "satellite_enabled": bool(
+            run.scenario.get("satellite", {}).get("enabled")),
+        "jammers": [{"id": j["id"], "kind": j["kind"],
+                     "power": float(j["tx_power_dbm"]),
+                     "start_s": j["start_s"], "stop_s": j["stop_s"],
+                     "x": float(j["position"][0]), "y": float(j["position"][1])}
+                    for j in run.jammers],
+    }
