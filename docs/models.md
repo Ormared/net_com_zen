@@ -40,8 +40,9 @@ rate and serialization delay come from the configured waveform profile.
 
 ## FHSS hop-collision model
 
-Hop dwells are below packet granularity at realistic hop rates, so hopping is modeled
-statistically per packet rather than per dwell:
+Hopping is modeled statistically per packet rather than by simulating individual
+dwells (a packet may span one dwell at slow hop rates or many at fast ones — the
+model covers both):
 
 - N hop channels, jammer covers a subset J (spot/sweep) or all with reduced spectral
   density (barrage). Overlap fraction `ρ = |J ∩ hopset| / N`.
