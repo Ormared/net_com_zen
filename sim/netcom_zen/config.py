@@ -103,6 +103,7 @@ class AgentConfig(BaseModel):
     full_every: int = Field(gt=0, default=10)  # snapshot cadence = loss-heal latency
     mls: bool = True
     transport: Literal["tcp", "udp"] = "tcp"  # zenoh link scheme (A/B under loss)
+    sync_mode: Literal["delta", "state"] = "delta"  # CRDT sync strategy (A/B)
 
 
 class Scenario(BaseModel):

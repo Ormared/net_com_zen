@@ -71,6 +71,7 @@ class ScenarioEngine:
             # stalls under loss (CRDT snapshots heal the gaps). TCP is reliable.
             cmd += ["--reliability",
                     "best-effort" if cfg.transport == "udp" else "reliable"]
+            cmd += ["--sync-mode", cfg.sync_mode]
             # M4: vehicles track the command node's link; command tracks none
             cmd_id = self.scenario.command_id
             if cmd_id and nid != cmd_id:
