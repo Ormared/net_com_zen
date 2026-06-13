@@ -36,6 +36,21 @@ class IsaacBackend:
                 position=np.array([ctl.x, ctl.y, VEHICLE_Z]),
                 scale=np.array([2.0, 1.0, 1.0]), mass=10.0))
         self.world.reset()
+        self._warmup()
+
+    def _warmup(self, frames: int = 4) -> None:
+        # the first world.step() JIT-compiles warp kernels (~3.5 s on the test
+        # host). Pay it here during scene build -- which the orchestrator does
+        # before t=0 -- not on the first live tick, where it would stall the
+        # channel. Snapshot and restore spawn state so poses() stays exact.
+        spawn = {nid: b.get_world_pose() for nid, b in self._body.items()}
+        for _ in range(frames):
+            self.world.step(render=False)
+        for nid, b in self._body.items():
+            pos, orient = spawn[nid]
+            b.set_world_pose(position=pos, orientation=orient)
+            b.set_linear_velocity(np.zeros(3))
+            b.set_angular_velocity(np.zeros(3))
 
     def poses(self) -> dict[str, list[float]]:
         out = {}

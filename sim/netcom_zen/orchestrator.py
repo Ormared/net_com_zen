@@ -210,8 +210,14 @@ class ScenarioEngine:
                 fwd.update_links(table)
                 if bridge:
                     bridge.publish_tick(t, poses, table, self.jammers)
-                await asyncio.sleep(dt)
                 t += dt
+                # sleep to the absolute tick deadline, not for a flat dt: per-
+                # tick work (mobility step, build_table, forwarder) must not
+                # accumulate as wall-clock drift, or the timing monitor reports
+                # scheduling slack as overruns. lag now measures genuine
+                # inability to keep pace (a slow step or stall) and self-heals
+                # once caught up.
+                await asyncio.sleep(max(0.0, wall0 + t - time.monotonic()))
                 lag = (time.monotonic() - wall0) - t
                 n_ticks += 1
                 late_ticks += lag > dt
