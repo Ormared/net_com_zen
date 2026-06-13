@@ -21,8 +21,9 @@ VEHICLE_Z = 0.5  # half the cuboid height: spawn resting on the plane
 
 
 class IsaacBackend:
-    def __init__(self, physics_dt: float, vehicles: dict):
+    def __init__(self, physics_dt: float, vehicles: dict, render: bool = False):
         self.dt = physics_dt
+        self.render = render  # GUI viewport (--gui); headless runs skip it
         self.world = World(physics_dt=physics_dt, rendering_dt=physics_dt,
                            stage_units_in_meters=1.0)
         self.world.scene.add(GroundPlane(prim_path="/World/ground"))
@@ -74,7 +75,7 @@ class IsaacBackend:
                 body.set_linear_velocity(np.array([
                     ctl.speed * math.cos(ctl.heading),
                     ctl.speed * math.sin(ctl.heading), vz]))
-            self.world.step(render=False)
+            self.world.step(render=self.render)
         return self.poses()
 
     def close(self) -> None:

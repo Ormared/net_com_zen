@@ -8,15 +8,22 @@ reuses a single Isaac process — init rebuilds the scene, close tears it down.
 from __future__ import annotations
 
 import json
+import select
 import socket
 from pathlib import Path
 
 
 class StepperServer:
-    def __init__(self, socket_path: str | Path, backend_factory):
+    def __init__(self, socket_path: str | Path, backend_factory,
+                 idle_callback=None, idle_interval: float = 0.01):
         self.path = Path(socket_path)
         self.backend_factory = backend_factory  # (physics_dt, vehicles) -> backend
         self.backend = None
+        # called while waiting for the next command (GUI mode pumps the Isaac
+        # viewport here so it stays live in the gaps between lockstep ticks);
+        # None => plain blocking reads, identical to headless behavior
+        self.idle_callback = idle_callback
+        self.idle_interval = idle_interval
 
     def serve_forever(self) -> None:
         self.path.unlink(missing_ok=True)
@@ -30,13 +37,28 @@ class StepperServer:
                 self._serve_client(conn)
 
     def _serve_client(self, conn: socket.socket) -> None:
-        with conn, conn.makefile("r", encoding="utf-8") as rx:
-            for line in rx:
-                try:
-                    reply = self._handle(json.loads(line))
-                except Exception as e:  # a bad run must not kill the stepper
-                    reply = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-                conn.sendall((json.dumps(reply) + "\n").encode())
+        # hand-rolled line framing (not makefile) so we can pump idle_callback
+        # while blocked waiting for the next command
+        with conn:
+            conn.setblocking(False)
+            buf = b""
+            while True:
+                ready, _, _ = select.select([conn], [], [], self.idle_interval)
+                if not ready:
+                    if self.idle_callback:
+                        self.idle_callback()
+                    continue
+                chunk = conn.recv(65536)
+                if not chunk:
+                    return  # client closed
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    try:
+                        reply = self._handle(json.loads(line))
+                    except Exception as e:  # a bad run must not kill the stepper
+                        reply = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+                    conn.sendall((json.dumps(reply) + "\n").encode())
 
     def _handle(self, msg: dict) -> dict:
         cmd = msg.get("cmd")
