@@ -16,7 +16,7 @@ from .channel.linkstate import build_table
 from .config import Scenario
 from .ew import Jammer
 from .metrics import PacketLog
-from .mobility import WaypointVehicle
+from .mobility import MobilityProvider, make_mobility
 from .netns import NetnsTopology
 from .propagation import CompositePathloss
 from .terrain import FoliageRegion, Terrain
@@ -36,7 +36,7 @@ class World:
     dataplane is separate). Shared by the engine and the ROS 2 viz demo."""
     terrain: Terrain
     pathloss: CompositePathloss
-    vehicles: dict[str, WaypointVehicle]
+    mobility: MobilityProvider
     jammers: list[Jammer]
 
 
@@ -48,8 +48,7 @@ def build_world(scenario: Scenario) -> World:
     return World(
         terrain=terrain,
         pathloss=CompositePathloss(terrain),
-        vehicles={n.id: WaypointVehicle(n.waypoints, n.speed_mps)
-                  for n in scenario.nodes},
+        mobility=make_mobility(scenario),
         jammers=[Jammer(j) for j in scenario.jammers])
 
 
@@ -68,7 +67,7 @@ class ScenarioEngine:
     def _build(self) -> None:
         w = build_world(self.scenario)
         self.terrain, self.pathloss = w.terrain, w.pathloss
-        self.vehicles, self.jammers = w.vehicles, w.jammers
+        self.mobility, self.jammers = w.mobility, w.jammers
 
     def _spawn_agents(self) -> dict[str, subprocess.Popen]:
         cfg = self.scenario.agent
@@ -182,7 +181,8 @@ class ScenarioEngine:
             fwd.start()
             # install the initial link-state table BEFORE agents spawn, so their
             # first connection attempts don't die as no_link
-            positions0 = {nid: (v.x, v.y) for nid, v in self.vehicles.items()}
+            positions0 = {nid: (p.x, p.y)
+                          for nid, p in self.mobility.poses().items()}
             fwd.update_links(build_table(
                 positions0, self.jammers, 0.0, self.scenario.radio, self.pathloss,
                 command_id=self.scenario.command_id,
@@ -198,7 +198,7 @@ class ScenarioEngine:
             grace = self.scenario.duration_s + 10.0
             while t < self.scenario.duration_s or (
                     t < grace and any(p.poll() is None for p in agents.values())):
-                poses = {nid: v.step(dt) for nid, v in self.vehicles.items()}
+                poses = self.mobility.step(dt)
                 positions = {nid: (p.x, p.y) for nid, p in poses.items()}
                 for nid, p in poses.items():
                     track.append((round(t, 3), nid, round(p.x, 2), round(p.y, 2),
@@ -210,8 +210,14 @@ class ScenarioEngine:
                 fwd.update_links(table)
                 if bridge:
                     bridge.publish_tick(t, poses, table, self.jammers)
-                await asyncio.sleep(dt)
                 t += dt
+                # sleep to the absolute tick deadline, not for a flat dt: per-
+                # tick work (mobility step, build_table, forwarder) must not
+                # accumulate as wall-clock drift, or the timing monitor reports
+                # scheduling slack as overruns. lag now measures genuine
+                # inability to keep pace (a slow step or stall) and self-heals
+                # once caught up.
+                await asyncio.sleep(max(0.0, wall0 + t - time.monotonic()))
                 lag = (time.monotonic() - wall0) - t
                 n_ticks += 1
                 late_ticks += lag > dt
@@ -227,6 +233,7 @@ class ScenarioEngine:
                     p.kill()
             if bridge:
                 bridge.close()
+            self.mobility.close()
             self.topo.teardown()
         log.to_parquet(self.out_dir / "packets.parquet")
         if track:
@@ -240,6 +247,10 @@ class ScenarioEngine:
             "scenario": self.scenario.model_dump(mode="json"),
             "seed": self.scenario.seed,
             "git_hash": _git_hash(),
+            "mobility": self.mobility.name,
+            # ADR-0006: Isaac trajectories are PhysX-integrated, not seed-
+            # exact; the channel RNG stays seeded/replayable regardless
+            "trajectories_seed_exact": self.mobility.seed_exact,
             "max_tick_lag_s": max_tick_lag,
             "late_tick_fraction": late_ticks / max(n_ticks, 1),
             # ok = the loop kept pace statistically: <1% late ticks and no

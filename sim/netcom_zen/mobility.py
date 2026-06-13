@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from .config import Scenario
 
 
 @dataclass
@@ -9,6 +13,22 @@ class Pose:
     x: float
     y: float
     heading: float  # radians, CCW from +x
+
+
+class MobilityProvider(Protocol):
+    """World-level mobility seam (ADR-0002/0006): one step per scenario tick
+    advances every vehicle and returns the new poses."""
+
+    name: str
+    seed_exact: bool  # same seed => bit-identical trajectories?
+
+    def poses(self) -> dict[str, Pose]:
+        """Current poses without advancing (initial link table needs them)."""
+        ...
+
+    def step(self, dt: float) -> dict[str, Pose]: ...
+
+    def close(self) -> None: ...
 
 
 class WaypointVehicle:
@@ -42,3 +62,35 @@ class WaypointVehicle:
         self.x += self.speed * dt * math.cos(self.heading)
         self.y += self.speed * dt * math.sin(self.heading)
         return Pose(self.x, self.y, self.heading)
+
+
+class WaypointMobility:
+    """Default MobilityProvider: one WaypointVehicle per node, closed-form
+    kinematics, seed-exact (trajectories depend only on the scenario)."""
+
+    name = "waypoint"
+    seed_exact = True
+
+    def __init__(self, nodes):
+        self._vehicles = {n.id: WaypointVehicle(n.waypoints, n.speed_mps)
+                          for n in nodes}
+
+    def poses(self) -> dict[str, Pose]:
+        return {nid: Pose(v.x, v.y, v.heading)
+                for nid, v in self._vehicles.items()}
+
+    def step(self, dt: float) -> dict[str, Pose]:
+        return {nid: v.step(dt) for nid, v in self._vehicles.items()}
+
+    def close(self) -> None:
+        pass
+
+
+def make_mobility(scenario: "Scenario") -> MobilityProvider:
+    if scenario.mobility.provider == "isaac":
+        from .isaac_mobility import IsaacMobilityProvider
+        return IsaacMobilityProvider(
+            scenario.nodes, socket_path=scenario.mobility.socket,
+            physics_hz=scenario.mobility.physics_hz,
+            extent=scenario.environment.extent_m)
+    return WaypointMobility(scenario.nodes)

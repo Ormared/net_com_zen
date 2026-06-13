@@ -1,0 +1,28 @@
+# R4 smoke: resilience_4node geometry with Isaac-sourced mobility.
+# Start the stepper first (owns the GPU process, keeps caches user-owned):
+#   pixi run -e isaac isaac-stepper
+# then: sudo $(pixi run which python) -m netcom_zen.run scenarios/isaac_smoke_4node.yaml
+name: isaac-smoke-4node
+duration_s: 30
+tick_hz: 10
+seed: 42
+mobility:
+  provider: isaac
+  physics_hz: 60.0
+radio:
+  freq_hz: 433.0e6
+  bandwidth_hz: 250.0e3
+  tx_power_dbm: 27.0
+  noise_figure_db: 7.0
+  data_rate_bps: 250.0e3
+  hop: {n_channels: 50, hop_rate_hz: 100.0}
+nodes:
+  - {id: v1, waypoints: [[100, 100], [900, 100], [900, 900], [100, 900]], speed_mps: 12}
+  - {id: v2, waypoints: [[900, 900], [100, 900], [100, 100], [900, 100]], speed_mps: 12}
+  - {id: v3, waypoints: [[500, 100], [500, 900]], speed_mps: 10}
+  - {id: v4, waypoints: [[100, 500], [900, 500]], speed_mps: 10}
+environment:
+  extent_m: [1000, 1000]
+agent:
+  enabled: true
+  period_ms: 500

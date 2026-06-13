@@ -1,0 +1,7 @@
+# R4 exit sweep (~4 min): Isaac-sourced vs closed-form mobility on the same
+# scenario — link-state dynamics should be equivalent at matched trajectories.
+# Needs the stepper up first: pixi run -e isaac isaac-stepper
+base: isaac_smoke_4node.yaml
+axes:
+  mobility.provider: [waypoint, isaac]
+seeds: [1, 2]
