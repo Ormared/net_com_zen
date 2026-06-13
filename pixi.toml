@@ -81,7 +81,10 @@ tinyobjloader = "==2.0.0rc13"
 # Stepper owns the GPU/Isaac process; the (root) orchestrator only connects to
 # the socket, so Isaac caches stay under the invoking user, not root.
 isaac-stepper = "python -m netcom_zen.isaac_stepper"
-isaac-smoke = "pytest tests -v -k isaac"
+# only the GPU smoke: the env is standalone, so the rest of the tree (which
+# needs default-env deps) doesn't even collect here; protocol/provider tests
+# run in the default env via `pixi run test`
+isaac-smoke = "pytest tests/test_isaac_real.py -v"
 
 [environments]
 ros2 = ["ros2"]
