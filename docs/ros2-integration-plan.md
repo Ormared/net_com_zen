@@ -95,10 +95,15 @@ trajectories track waypoint kinematics closely but are Isaac-integrated
 same wire protocol without Isaac for tests/dry-runs. Step latency lands in the
 existing timing monitor (`max_tick_lag_s`, `timing_ok`); measured on the RTX
 5090 host (4 vehicles, 6 frames/step): median 5.8 ms, p95 6.4 ms per 100 ms
-tick on a warm stepper — the risk-list concern is settled. Cold boot is 11-40 s
-plus one ~4 s warp-compile stall on the first physics steps, which is why the
-stepper is a long-lived user-owned process the orchestrator connects to, not a
-per-run child. The isaac pixi env is
+tick — the risk-list concern is settled. Two timing fixes were needed to make
+that monitor trustworthy: (a) the tick loop now sleeps to the absolute tick
+deadline instead of a flat `dt`, so per-tick work no longer accumulates as
+drift (a 30 s run previously reported `late_fraction ~0.79` purely from
+scheduling slack); (b) warp JIT-compiles on Isaac's first physics step (~3.5 s),
+so `IsaacBackend` warms the kernels during scene build (before t=0) and restores
+spawn state, keeping the stall out of the live loop. Cold boot is still 11-40 s,
+which is why the stepper is a long-lived user-owned process the orchestrator
+connects to, not a per-run child. The isaac pixi env is
 standalone (no default feature): isaacsim's exact pypi pins conflict with
 conda-solved defaults; the stepper needs only stdlib + `netcom_zen` + isaacsim.
 
