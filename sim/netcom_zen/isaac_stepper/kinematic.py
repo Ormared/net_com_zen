@@ -7,8 +7,8 @@ from ..mobility import WaypointVehicle
 
 
 class KinematicBackend:
-    def __init__(self, physics_dt: float, vehicles: dict):
-        self.dt = physics_dt
+    def __init__(self, physics_dt: float, vehicles: dict, extent=None):
+        self.dt = physics_dt  # extent is ground-visual only; no scene here
         self._v = {nid: WaypointVehicle(cfg["waypoints"], cfg["speed_mps"])
                    for nid, cfg in vehicles.items()}
 

@@ -38,13 +38,15 @@ class IsaacMobilityProvider:
     seed_exact = False  # PhysX-integrated trajectories (ADR-0006 consequence)
 
     def __init__(self, nodes, socket_path: str | Path,
-                 physics_hz: float = 60.0):
+                 physics_hz: float = 60.0,
+                 extent: tuple[float, float] | None = None):
         self.physics_hz = physics_hz
         self._sock = self._connect(Path(socket_path))
         self._rx = self._sock.makefile("r", encoding="utf-8")
         reply = self._request({
             "cmd": "init",
             "physics_dt": 1.0 / physics_hz,
+            "extent": list(extent) if extent else None,  # ground visual size
             "vehicles": {n.id: {"waypoints": [list(w) for w in n.waypoints],
                                 "speed_mps": n.speed_mps}
                          for n in nodes}})

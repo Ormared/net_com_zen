@@ -34,7 +34,8 @@ def main() -> None:
     from isaacsim import SimulationApp
     app = SimulationApp({"headless": False})
     from .isaac_backend import IsaacBackend
-    backend = IsaacBackend(1.0 / args.physics_hz, vehicles, render=True)
+    backend = IsaacBackend(1.0 / args.physics_hz, vehicles,
+                           extent=sc.environment.extent_m, render=True)
     frames = round(args.physics_hz / sc.tick_hz)  # PhysX frames per scenario tick
     dt = 1.0 / sc.tick_hz
     print(f"previewing {sc.name!r}: {len(vehicles)} vehicles at "

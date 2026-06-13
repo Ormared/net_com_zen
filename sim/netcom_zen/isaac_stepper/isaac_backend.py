@@ -1,7 +1,19 @@
 """Isaac Sim 6 stepper backend (plan R4): flat ground + one dynamic cuboid
 per vehicle, velocity-controlled along the scenario waypoints by the same
 unicycle law as WaypointVehicle — but the controller runs on PhysX ground
-truth, so positions are Isaac-integrated (friction, contacts), not seed-exact.
+truth, so positions are Isaac-integrated, not seed-exact.
+
+What physics is actually live (the channel only consumes XY poses, so the scene
+is deliberately minimal — "poses are all the channel needs", plan R4):
+  - Gravity + ground contact: real. Each cuboid is a rigid body with mass; the
+    GroundPlane collider is an infinite plane, so bodies rest on it everywhere
+    (verified: a body at (900,900), far off the visual mesh, settles at z=0.5).
+  - Vehicle-vehicle collision: effectively suppressed. step() hard-sets each
+    body's XY velocity from its controller every frame, so the commanded motion
+    overrides any contact response in the plane — crossing vehicles pass
+    through rather than collide. Only Z is left to physics. This is intentional
+    (vehicles are placeholders for poses); richer dynamics / terrain are
+    deferred (plan R4: "terrain mesh from the existing DEM later").
 
 Import only after SimulationApp is running (isaacsim.core needs the app);
 __main__ owns that ordering.
@@ -21,12 +33,14 @@ VEHICLE_Z = 0.5  # half the cuboid height: spawn resting on the plane
 
 
 class IsaacBackend:
-    def __init__(self, physics_dt: float, vehicles: dict, render: bool = False):
+    def __init__(self, physics_dt: float, vehicles: dict,
+                 extent: tuple[float, float] | None = None,
+                 render: bool = False):
         self.dt = physics_dt
         self.render = render  # GUI viewport (--gui); headless runs skip it
         self.world = World(physics_dt=physics_dt, rendering_dt=physics_dt,
                            stage_units_in_meters=1.0)
-        self.world.scene.add(GroundPlane(prim_path="/World/ground"))
+        self._add_ground(extent)
         self._ctl: dict[str, WaypointVehicle] = {}
         self._body: dict[str, DynamicCuboid] = {}
         for nid, cfg in vehicles.items():
@@ -38,6 +52,20 @@ class IsaacBackend:
                 scale=np.array([2.0, 1.0, 1.0]), mass=10.0))
         self.world.reset()
         self._warmup()
+
+    def _add_ground(self, extent: tuple[float, float] | None) -> None:
+        # GroundPlane's collider is an infinite plane, but its visual mesh
+        # defaults to a 100 m square at the origin. Scenario vehicles run in
+        # [0, extent], so with the default they appear to drive off the world
+        # into free space (they don't -- the infinite collider still holds
+        # them, verified: a body at (900,900) rests at z=0.5). Size the visual
+        # large enough to cover the whole scenario. It stays origin-centered:
+        # GroundPlane's mesh doesn't honor an xform translate (geometry is in
+        # absolute coords), so the field reaches +/-1.2*max(extent), which
+        # contains [0, extent] with margin to spare.
+        m = max(float(extent[0]), float(extent[1])) if extent else 1000.0
+        self.world.scene.add(GroundPlane(prim_path="/World/ground",
+                                         size=m * 1.2))
 
     def _warmup(self, frames: int = 4) -> None:
         # the first world.step() JIT-compiles warp kernels (~3.5 s on the test

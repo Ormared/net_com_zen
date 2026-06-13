@@ -91,5 +91,6 @@ def make_mobility(scenario: "Scenario") -> MobilityProvider:
         from .isaac_mobility import IsaacMobilityProvider
         return IsaacMobilityProvider(
             scenario.nodes, socket_path=scenario.mobility.socket,
-            physics_hz=scenario.mobility.physics_hz)
+            physics_hz=scenario.mobility.physics_hz,
+            extent=scenario.environment.extent_m)
     return WaypointMobility(scenario.nodes)

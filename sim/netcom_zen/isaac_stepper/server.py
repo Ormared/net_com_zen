@@ -66,7 +66,8 @@ class StepperServer:
             if self.backend is not None:
                 self.backend.close()
             self.backend = self.backend_factory(msg["physics_dt"],
-                                                msg["vehicles"])
+                                                msg["vehicles"],
+                                                msg.get("extent"))
             return {"ok": True, "poses": self.backend.poses()}
         if cmd == "step":
             return {"ok": True, "poses": self.backend.step(int(msg["frames"]))}
