@@ -21,17 +21,19 @@ def main() -> None:
     ap.add_argument("--physics-hz", type=float, default=60.0)
     args = ap.parse_args()
 
-    # SimulationApp must come up before any isaacsim.core import; argparse
-    # already ran, so `--help` stays fast (no Isaac boot)
-    from isaacsim import SimulationApp
-    app = SimulationApp({"headless": False})
-
+    # Load + validate the scenario before the ~10s Isaac boot: fail fast on a
+    # bad path, and import pydantic in the clean outer interpreter (Isaac's kit
+    # Python re-checks site at boot; the isaac env sets PYTHONNOUSERSITE so the
+    # pinned pydantic wins either way, but importing here keeps it cached).
     from netcom_zen.config import load_scenario
-    from .isaac_backend import IsaacBackend
-
     sc = load_scenario(args.scenario)
     vehicles = {n.id: {"waypoints": [list(w) for w in n.waypoints],
                        "speed_mps": n.speed_mps} for n in sc.nodes}
+
+    # SimulationApp must come up before any isaacsim.core import
+    from isaacsim import SimulationApp
+    app = SimulationApp({"headless": False})
+    from .isaac_backend import IsaacBackend
     backend = IsaacBackend(1.0 / args.physics_hz, vehicles, render=True)
     frames = round(args.physics_hz / sc.tick_hz)  # PhysX frames per scenario tick
     dt = 1.0 / sc.tick_hz

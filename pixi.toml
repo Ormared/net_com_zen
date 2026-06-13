@@ -61,9 +61,12 @@ python = "3.12.*"
 # non-interactive acceptance of the NVIDIA Omniverse EULA (ADR-0006 committed
 # the project to Isaac Sim; first import blocks on a prompt otherwise)
 OMNI_KIT_ACCEPT_EULA = "YES"
-# this env is no-default-feature, so it doesn't inherit the default env's guard;
-# without it, ~/.local site-packages (e.g. a newer pydantic) shadow the pinned
-# env and break imports. The default env sets this too.
+# REQUIRED: this env is no-default-feature, so it does NOT inherit the
+# workspace [activation.env] above. Without it, ~/.local site-packages leak in
+# and a newer user-site pydantic shadows the pinned one — and Isaac's kit
+# Python re-checks site at boot, so config imports made AFTER SimulationApp()
+# (e.g. isaac-preview) crash with `cannot import name 'Sentinel'`. Verified:
+# with this set, kit's interpreter reports ENABLE_USER_SITE=False.
 PYTHONNOUSERSITE = "1"
 
 [feature.isaac.pypi-options]
