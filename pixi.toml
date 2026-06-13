@@ -57,6 +57,11 @@ libc = { family = "glibc", version = "2.35" }
 [feature.isaac.dependencies]
 python = "3.12.*"
 
+[feature.isaac.activation.env]
+# non-interactive acceptance of the NVIDIA Omniverse EULA (ADR-0006 committed
+# the project to Isaac Sim; first import blocks on a prompt otherwise)
+OMNI_KIT_ACCEPT_EULA = "YES"
+
 [feature.isaac.pypi-options]
 extra-index-urls = ["https://pypi.nvidia.com"]
 # some isaacsim deps (e.g. mujoco-usd-converter) need versions that live on

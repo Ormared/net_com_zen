@@ -93,7 +93,12 @@ are dynamic cuboids velocity-controlled by the same unicycle law as
 trajectories track waypoint kinematics closely but are Isaac-integrated
 (manifest: `trajectories_seed_exact: false`). `--backend kinematic` serves the
 same wire protocol without Isaac for tests/dry-runs. Step latency lands in the
-existing timing monitor (`max_tick_lag_s`, `timing_ok`). The isaac pixi env is
+existing timing monitor (`max_tick_lag_s`, `timing_ok`); measured on the RTX
+5090 host (4 vehicles, 6 frames/step): median 5.8 ms, p95 6.4 ms per 100 ms
+tick on a warm stepper — the risk-list concern is settled. Cold boot is 11-40 s
+plus one ~4 s warp-compile stall on the first physics steps, which is why the
+stepper is a long-lived user-owned process the orchestrator connects to, not a
+per-run child. The isaac pixi env is
 standalone (no default feature): isaacsim's exact pypi pins conflict with
 conda-solved defaults; the stepper needs only stdlib + `netcom_zen` + isaacsim.
 

@@ -25,7 +25,7 @@ from pathlib import Path
 
 from .mobility import Pose
 
-CONNECT_TIMEOUT_S = 60.0   # Isaac startup is slow; the stepper may still load
+CONNECT_TIMEOUT_S = 180.0  # Isaac cold boot observed at 11-40 s; allow margin
 STEP_TIMEOUT_S = 30.0
 
 
