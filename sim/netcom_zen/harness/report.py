@@ -4,6 +4,10 @@
 
 Produces <sweep-dir>/summary.json and PNG curves (metric vs the x axis,
 one line per series axis), aggregated mean over seeds.
+
+Two substrates are supported:
+  channel — AF_PACKET forwarder with RF model; produces packets.parquet.
+  bridge  — kernel L2 bridge; produces agent_*.jsonl + resources.parquet.
 """
 from __future__ import annotations
 
@@ -17,6 +21,38 @@ import pyarrow.parquet as pq
 
 from .aoi import aoi_summary
 
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+def _percentile(sorted_vals: list[float], p: float) -> float | None:
+    """p-th percentile (0–1) via floor-index into a pre-sorted list."""
+    if not sorted_vals:
+        return None
+    idx = int(p * (len(sorted_vals) - 1))
+    return sorted_vals[idx]
+
+
+def _is_bridge_run(run_dir: Path) -> bool:
+    """True when the run used the bridge substrate.
+
+    Prefer the explicit manifest field; fall back to artifact fingerprinting
+    so old runs without a substrate key are handled gracefully.
+    """
+    manifest_path = run_dir / "manifest.json"
+    if manifest_path.exists():
+        m = json.loads(manifest_path.read_text())
+        if m.get("substrate") == "bridge":
+            return True
+    # bridge runs have resources.parquet but no packets.parquet
+    return ((run_dir / "resources.parquet").exists()
+            and not (run_dir / "packets.parquet").exists())
+
+
+# ---------------------------------------------------------------------------
+# channel substrate (original)
+# ---------------------------------------------------------------------------
 
 def run_metrics(run_dir: Path) -> dict:
     """Channel + application metrics for one run directory."""
@@ -64,15 +100,146 @@ def run_metrics(run_dir: Path) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# bridge substrate
+# ---------------------------------------------------------------------------
+
+def bridge_run_metrics(run_dir: Path) -> dict:
+    """Metrics for one bridge-substrate run directory.
+
+    Reads agent_*.jsonl for timing/delivery, resources.parquet for CPU/mem,
+    and manifest.json for host-pressure counters written by the orchestrator.
+    """
+    # --- parse per-agent JSONL ---
+    start_ts: dict[str, int] = {}
+    pub_counts: dict[str, int] = collections.Counter()
+    # recv events keyed by the receiving node id
+    recv_events: dict[str, list[dict]] = collections.defaultdict(list)
+
+    for path in sorted(run_dir.glob("agent_*.jsonl")):
+        nid = path.stem.removeprefix("agent_")
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            ev = json.loads(line)
+            t = ev["type"]
+            if t == "start":
+                start_ts[nid] = ev["ts_us"]
+            elif t == "pub":
+                pub_counts[nid] += 1
+            elif t == "recv":
+                recv_events[nid].append(ev)
+
+    node_ids = sorted(start_ts)
+    n = len(node_ids)
+    total_pairs = n * (n - 1)  # ordered (receiver, sender) pairs
+
+    # discovery_time_s — per node: max first-recv-ts over peers − node's start_ts.
+    # Peers with no recv at all are excluded from the max (they never formed a link)
+    # but DO count against mesh_completeness.
+    connected_pairs = 0
+    node_disc: list[float] = []
+    for nid in node_ids:
+        first_recv: dict[str, int] = {}
+        for ev in recv_events[nid]:
+            peer = ev["from"]
+            if peer not in first_recv or ev["ts_us"] < first_recv[peer]:
+                first_recv[peer] = ev["ts_us"]
+        connected_pairs += len(first_recv)
+        if first_recv and nid in start_ts:
+            disc_us = max(first_recv.values()) - start_ts[nid]
+            node_disc.append(disc_us / 1e6)
+
+    discovery_time_s = max(node_disc) if node_disc else None
+    mesh_completeness = connected_pairs / total_pairs if total_pairs > 0 else None
+
+    # latency percentiles — one-way delay per recv event (recv_ts − pub_ts)
+    latencies_ms = sorted(
+        (ev["ts_us"] - ev["peer_ts_us"]) / 1e3
+        for evs in recv_events.values()
+        for ev in evs
+    )
+    latency_p50_ms = _percentile(latencies_ms, 0.50)
+    latency_p99_ms = _percentile(latencies_ms, 0.99)
+
+    # delivery_ratio — fraction of offered packets that arrived at each peer.
+    # "offered" for pair (a, b) = total pubs by b (b broadcasts to all peers).
+    recv_counts: collections.Counter = collections.Counter()
+    for nid, evs in recv_events.items():
+        for ev in evs:
+            recv_counts[(nid, ev["from"])] += 1
+    total_delivered = sum(recv_counts.values())
+    total_offered = sum(
+        pub_counts.get(sender, 0)
+        for receiver in node_ids
+        for sender in node_ids
+        if sender != receiver
+    )
+    delivery_ratio = total_delivered / total_offered if total_offered else None
+
+    # CPU / mem from resources.parquet, split by proc type:
+    # workload procs = rows where proc does NOT start with "router:"
+    # router procs  = rows where proc starts with "router:" (zenoh only)
+    res = pq.read_table(run_dir / "resources.parquet").to_pylist()
+    node_rows = [r for r in res if not str(r["proc"]).startswith("router:")]
+    router_rows = [r for r in res if str(r["proc"]).startswith("router:")]
+
+    def _proc_stats(rows: list[dict], prefix: str) -> dict:
+        """mean-of-means cpu, max-of-peaks cpu, max-of-peaks rss, all by proc."""
+        by_proc: dict[str, list] = collections.defaultdict(list)
+        for r in rows:
+            by_proc[str(r["proc"])].append(r)
+        if not by_proc:
+            return {f"{prefix}cpu_mean_pct": None,
+                    f"{prefix}cpu_peak_pct": None,
+                    f"{prefix}rss_peak_mb": None}
+        cpu_means = [statistics.mean(r["cpu_pct"] for r in s) for s in by_proc.values()]
+        cpu_peaks = [max(r["cpu_pct"] for r in s) for s in by_proc.values()]
+        rss_peaks = [max(r["rss_bytes"] for r in s) for s in by_proc.values()]
+        return {
+            f"{prefix}cpu_mean_pct": statistics.mean(cpu_means),
+            f"{prefix}cpu_peak_pct": max(cpu_peaks),
+            f"{prefix}rss_peak_mb": max(rss_peaks) / 1e6,
+        }
+
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    exit_codes = manifest.get("agent_exit_codes", {})
+
+    return {
+        "discovery_time_s": discovery_time_s,
+        "mesh_completeness": mesh_completeness,
+        "latency_p50_ms": latency_p50_ms,
+        "latency_p99_ms": latency_p99_ms,
+        "delivery_ratio": delivery_ratio,
+        **_proc_stats(node_rows, ""),
+        **_proc_stats(router_rows, "router_"),
+        "n_nodes": manifest.get("n_nodes"),
+        "rmw": manifest.get("rmw"),
+        # True only when every agent exited 0; None if no exit codes recorded
+        "agents_exit_clean": (
+            all(c == 0 for c in exit_codes.values()) if exit_codes else None
+        ),
+        "peak_host_mem_used_bytes": manifest.get("peak_host_mem_used_bytes"),
+        "min_host_mem_avail_bytes": manifest.get("min_host_mem_avail_bytes"),
+        "peak_host_swap_used_bytes": manifest.get("peak_host_swap_used_bytes"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# aggregation + plotting (substrate-aware)
+# ---------------------------------------------------------------------------
+
 def aggregate(sweep_dir: Path) -> list[dict]:
     manifest = json.loads((sweep_dir / "sweep_manifest.json").read_text())
     rows = []
     for cell in manifest["cells"]:
         run_dir = sweep_dir / cell["name"]
-        if not (run_dir / "packets.parquet").exists():
-            continue
-        rows.append({**cell["overrides"], "seed": cell["seed"],
-                     **run_metrics(run_dir)})
+        base = {**cell["overrides"], "seed": cell["seed"]}
+        if _is_bridge_run(run_dir):
+            rows.append({**base, **bridge_run_metrics(run_dir)})
+        elif (run_dir / "packets.parquet").exists():
+            rows.append({**base, **run_metrics(run_dir)})
+        # else: incomplete / missing run — skip silently
     return rows
 
 
@@ -82,12 +249,27 @@ def plot_curves(rows: list[dict], sweep_dir: Path, x_axis: str,
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    # Pick the metric list from the substrate of the data:
+    # bridge rows carry discovery_time_s; channel rows carry frame_pdr.
+    if rows and "discovery_time_s" in rows[0]:
+        metrics = [
+            ("discovery_time_s",  "Discovery time (s)"),
+            ("latency_p50_ms",    "Latency p50 (ms)"),
+            ("latency_p99_ms",    "Latency p99 (ms)"),
+            ("delivery_ratio",    "Delivery ratio"),
+            ("rss_peak_mb",       "RSS peak per node (MB)"),
+        ]
+    else:
+        metrics = [
+            ("frame_pdr",         "Frame PDR"),
+            ("frame_pdr_postjam", "Frame PDR (jammer active)"),
+            ("update_delivery",   "State-update delivery ratio"),
+            ("mean_aoi_s",        "Mean age of information (s)"),
+            ("median_delay_ms",   "Median delivery latency (ms)"),
+        ]
+
     written = []
-    for metric, label in [("frame_pdr", "Frame PDR"),
-                          ("frame_pdr_postjam", "Frame PDR (jammer active)"),
-                          ("update_delivery", "State-update delivery ratio"),
-                          ("mean_aoi_s", "Mean age of information (s)"),
-                          ("median_delay_ms", "Median delivery latency (ms)")]:
+    for metric, label in metrics:
         fig, ax = plt.subplots(figsize=(7, 4.5))
         series_vals = sorted({r.get(series_axis) for r in rows}) if series_axis else [None]
         for sv in series_vals:
