@@ -110,12 +110,18 @@ class AgentConfig(BaseModel):
 
 
 class Ros2WorkloadConfig(BaseModel):
-    """R3 wiring B (ADR-0006): stock ROS 2 telemetry over rmw_zenoh, peering
-    across the emulated channel via one zenoh router per netns."""
+    """R3 wiring B (ADR-0006): stock ROS 2 telemetry over a configurable RMW.
+    On substrate=channel it peers across the emulated channel via one zenoh
+    router per netns; on substrate=bridge each RMW uses its native discovery
+    over the kernel bridge (DDS benchmark track)."""
+    # RMW under test (DDS benchmark axis). Maps to the rmw_*_cpp impl name and
+    # the per-RMW spawn strategy: zenoh = router-per-netns; fastrtps/cyclonedds
+    # = routerless, native multicast discovery on the bridge.
+    rmw: Literal["zenoh", "fastrtps", "cyclonedds"] = "zenoh"
     period_ms: int = Field(gt=0, default=500)
     payload_bytes: int = Field(gt=0, default=255)  # ~ one state-sync snapshot
     reliability: Literal["reliable", "best_effort"] = "reliable"  # stock default
-    port: int = 7447  # router port inside each netns
+    port: int = 7447  # router port inside each netns (zenoh only)
 
 
 class MobilityConfig(BaseModel):
@@ -128,13 +134,25 @@ class MobilityConfig(BaseModel):
     physics_hz: float = Field(gt=0, default=60.0)  # PhysX frames per sim second
 
 
+# Per-substrate node ceilings. channel = AF_PACKET forwarder (single-thread
+# asyncio, O(N^2) broadcast fan-out) genuinely tops out low — keep the historic
+# cap so the EW track's assumptions are untouched. bridge = kernel L2 forwarding,
+# pushed to swarm scale for the DDS benchmark (96 is the deliberate stress point).
+_SUBSTRATE_MAX_NODES = {"channel": 8, "bridge": 96}
+
+
 class Scenario(BaseModel):
     name: str
     duration_s: float = Field(gt=0)
     tick_hz: float = 10.0
     seed: int = 0
     radio: RadioProfile
-    nodes: list[NodeConfig] = Field(min_length=2, max_length=8)
+    # Dataplane: channel = netns + AF_PACKET RF forwarder (EW track); bridge =
+    # netns + veth into a Linux kernel bridge, no RF model (DDS benchmark track).
+    substrate: Literal["channel", "bridge"] = "channel"
+    # Upper bound is the largest substrate ceiling; the exact cap is enforced
+    # per-substrate in _nodes_fit_substrate below.
+    nodes: list[NodeConfig] = Field(min_length=2, max_length=96)
     environment: EnvironmentConfig = EnvironmentConfig()
     jammers: list[JammerConfig] = []
     workload: Literal["agent", "ros2"] = "agent"  # what crosses the channel
@@ -148,6 +166,16 @@ class Scenario(BaseModel):
         ids = [n.id for n in self.nodes]
         if len(set(ids)) != len(ids):
             raise ValueError("duplicate node ids")
+        return self
+
+    @model_validator(mode="after")
+    def _nodes_fit_substrate(self):
+        cap = _SUBSTRATE_MAX_NODES[self.substrate]
+        if len(self.nodes) > cap:
+            raise ValueError(
+                f"substrate={self.substrate!r} supports at most {cap} nodes "
+                f"(got {len(self.nodes)}); the channel forwarder can't model "
+                f"more, use substrate=bridge for swarm scale")
         return self
 
     @model_validator(mode="after")

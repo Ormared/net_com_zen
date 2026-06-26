@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import psutil
 
 from .channel.forwarder import ChannelForwarder
 from .channel.linkstate import build_table
@@ -158,8 +159,14 @@ class ScenarioEngine:
         return agents
 
     async def run(self) -> None:
-        self._build()
         self.out_dir.mkdir(parents=True, exist_ok=True)
+        if self.scenario.substrate == "bridge":
+            await self._run_bridge()
+        else:
+            await self._run_channel()
+
+    async def _run_channel(self) -> None:
+        self._build()
         self.topo = NetnsTopology([n.id for n in self.scenario.nodes])
         self.topo.setup()
         log = PacketLog()
@@ -259,3 +266,117 @@ class ScenarioEngine:
                          and max_tick_lag < 5 * dt,
             "agent_exit_codes": agent_exit,
         }, indent=2))
+
+    async def _run_bridge(self) -> None:
+        """DDS benchmark substrate (plan: substrate=bridge). No RF model, no
+        forwarder, no mobility: netns + kernel bridge carry the traffic, each
+        RMW uses native discovery. Spawn the workload, then sample per-PID +
+        host CPU/mem/swap for duration_s. Host-level sampling is what lets the
+        write-up tell 'RMW degraded' from 'rig saturated' at swarm scale (96
+        nodes is the deliberate stress point). Metrics otherwise come from the
+        workload JSONL; there is no packets.parquet."""
+        self.topo = NetnsTopology([n.id for n in self.scenario.nodes],
+                                  bridge=True)
+        self.topo.setup()
+        self._routers = {}
+        agents: dict[str, subprocess.Popen] = {}
+        agent_exit: dict[str, int | None] = {}
+        samples: list[dict] = []
+        sample_dt = 1.0  # resource sampling cadence (s)
+        try:
+            agents = (self._spawn_ros2() if self.scenario.workload == "ros2"
+                      else self._spawn_agents()
+                      if self.scenario.agent.enabled else {})
+            self.ready.set()
+            # track workload nodes + (zenoh) routers; engine runs as root under
+            # sudo, so psutil can read these root-owned child PIDs
+            tracked = {**agents,
+                       **{f"router:{k}": v for k, v in self._routers.items()}}
+            meters = {name: psutil.Process(p.pid)
+                      for name, p in tracked.items() if p.poll() is None}
+            for m in meters.values():
+                m.cpu_percent(None)  # prime per-PID cpu deltas
+            psutil.cpu_percent(None)  # prime host cpu delta
+            wall0 = time.monotonic()
+            duration = self.scenario.duration_s
+            grace = duration + 10.0  # let agents finish past duration (logged)
+            tick = 0
+            # keep sampling until duration elapsed AND agents exited (a dead
+            # agent mid-run is a logged event, not an abort), capped by grace
+            while True:
+                elapsed = time.monotonic() - wall0
+                alive = any(p.poll() is None for p in agents.values())
+                if (elapsed >= duration and not alive) or elapsed >= grace:
+                    break
+                samples.append(self._sample_resources(round(elapsed, 3), meters))
+                tick += 1
+                # deadline-paced like the channel tick loop, so per-sample work
+                # doesn't accumulate as drift (orchestrator-tick-pacing)
+                await asyncio.sleep(max(0.0, wall0 + tick * sample_dt
+                                        - time.monotonic()))
+            for nid, p in agents.items():
+                if p.poll() is None:
+                    p.kill()
+                agent_exit[nid] = p.wait(timeout=10)
+        finally:
+            for p in list(agents.values()) + list(self._routers.values()):
+                if p.poll() is None:
+                    p.kill()
+            self.topo.teardown()
+        self._write_resources(samples)
+        # peak host pressure = the "was the rig saturated?" evidence
+        peak_mem = max((s["host_mem_used"] for s in samples), default=0)
+        min_avail = min((s["host_mem_avail"] for s in samples), default=0)
+        peak_swap = max((s["host_swap_used"] for s in samples), default=0)
+        (self.out_dir / "manifest.json").write_text(json.dumps({
+            "scenario": self.scenario.model_dump(mode="json"),
+            "seed": self.scenario.seed,
+            "git_hash": _git_hash(),
+            "substrate": "bridge",
+            "rmw": self.scenario.ros2.rmw,
+            "n_nodes": len(self.scenario.nodes),
+            "resource_samples": len(samples),
+            "peak_host_mem_used_bytes": peak_mem,
+            "min_host_mem_avail_bytes": min_avail,
+            "peak_host_swap_used_bytes": peak_swap,
+            "agent_exit_codes": agent_exit,
+        }, indent=2))
+
+    def _sample_resources(self, t: float, meters: dict) -> dict:
+        """One resource sample: per-PID cpu%/RSS plus host cpu/mem/swap."""
+        procs: list[tuple] = []
+        for name, m in meters.items():
+            try:
+                with m.oneshot():
+                    procs.append((name, m.cpu_percent(None), m.memory_info().rss))
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                procs.append((name, float("nan"), 0))  # exited mid-run
+        vm = psutil.virtual_memory()
+        return {
+            "t": t,
+            "host_cpu_pct": psutil.cpu_percent(None),
+            "host_mem_used": vm.used,
+            "host_mem_avail": vm.available,
+            "host_swap_used": psutil.swap_memory().used,
+            "procs": procs,
+        }
+
+    def _write_resources(self, samples: list[dict]) -> None:
+        if not samples:
+            return
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        cols: dict[str, list] = {k: [] for k in (
+            "t", "proc", "cpu_pct", "rss_bytes", "host_cpu_pct",
+            "host_mem_used", "host_mem_avail", "host_swap_used")}
+        for s in samples:
+            for name, cpu, rss in s["procs"]:
+                cols["t"].append(s["t"])
+                cols["proc"].append(name)
+                cols["cpu_pct"].append(cpu)
+                cols["rss_bytes"].append(rss)
+                cols["host_cpu_pct"].append(s["host_cpu_pct"])
+                cols["host_mem_used"].append(s["host_mem_used"])
+                cols["host_mem_avail"].append(s["host_mem_avail"])
+                cols["host_swap_used"].append(s["host_swap_used"])
+        pq.write_table(pa.table(cols), self.out_dir / "resources.parquet")

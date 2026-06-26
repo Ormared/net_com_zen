@@ -12,6 +12,7 @@ pydantic = ">=2.7"
 pyyaml = ">=6"
 pytest = ">=8"
 pyarrow = ">=16"
+psutil = ">=5.9"  # per-PID + host CPU/mem sampling (bridge substrate, DDS benchmark)
 matplotlib = ">=3.8"
 pandas = ">=2.0"
 plotly = ">=5.20"

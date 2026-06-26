@@ -1,0 +1,24 @@
+# DDS benchmark smoke (substrate=bridge): 4 nodes on a kernel bridge, stock
+# ROS 2 telemetry over the configured RMW. No RF model, no jammer, no mobility.
+# radio/waypoints are schema-required but unused on the bridge substrate.
+name: bridge-smoke-4node
+duration_s: 12
+seed: 0
+substrate: bridge
+radio:
+  freq_hz: 433.0e6
+  bandwidth_hz: 250.0e3
+  tx_power_dbm: 27.0
+  data_rate_bps: 250.0e3
+  hop: {n_channels: 50, hop_rate_hz: 100.0}
+nodes:
+  - {id: d1, waypoints: [[0, 0]]}
+  - {id: d2, waypoints: [[0, 0]]}
+  - {id: d3, waypoints: [[0, 0]]}
+  - {id: d4, waypoints: [[0, 0]]}
+workload: ros2
+ros2:
+  rmw: zenoh        # Phase A: only zenoh wired; fastrtps/cyclonedds land in B1
+  period_ms: 200
+  payload_bytes: 255
+  reliability: reliable
