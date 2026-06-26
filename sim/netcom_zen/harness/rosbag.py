@@ -20,13 +20,15 @@ PHASE C USAGE (manual, confirmatory single run)
             -m netcom_zen.run scenarios/dds/bridge_n4.yaml
 
 2.  Enter drone d1's netns and configure the RMW env (terminal B).
-    The netns name is ``ncz_<run-id>_d1`` — ``<run-id>`` appears in the
-    orchestrator's startup log::
+    NetnsTopology names netns ``ncz-<run-id>-<index>`` (0-based scenario node
+    order, so d1 -> index 0), NOT by node id. List them with
+    ``sudo ip netns list | grep ncz-``::
 
-        sudo ip netns exec ncz_<run-id>_d1 bash
+        sudo ip netns exec ncz-<run-id>-0 bash
         export RMW_IMPLEMENTATION=rmw_zenoh_cpp   # or fastrtps / cyclonedds
         export PYTHONNOUSERSITE=1
-        source /opt/ros/jazzy/setup.bash           # or: pixi shell ros2
+        # ros2 CLI must be on PATH inside the netns — activate the ros2 pixi
+        # env first (e.g. `pixi shell -e ros2`, robostack-jazzy, no /opt/ros)
 
 3.  Record one representative telemetry stream for ≥30 s then Ctrl-C::
 
@@ -129,6 +131,7 @@ def play_cmd(
 def full_workflow_cmds(
     run_id: str,
     node_id: str = "d1",
+    node_index: int = 0,
     rmw: str = "zenoh",
     bag_path: str | Path = DEFAULT_BAG,
 ) -> list[str]:
@@ -143,6 +146,9 @@ def full_workflow_cmds(
     run_id:     Run identifier used by NetnsTopology (appears in orchestrator
                 startup log; e.g. ``"run0"``).
     node_id:    Which drone to record from.  One is enough (default ``"d1"``).
+    node_index: 0-based position of that drone in the scenario node list — the
+                netns is named ``ncz-<run_id>-<index>`` (NetnsTopology), not by
+                node id. d1 -> 0, d2 -> 1, ...  (`sudo ip netns list | grep ncz-`).
     rmw:        RMW short name: ``"zenoh"``, ``"fastrtps"``, or ``"cyclonedds"``.
     bag_path:   Destination bag directory.
 
@@ -162,7 +168,8 @@ def full_workflow_cmds(
         "cyclonedds": "rmw_cyclonedds_cpp",
     }
     rmw_impl = _rmw_impl[rmw]  # KeyError on invalid rmw — intentional
-    netns = f"ncz_{run_id}_{node_id}"
+    # netns naming is NetnsTopology's: ncz-<run_id>-<0-based index>, NOT node id
+    netns = f"ncz-{run_id}-{node_index}"
 
     return [
         # terminal A: start the bridge run

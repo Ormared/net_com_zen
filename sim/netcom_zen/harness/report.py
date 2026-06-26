@@ -193,12 +193,17 @@ def bridge_run_metrics(run_dir: Path) -> dict:
             return {f"{prefix}cpu_mean_pct": None,
                     f"{prefix}cpu_peak_pct": None,
                     f"{prefix}rss_peak_mb": None}
-        cpu_means = [statistics.mean(r["cpu_pct"] for r in s) for s in by_proc.values()]
-        cpu_peaks = [max(r["cpu_pct"] for r in s) for s in by_proc.values()]
+        # the sampler records NaN cpu for a PID that vanished mid-run (a proc
+        # killed/exited during the collapse at scale); drop those so one dead
+        # sample doesn't poison the whole mean (v == v is False only for NaN)
+        cpu_by_proc = [[r["cpu_pct"] for r in s if r["cpu_pct"] == r["cpu_pct"]]
+                       for s in by_proc.values()]
+        cpu_means = [statistics.mean(c) for c in cpu_by_proc if c]
+        cpu_peaks = [max(c) for c in cpu_by_proc if c]
         rss_peaks = [max(r["rss_bytes"] for r in s) for s in by_proc.values()]
         return {
-            f"{prefix}cpu_mean_pct": statistics.mean(cpu_means),
-            f"{prefix}cpu_peak_pct": max(cpu_peaks),
+            f"{prefix}cpu_mean_pct": statistics.mean(cpu_means) if cpu_means else None,
+            f"{prefix}cpu_peak_pct": max(cpu_peaks) if cpu_peaks else None,
             f"{prefix}rss_peak_mb": max(rss_peaks) / 1e6,
         }
 
