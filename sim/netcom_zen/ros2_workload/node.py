@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 
 import rclpy
@@ -74,8 +75,13 @@ def main() -> None:
     while time.time() < end:
         rclpy.spin_once(node, timeout_sec=0.2)
     node._log({"type": "final_state", "id": args.id, "ts_us": now_us()})
-    node.destroy_node()
-    rclpy.shutdown()
+    node.metrics.flush()
+    # rmw_cyclonedds_cpp (and occasionally fastrtps) can hang for seconds in
+    # rclpy.shutdown() draining DDS threads. The metrics file is line-buffered
+    # so all events are already on disk; a clean teardown buys us nothing (the
+    # netns is about to be destroyed, SHM is off) and would stall every run to
+    # the orchestrator's grace deadline. Exit hard instead.
+    os._exit(0)
 
 
 if __name__ == "__main__":

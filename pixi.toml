@@ -35,6 +35,9 @@ channels = ["robostack-jazzy"]
 python = "3.12.*"
 ros-jazzy-ros-base = "*"
 ros-jazzy-rmw-zenoh-cpp = "*"
+# DDS benchmark RMW axis (substrate=bridge): the two routerless DDS impls
+ros-jazzy-rmw-fastrtps-cpp = "*"
+ros-jazzy-rmw-cyclonedds-cpp = "*"
 ros-jazzy-demo-nodes-py = "*"
 ros-jazzy-rviz2 = "*"
 

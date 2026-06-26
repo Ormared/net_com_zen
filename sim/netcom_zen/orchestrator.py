@@ -23,6 +23,29 @@ from .propagation import CompositePathloss
 from .terrain import FoliageRegion, Terrain
 
 
+# Cyclone DDS config for the bridge substrate: SHM/Iceoryx off (force real UDP
+# over the veth, no same-host shortcut) and multicast on so native discovery
+# floods across the bridge. autodetermine picks the single non-lo veth in each
+# netns. Domain id="any" so it applies whatever ROS_DOMAIN_ID is in use.
+_CYCLONEDDS_XML = """<?xml version="1.0" encoding="UTF-8" ?>
+<CycloneDDS xmlns="https://cdds.io/config"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="https://cdds.io/config https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
+  <Domain id="any">
+    <General>
+      <Interfaces>
+        <NetworkInterface autodetermine="true" multicast="true"/>
+      </Interfaces>
+      <AllowMulticast>true</AllowMulticast>
+    </General>
+    <SharedMemory>
+      <Enable>false</Enable>
+    </SharedMemory>
+  </Domain>
+</CycloneDDS>
+"""
+
+
 def _git_hash() -> str:
     try:
         return subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
@@ -103,11 +126,89 @@ class ScenarioEngine:
             agents[nid] = subprocess.Popen(cmd)
         return agents
 
+    def _ros2_base_env(self, rmw_impl: str, log_dir: Path) -> dict:
+        """Minimal child env: sudo strips activation, so children need only
+        these (verified against a bare `env -i` in R3)."""
+        prefix = Path(sys.executable).resolve().parents[1]
+        return {
+            "AMENT_PREFIX_PATH": str(prefix),
+            "ROS_LOG_DIR": str(log_dir),
+            "RMW_IMPLEMENTATION": rmw_impl,
+            "PYTHONNOUSERSITE": "1",
+            "PATH": os.environ.get("PATH", "/usr/sbin:/usr/bin:/sbin:/bin"),
+        }
+
+    def _workload_cmd(self, nid: str) -> list[str]:
+        cfg = self.scenario.ros2
+        return ["ip", "netns", "exec", self.topo.ns_names[nid],
+                sys.executable, "-m", "netcom_zen.ros2_workload",
+                "--id", nid,
+                "--peers", ",".join(p for p in self.topo.nodes if p != nid),
+                "--period-ms", str(cfg.period_ms),
+                "--payload-bytes", str(cfg.payload_bytes),
+                "--reliability", cfg.reliability,
+                "--duration-s", str(self.scenario.duration_s),
+                "--metrics", str(self.out_dir / f"agent_{nid}.jsonl")]
+
     def _spawn_ros2(self) -> dict[str, subprocess.Popen]:
-        """Wiring B (ADR-0006): per netns one zenoh router (explicit TCP mesh
-        over the TUN addresses; multicast scouting is off in rmw_zenoh's
-        defaults, so no traffic can bypass the channel) plus a stock-ROS2
-        telemetry node that reaches its router over loopback."""
+        """Stock-ROS2 telemetry workload under the configured RMW (DDS benchmark
+        axis). zenoh is router-based (one rmw_zenohd per netns); fastrtps and
+        cyclonedds are routerless and use native multicast discovery. The
+        routerless multicast path only works on substrate=bridge (the channel
+        forwarder can't carry multicast) — that asymmetry is inherent to the
+        architectures (plan Q1), not a bug."""
+        rmw = self.scenario.ros2.rmw
+        if rmw != "zenoh" and self.scenario.substrate != "bridge":
+            raise RuntimeError(
+                f"rmw={rmw!r} needs substrate=bridge (native multicast "
+                "discovery); only zenoh's explicit mesh works over substrate="
+                "channel")
+        log_dir = self.out_dir / "ros_logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        if rmw == "zenoh":
+            return self._spawn_zenoh(log_dir)
+        if rmw == "fastrtps":
+            # UDPv4 builtin transport drops the default SHM transport, forcing
+            # real UDP over the veth; native SPDP multicast handles discovery.
+            return self._spawn_routerless(
+                "rmw_fastrtps_cpp", log_dir,
+                lambda nid: {"FASTDDS_BUILTIN_TRANSPORTS": "UDPv4"})
+        if rmw == "cyclonedds":
+            xml = self.out_dir / "cyclonedds.xml"
+            xml.write_text(_CYCLONEDDS_XML)
+            return self._spawn_routerless(
+                "rmw_cyclonedds_cpp", log_dir,
+                lambda nid: {"CYCLONEDDS_URI": f"file://{xml}"})
+        raise RuntimeError(f"unknown rmw {rmw!r}")
+
+    def _spawn_routerless(self, rmw_impl: str, log_dir: Path,
+                          extra_env) -> dict[str, subprocess.Popen]:
+        """fastrtps / cyclonedds: no router, one workload node per netns, native
+        multicast discovery flooded by the bridge (mcast_snooping off)."""
+        base = self._ros2_base_env(rmw_impl, log_dir)
+        agents: dict[str, subprocess.Popen] = {}
+        for nid in self.topo.nodes:
+            agents[nid] = subprocess.Popen(self._workload_cmd(nid),
+                                           env={**base, **extra_env(nid)})
+        return agents
+
+    def _spawn_zenoh(self, log_dir: Path) -> dict[str, subprocess.Popen]:
+        """Per netns one rmw_zenohd router + a telemetry node reaching it over
+        loopback, wired into an explicit lower-index TCP mesh (one link per
+        router pair).
+
+        Q1 asymmetry (documented, not a bug): unlike Fast DDS / Cyclone, which
+        are routerless and discover peers via native SPDP/scouting multicast,
+        rmw_zenohd routers do NOT autoconnect to peer routers off multicast
+        scouting alone (they hear each other on 224.0.0.224 but stay
+        unconnected; the autoconnect/whatami override key is rejected by this
+        zenoh build). So zenoh uses a pre-wired router mesh on BOTH substrates.
+        Consequence: zenoh's discovery-time is effectively connect-time, not
+        comparable to the DDS impls' native discovery — the write-up reports
+        zenoh discovery separately. Latency / throughput / CPU / mem stay fair.
+        On the channel substrate the explicit mesh is also mandatory (the
+        forwarder can't carry multicast); on the bridge it is a fairness/
+        reliability choice."""
         cfg = self.scenario.ros2
         prefix = Path(sys.executable).resolve().parents[1]
         zenohd = prefix / "lib" / "rmw_zenoh_cpp" / "rmw_zenohd"
@@ -115,27 +216,16 @@ class ScenarioEngine:
             raise RuntimeError(
                 f"{zenohd} not found: workload=ros2 must run with the ros2 "
                 "pixi env python (sudo .pixi/envs/ros2/bin/python ...)")
-        log_dir = self.out_dir / "ros_logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        # sudo strips the activation env; children need only these (verified
-        # against a bare `env -i`)
-        base_env = {
-            "AMENT_PREFIX_PATH": str(prefix),
-            "ROS_LOG_DIR": str(log_dir),
-            "RMW_IMPLEMENTATION": "rmw_zenoh_cpp",
-            "PYTHONNOUSERSITE": "1",
-            "PATH": os.environ.get("PATH", "/usr/sbin:/usr/bin:/sbin:/bin"),
-        }
+        base_env = self._ros2_base_env("rmw_zenoh_cpp", log_dir)
         nodes = list(self.topo.nodes)
         for i, nid in enumerate(nodes):
+            listen = (f'listen/endpoints=["tcp/{self.topo.addrs[nid]}:{cfg.port}",'
+                      f'"tcp/127.0.0.1:{cfg.port}"]')
             # lower-index mesh: exactly one router-router TCP link per pair
             connect = [f'"tcp/{self.topo.addrs[p]}:{cfg.port}"'
                        for p in nodes[:i]]
-            override = (
-                f'listen/endpoints=["tcp/{self.topo.addrs[nid]}:{cfg.port}",'
-                f'"tcp/127.0.0.1:{cfg.port}"]'
-                + (f';connect/endpoints=[{",".join(connect)}]'
-                   if connect else ""))
+            override = listen + (f';connect/endpoints=[{",".join(connect)}]'
+                                 if connect else '')
             self._routers[nid] = subprocess.Popen(
                 ["ip", "netns", "exec", self.topo.ns_names[nid], str(zenohd)],
                 env={**base_env, "ZENOH_CONFIG_OVERRIDE": override},
@@ -144,18 +234,9 @@ class ScenarioEngine:
         time.sleep(1.0)  # let routers accept before sessions dial in
         agents: dict[str, subprocess.Popen] = {}
         for nid in nodes:
-            cmd = ["ip", "netns", "exec", self.topo.ns_names[nid],
-                   sys.executable, "-m", "netcom_zen.ros2_workload",
-                   "--id", nid,
-                   "--peers", ",".join(p for p in nodes if p != nid),
-                   "--period-ms", str(cfg.period_ms),
-                   "--payload-bytes", str(cfg.payload_bytes),
-                   "--reliability", cfg.reliability,
-                   "--duration-s", str(self.scenario.duration_s),
-                   "--metrics", str(self.out_dir / f"agent_{nid}.jsonl")]
             env = {**base_env, "ZENOH_CONFIG_OVERRIDE":
                    f'connect/endpoints=["tcp/127.0.0.1:{cfg.port}"]'}
-            agents[nid] = subprocess.Popen(cmd, env=env)
+            agents[nid] = subprocess.Popen(self._workload_cmd(nid), env=env)
         return agents
 
     async def run(self) -> None:
