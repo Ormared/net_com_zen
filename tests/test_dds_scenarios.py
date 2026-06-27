@@ -65,9 +65,10 @@ class TestBridgeScenario:
         assert d.get("jammers", []) == []
 
     def test_over_bridge_cap_raises_validation_error(self) -> None:
-        """N=97 exceeds the bridge cap of 96; Scenario.model_validate must raise."""
+        """N=257 exceeds the bridge cap of 256 (raised from 96 for the QoS-plane
+        ceiling probe); Scenario.model_validate must raise."""
         with pytest.raises(ValidationError):
-            bridge_scenario(97, "zenoh")
+            bridge_scenario(257, "zenoh")
 
     @pytest.mark.parametrize("n", DDS_N_VALUES)
     def test_custom_workload_params_round_trip(self, n: int) -> None:

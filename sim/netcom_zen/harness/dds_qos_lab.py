@@ -1,0 +1,233 @@
+"""DDS QoS-plane characterization lab (the "understand the whole plane" study).
+
+This is the driver for the systematic exploration of how each RMW (Fast DDS,
+Cyclone, Zenoh) behaves across the full DDS QoS + transport-buffer space, with
+the single goal of reaching a HIGH number of participants on the kernel-bridge
+substrate. Swarm/EW realism is deliberately out of scope here — every node is a
+bare telemetry pub/sub and we move QoS knobs to find what scales.
+
+DESIGN
+------
+Running a full factorial of every QoS policy × every level × 3 RMW × several N
+is combinatorially hopeless. The study is staged instead:
+
+* ``screen``  — one-factor-at-a-time (OFAT) from a fixed baseline at the stress
+                point N=96. Identifies which knobs actually move mesh/delivery.
+* ``buffer``  — sweep the socket/kernel buffer size at N=96 (the explicit
+                "increase the buffer" hypothesis).
+* ``factorial``— full factorial over the handful of knobs ``screen`` flags as
+                active, at N=48 and N=96.
+* ``ceiling`` — best config per RMW pushed past 96 to find each one's wall.
+
+Each cell is one ScenarioEngine run on substrate=bridge; results land under
+``results/dds/qos/<phase>/<cell>/`` and are aggregated with
+``netcom_zen.harness.report.bridge_run_metrics``. Needs root (netns + bridge +
+the /proc/sys buffer raise): ::
+
+    sudo .pixi/envs/ros2/bin/python -m netcom_zen.harness.dds_qos_lab screen
+    sudo .pixi/envs/ros2/bin/python -m netcom_zen.harness.dds_qos_lab buffer
+    # ... factorial / ceiling (see CELLS_* below)
+
+Then aggregate any phase dir to a table::
+
+    .pixi/envs/default/bin/python -m netcom_zen.harness.dds_qos_lab report \\
+        results/dds/qos/screen
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import itertools
+import json
+from pathlib import Path
+
+from ..config import Scenario
+from .dds_scenarios import _MINIMAL_RADIO
+
+# Stock-ROS2 baseline: the exact config the original scaling study used, so a
+# baseline cell here reproduces those numbers and every OFAT delta is one knob.
+BASELINE_QOS: dict = {
+    "reliability": "reliable",
+    "durability": "volatile",
+    "history": "keep_last",
+    "depth": 10,
+    "deadline_ms": 0.0,
+    "lifespan_ms": 0.0,
+    "liveliness": "automatic",
+    "liveliness_lease_ms": 0.0,
+    "socket_buffer_bytes": 0,
+}
+
+RMWS = ("fastrtps", "cyclonedds", "zenoh")
+_MB = 1 << 20
+
+
+def make_scenario(n: int, rmw: str, *, duration_s: float = 30.0,
+                  **qos_over) -> dict:
+    """Schema-valid bridge scenario for *n* nodes, *rmw*, baseline QoS + overrides.
+
+    Mirrors ``dds_scenarios.bridge_scenario`` but threads the full QoS block so
+    the lab can move any policy. Validates immediately (raises on a bad combo)."""
+    ros2 = {"rmw": rmw, "period_ms": 200, "payload_bytes": 255,
+            **BASELINE_QOS, **qos_over}
+    d = {
+        "name": f"qos-n{n}-{rmw}",
+        "duration_s": duration_s,
+        "seed": 0,
+        "substrate": "bridge",
+        "radio": _MINIMAL_RADIO,
+        "nodes": [{"id": f"d{i}", "waypoints": [[0, 0]]}
+                  for i in range(1, n + 1)],
+        "workload": "ros2",
+        "ros2": ros2,
+    }
+    Scenario.model_validate(d)
+    return d
+
+
+# ── Phase: screen — OFAT at N=96 ───────────────────────────────────────────
+# (label, {override}). The baseline cell is the all-defaults control. Each other
+# cell flips exactly one policy away from BASELINE_QOS.
+SCREEN_CELLS: list[tuple[str, dict]] = [
+    ("baseline", {}),
+    ("best_effort", {"reliability": "best_effort"}),
+    ("depth1", {"depth": 1}),
+    ("keep_all", {"history": "keep_all"}),
+    ("transient_local", {"durability": "transient_local"}),
+    ("lifespan500ms", {"lifespan_ms": 500.0}),
+    ("deadline1s", {"deadline_ms": 1000.0}),
+    ("manual_liveliness", {"liveliness": "manual_by_topic",
+                           "liveliness_lease_ms": 2000.0}),
+    ("buf16m", {"socket_buffer_bytes": 16 * _MB}),
+]
+
+# ── Phase: buffer — buffer-size sweep at N=96 (DDS only; zenoh is TCP) ──────
+BUFFER_SIZES = [0, 4 * _MB, 16 * _MB, 64 * _MB]
+
+# ── Phase: factorial — filled in from screen findings (reliability × buffer ×
+# history are the a-priori actives); 2×2×2 per RMW per N. Adjust after screen.
+FACTORIAL_AXES: dict[str, list] = {
+    "reliability": ["reliable", "best_effort"],
+    "socket_buffer_bytes": [0, 16 * _MB],
+    "history": ["keep_last", "keep_all"],
+}
+
+# ── Phase: ceiling — best config per RMW pushed past 96 ─────────────────────
+CEILING_N = [128, 192]
+
+
+async def _run_cell(n: int, rmw: str, label: str, overrides: dict,
+                    out_root: Path, duration_s: float) -> dict:
+    from ..orchestrator import ScenarioEngine
+    from . import report
+    cell_dir = out_root / f"{rmw}__{label}"
+    if (cell_dir / "manifest.json").exists():
+        print(f"  {rmw}/{label} — exists, skipping")
+    else:
+        print(f"  {rmw}/{label} (n={n}, {duration_s:.0f}s) {overrides}")
+        scn = Scenario.model_validate(
+            make_scenario(n, rmw, duration_s=duration_s, **overrides))
+        await ScenarioEngine(scn, cell_dir).run()
+    m = report.bridge_run_metrics(cell_dir)
+    mani = json.loads((cell_dir / "manifest.json").read_text())
+    return {"rmw": rmw, "label": label, "n": n, "overrides": overrides,
+            "mesh": m.get("mesh_completeness"),
+            "delivery": m.get("delivery_ratio"),
+            "discovery_s": m.get("discovery_time_s"),
+            "p50_ms": m.get("latency_p50_ms"),
+            "p99_ms": m.get("latency_p99_ms"),
+            "rss_mb": m.get("rss_peak_mb"),
+            "min_host_mem_avail_gb": round(
+                mani.get("min_host_mem_avail_bytes", 0) / 1e9, 1),
+            "exits_ok": set(mani.get("agent_exit_codes", {}).values()) <= {0}}
+
+
+async def run_phase(phase: str, out_root: Path, rmws: tuple[str, ...]) -> None:
+    out_root.mkdir(parents=True, exist_ok=True)
+    rows: list[dict] = []
+    if phase == "screen":
+        for rmw in rmws:
+            for label, ov in SCREEN_CELLS:
+                rows.append(await _run_cell(96, rmw, label, ov, out_root, 30.0))
+    elif phase == "buffer":
+        for rmw in rmws:
+            for b in BUFFER_SIZES:
+                rows.append(await _run_cell(
+                    96, rmw, f"buf{b // _MB}m", {"socket_buffer_bytes": b},
+                    out_root, 30.0))
+    elif phase == "factorial":
+        keys = list(FACTORIAL_AXES)
+        for rmw in rmws:
+            for n in (48, 96):
+                for combo in itertools.product(*FACTORIAL_AXES.values()):
+                    ov = dict(zip(keys, combo))
+                    label = f"n{n}__" + "_".join(
+                        f"{k.split('_')[0]}={v}" for k, v in ov.items())
+                    rows.append(await _run_cell(n, rmw, label, ov, out_root, 30.0))
+    else:
+        raise SystemExit(f"unknown phase {phase!r}")
+    _write_summary(out_root, rows)
+
+
+def _write_summary(out_root: Path, rows: list[dict]) -> None:
+    (out_root / "summary.json").write_text(json.dumps(rows, indent=2, default=str))
+    hdr = ("| rmw | label | n | mesh | delivery | disc(s) | p50 | p99 | "
+           "rss(MB) | host free(GB) | ok |")
+    sep = "|" + "---|" * 11
+    lines = [hdr, sep]
+    for r in rows:
+        def f(x, p=3):
+            return f"{x:.{p}f}" if isinstance(x, (int, float)) else str(x)
+        lines.append(
+            f"| {r['rmw']} | {r['label']} | {r['n']} | {f(r['mesh'])} | "
+            f"{f(r['delivery'])} | {f(r['discovery_s'],2)} | {f(r['p50_ms'],2)} | "
+            f"{f(r['p99_ms'],2)} | {f(r['rss_mb'],0)} | "
+            f"{r['min_host_mem_avail_gb']} | {'Y' if r['exits_ok'] else 'N'} |")
+    (out_root / "table.md").write_text("\n".join(lines) + "\n")
+    print("\n".join(lines))
+
+
+def _report_existing(out_root: Path, rmws: tuple[str, ...]) -> None:
+    """Re-aggregate whatever cells already exist under out_root (no runs)."""
+    from . import report
+    rows = []
+    for cell_dir in sorted(out_root.glob("*__*")):
+        if not (cell_dir / "manifest.json").exists():
+            continue
+        rmw, label = cell_dir.name.split("__", 1)
+        m = report.bridge_run_metrics(cell_dir)
+        mani = json.loads((cell_dir / "manifest.json").read_text())
+        rows.append({
+            "rmw": rmw, "label": label,
+            "n": mani.get("n_nodes"), "overrides": {},
+            "mesh": m.get("mesh_completeness"),
+            "delivery": m.get("delivery_ratio"),
+            "discovery_s": m.get("discovery_time_s"),
+            "p50_ms": m.get("latency_p50_ms"), "p99_ms": m.get("latency_p99_ms"),
+            "rss_mb": m.get("rss_peak_mb"),
+            "min_host_mem_avail_gb": round(
+                mani.get("min_host_mem_avail_bytes", 0) / 1e9, 1),
+            "exits_ok": set(mani.get("agent_exit_codes", {}).values()) <= {0}})
+    _write_summary(out_root, rows)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("phase", choices=["screen", "buffer", "factorial", "report"])
+    ap.add_argument("path", nargs="?", help="for 'report': the phase dir to aggregate")
+    ap.add_argument("--out", default="results/dds/qos",
+                    help="root for phase output dirs")
+    ap.add_argument("--rmws", default=",".join(RMWS),
+                    help="comma-separated subset of rmws to run")
+    args = ap.parse_args()
+    rmws = tuple(args.rmws.split(","))
+    if args.phase == "report":
+        _report_existing(Path(args.path), rmws)
+        return
+    out_root = Path(args.out) / args.phase
+    asyncio.run(run_phase(args.phase, out_root, rmws))
+
+
+if __name__ == "__main__":
+    main()

@@ -167,8 +167,9 @@ class MobilityConfig(BaseModel):
 # Per-substrate node ceilings. channel = AF_PACKET forwarder (single-thread
 # asyncio, O(N^2) broadcast fan-out) genuinely tops out low — keep the historic
 # cap so the EW track's assumptions are untouched. bridge = kernel L2 forwarding,
-# pushed to swarm scale for the DDS benchmark (96 is the deliberate stress point).
-_SUBSTRATE_MAX_NODES = {"channel": 8, "bridge": 96}
+# pushed to swarm scale for the DDS benchmark (96 was the original stress point;
+# raised to 256 for the QoS-plane ceiling probe that pushes each RMW past 96).
+_SUBSTRATE_MAX_NODES = {"channel": 8, "bridge": 256}
 
 
 class Scenario(BaseModel):
@@ -182,7 +183,7 @@ class Scenario(BaseModel):
     substrate: Literal["channel", "bridge"] = "channel"
     # Upper bound is the largest substrate ceiling; the exact cap is enforced
     # per-substrate in _nodes_fit_substrate below.
-    nodes: list[NodeConfig] = Field(min_length=2, max_length=96)
+    nodes: list[NodeConfig] = Field(min_length=2, max_length=256)
     environment: EnvironmentConfig = EnvironmentConfig()
     jammers: list[JammerConfig] = []
     workload: Literal["agent", "ros2"] = "agent"  # what crosses the channel
