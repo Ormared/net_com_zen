@@ -131,6 +131,17 @@ sudo .pixi/envs/ros2/bin/python -m netcom_zen.harness.sweep scenarios/dds/sweep_
 sudo .pixi/envs/default/bin/python -m netcom_zen.harness.dds_report results/dds
 ```
 
+## Why each one collapses, and how to fix it
+
+A per-architecture diagnosis — *why* each RMW degrades where it does, what every
+relevant knob actually changes, and the ordered set of next experiments to push
+the knee out — is in the companion doc:
+[**`dds-rmw-tuning.md`**](dds-rmw-tuning.md). Short version: all three share the
+same O(N²)-discovery-on-a-flat-segment disease; Fast DDS plateaus (→ Discovery
+Server), Cyclone thrashes on a buffer-overflow retransmit storm (→ bigger recv
+buffers, then unicast peers), and Zenoh was capped by *our* full router mesh, not
+by Zenoh (→ collapse it to a star hub).
+
 ## Status / future work
 
 - **Rosbag realism cross-check** (`harness/rosbag.py`): not yet run — a single
