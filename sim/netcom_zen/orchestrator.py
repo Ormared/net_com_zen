@@ -250,10 +250,15 @@ class ScenarioEngine:
         """fastrtps / cyclonedds: no router, one workload node per netns, native
         multicast discovery flooded by the bridge (mcast_snooping off)."""
         base = self._ros2_base_env(rmw_impl, log_dir)
+        stagger_s = self.scenario.ros2.spawn_stagger_ms / 1e3
         agents: dict[str, subprocess.Popen] = {}
-        for nid in self.topo.nodes:
+        for i, nid in enumerate(self.topo.nodes):
             agents[nid] = subprocess.Popen(self._workload_cmd(nid),
                                            env={**base, **extra_env(nid)})
+            # stagger participant joins to defuse the simultaneous-startup SPDP
+            # storm (tests the Fast DDS discovery-ceiling hypothesis)
+            if stagger_s and i < len(self.topo.nodes) - 1:
+                time.sleep(stagger_s)
         return agents
 
     # Fast DDS Discovery Server port (the impl's well-known default). The server

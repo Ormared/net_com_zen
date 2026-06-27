@@ -20,9 +20,10 @@ def test_qos_fields_parse_and_validate():
         rmw="cyclonedds", durability="transient_local", history="keep_all",
         depth=50, deadline_ms=1000, lifespan_ms=2000,
         liveliness="manual_by_topic", liveliness_lease_ms=3000,
-        socket_buffer_bytes=4 << 20)
+        socket_buffer_bytes=4 << 20, spawn_stagger_ms=200)
     assert c.history == "keep_all" and c.depth == 50
     assert c.socket_buffer_bytes == 4 << 20
+    assert c.spawn_stagger_ms == 200
     # bounds: depth>0, the duration/buffer knobs are >=0
     with pytest.raises(ValidationError):
         Ros2WorkloadConfig(depth=0)

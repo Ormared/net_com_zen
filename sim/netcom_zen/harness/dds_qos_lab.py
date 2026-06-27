@@ -191,6 +191,17 @@ async def run_phase(phase: str, out_root: Path, rmws: tuple[str, ...]) -> None:
             for dur in WINDOW_PLAN.get(rmw, [120.0]):
                 rows.append(await _run_cell(
                     96, rmw, f"dur{int(dur)}s", {}, out_root, dur))
+    elif phase == "stagger":
+        # test whether staggering participant joins breaks the Fast DDS ~33-node
+        # discovery ceiling (simultaneous-startup SPDP collapse hypothesis).
+        # duration must outlast the stagger so all nodes overlap for a real
+        # observation window: dur = stagger_total + 60s.
+        for rmw in ("fastrtps", "cyclonedds"):
+            for st in (50.0, 200.0):
+                dur = round(st / 1e3 * 96 + 60.0, 0)
+                rows.append(await _run_cell(
+                    96, rmw, f"stagger{int(st)}ms", {"spawn_stagger_ms": st},
+                    out_root, dur))
     elif phase == "beststack":
         for rmw in rmws:
             # give the stack room (120s) so a higher rate shows as higher mesh
@@ -267,8 +278,9 @@ def _report_existing(out_root: Path, rmws: tuple[str, ...]) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("phase", choices=["screen", "buffer", "window", "beststack",
-                                      "ceiling", "factorial", "report"])
+    ap.add_argument("phase", choices=["screen", "buffer", "window", "stagger",
+                                      "beststack", "ceiling", "factorial",
+                                      "report"])
     ap.add_argument("path", nargs="?", help="for 'report': the phase dir to aggregate")
     ap.add_argument("--out", default="results/dds/qos",
                     help="root for phase output dirs")

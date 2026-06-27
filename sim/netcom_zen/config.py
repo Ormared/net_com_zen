@@ -136,6 +136,11 @@ class Ros2WorkloadConfig(BaseModel):
     # the request isn't silently clamped. Applies to fastrtps/cyclonedds (UDP);
     # zenoh is TCP-meshed so it's a no-op there.
     socket_buffer_bytes: int = Field(ge=0, default=0)
+    # Stagger participant joins by this many ms (sleep between spawns). 0 = all
+    # nodes start simultaneously (the SPDP-storm worst case). The hypothesis for
+    # Fast DDS's ~33-participant discovery ceiling is that simultaneous startup
+    # collapses discovery into a clique; staggering lets it settle incrementally.
+    spawn_stagger_ms: float = Field(ge=0, default=0.0)
     port: int = 7447  # router port inside each netns (zenoh only)
     # Fast DDS Discovery Server (tuning experiment, dds-rmw-tuning.md #4): when
     # true, run one `fast-discovery-server` broker on the bridge and point every
