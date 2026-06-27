@@ -223,11 +223,13 @@ async def run_phase(phase: str, out_root: Path, rmws: tuple[str, ...]) -> None:
             rows.append(await _run_cell(
                 96, rmw, "beststack", BESTSTACK.get(rmw, {}), out_root, 120.0))
     elif phase == "ceiling":
-        # best config per RMW pushed past 96 to find each one's wall, long window
+        # push baseline past 96 to find each RMW's wall. For Fast DDS the test is
+        # whether connected-pair COUNT stays ~1022 (absolute ~33-clique cap) as N
+        # grows -> mesh would fall as 1022/N(N-1). 45s window.
         for rmw in rmws:
             for n in CEILING_N:
                 rows.append(await _run_cell(
-                    n, rmw, f"n{n}", BESTSTACK.get(rmw, {}), out_root, 120.0))
+                    n, rmw, f"n{n}", {}, out_root, 45.0))
     elif phase == "factorial":
         keys = list(FACTORIAL_AXES)
         for rmw in rmws:

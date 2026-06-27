@@ -6,140 +6,204 @@ mesh at N=96). [`dds-rmw-tuning.md`](dds-rmw-tuning.md) found that the obvious f
 (Fast DDS Discovery Server) does nothing, because the bottleneck is the
 data-plane endpoint mesh, not discovery. This document drops every swarm/EW
 constraint, treats each middleware as a system to characterize, and sweeps the
-**whole DDS QoS contract + the transport buffer** to answer one question: *what
-actually lets each RMW reach a high participant count?*
+**whole DDS QoS contract + the transport buffer + startup timing** to answer one
+question: *what actually lets each RMW reach a high participant count?*
 
-The answer turned out to be a single law that the earlier "collapse" framing hid.
+It took a chain of experiments that kept overturning the tidy story. The honest
+finding is that the three RMWs hit **three different walls**, and that **run-to-run
+variance is large enough that a single run will lie to you** — so the method
+matters as much as the result.
 
-## The headline: mesh formation is rate-limited pair establishment
+Metric: a **connected pair** is an ordered (receiver, sender) that exchanged ≥1
+message during the run; **mesh** = connected pairs / N(N−1). All runs:
+`substrate=bridge`, single host (24-core/62 GB), 255 B @ 5 Hz, driver
+[`dds_qos_lab`](../../sim/netcom_zen/harness/dds_qos_lab.py). Host stayed ≥22 GB
+free on every cell, so everything below is middleware behavior, not the rig.
 
-Define a **connected pair** as an ordered (receiver, sender) that exchanged at
-least one message during the run, and **mesh** = connected pairs / N(N−1). The
-screening sweep makes one fact impossible to miss:
+## TL;DR — three different walls
 
-> **Each (middleware, QoS) establishes connected pairs at a characteristic
-> RATE. The number of pairs wired in a fixed window is constant — independent
-> of N. So `mesh = rate · T / N(N−1)`, and the "knee" is just where N(N−1)
-> outgrows `rate · T`.**
-
-The proof is Fast DDS, whose pair *count* is invariant to everything:
-
-| | N=48 (30 s) | N=96 (30 s) | every QoS knob @ N=96 |
+| | Fast DDS | Cyclone DDS | Zenoh |
 |---|---|---|---|
-| mesh | 0.453 | 0.112 | **0.112** (all 9 cells) |
-| connected pairs | **1022** | **1021** | **1017–1022** |
-| rate (pairs/s) | 34.1 | 34.0 | **33.9–34.1** |
+| N=96 mesh (mean) | **0.112** | 0.057 | 0.275 |
+| run-to-run CV | **0 %** (deterministic) | 32 % | 35 % |
+| nature of the wall | **hard ~33-participant clique** | thrashing retransmit storm | racy router-mesh startup |
+| moved by QoS? | no (bit-for-bit invariant) | no (all knobs ≤ noise) | no (effects ≤ noise) |
+| moved by buffer? | no | no (within noise) | no (within noise) |
+| moved by **stagger**? | barely (+12 %) | **yes (2.5×)** | n/a |
+| moved by **time**? | no (frozen at 300 s) | yes, crawls upward | no (plateaus by 30 s) |
+| the real lever | reduce participant count / a resource-limit knob | **stagger joins** | accept variance, or fewer routers |
 
-Fast DDS wires ~1020 pairs in 30 s whether there are 48 nodes or 96, and whether
-QoS is reliable or best-effort, KEEP_LAST(1) or KEEP_ALL, volatile or
-transient-local, default or 16 MB buffered. **34 pairs/second, full stop.** The
-N=48 "knee" was never a knee — 1020 pairs is a full mesh at N≈33 (33·32=1056) but
-only 11 % of N=96's 9120 pairs. Same rate, bigger denominator.
+## The meta-finding: single runs lie (run-to-run variance)
 
-This reframes the entire question. "How do I reach high participant count?" is
-really two levers: **raise the establishment rate**, or **give it more time**
-(full-mesh time = N(N−1)/rate). The three RMWs differ in their base rate, how
-tunable that rate is, and whether they stay stable while doing it.
+The buffer and beststack phases produced impossible-looking contradictions — the
+*same* Zenoh config gave mesh 0.146 in one phase and 0.365 in another. So before
+trusting any QoS "effect" we replicated baseline ×5 per RMW
+(`results/dds/qos/replicate/`):
 
-## Screening: one QoS knob at a time, N=96, 30 s (`results/dds/qos/screen/`)
+| RMW | baseline mesh ×5 | mean | CV |
+|---|---|---|---|
+| **fastrtps** | 0.112, 0.112, 0.112, 0.112, 0.112 | 0.112 | **0 %** |
+| cyclonedds | 0.034, 0.046, 0.049, 0.073, 0.082 | 0.057 | 32 % |
+| zenoh | 0.163, 0.207, 0.241, 0.338, 0.428 | 0.275 | 35 % |
 
-From a stock baseline (reliable, KEEP_LAST 10, volatile, no
-deadline/lifespan, automatic liveliness, default buffer) each cell flips exactly
-one policy. Rate (pairs/s) is the column that matters; mesh is rate·30/9120.
+Fast DDS is **perfectly deterministic**. Cyclone and Zenoh swing ±~⅓. This single
+table invalidates most of the per-knob "effects" the screening sweep appeared to
+show for those two — including Zenoh's headline "manual-liveliness gives 2.1×":
+replicated ×5, manual-liveliness averages **0.191**, *below* baseline's 0.275. It
+was noise. **For Cyclone and Zenoh, any difference under ~2× from a single run is
+not real.** Everything below is read against this noise floor.
 
-| rmw | knob flipped | mesh | rate (/s) | delivery | p50 (ms) | p99 (ms) | notes |
-|---|---|---|---|---|---|---|---|
-| **fastrtps** | baseline | 0.112 | 34.0 | 0.111 | 5.5 | 23.8 | |
-| fastrtps | best_effort | 0.112 | 33.9 | 0.109 | 5.8 | 31.1 | rate unmoved |
-| fastrtps | depth=1 | 0.112 | 34.0 | 0.111 | 5.4 | 23.2 | fast disco, same rate |
-| fastrtps | keep_all | 0.112 | 34.1 | 0.111 | 5.2 | 21.0 | |
-| fastrtps | transient_local | 0.112 | 34.1 | 0.111 | 5.6 | 23.0 | |
-| fastrtps | lifespan 500 ms | 0.112 | 34.1 | 0.111 | 5.6 | 23.1 | |
-| fastrtps | deadline 1 s | 0.112 | 34.1 | 0.111 | 6.0 | 25.0 | |
-| fastrtps | manual liveliness | 0.112 | 34.0 | 0.111 | 7.1 | 29.1 | |
-| fastrtps | **buffer 16 MB** | 0.112 | 34.1 | 0.110 | 6.3 | 81.4 | **inert** |
-| **cyclonedds** | baseline | 0.064 | 19.6 | 0.015 | 662 | 1998 | thrashing tail |
-| cyclonedds | best_effort | 0.032 | 9.9 | 0.001 | 1.0 | 7.6 | low latency, *worse* mesh |
-| cyclonedds | depth=1 | 0.052 | 15.9 | 0.003 | 8.4 | 208 | |
-| cyclonedds | keep_all | 0.027 | 8.3 | 0.014 | 3436 | 18582 | **unbounded queue, exits≠0** |
-| cyclonedds | transient_local | 0.046 | 14.1 | 0.012 | 625 | 6305 | |
-| cyclonedds | lifespan 500 ms | 0.050 | 15.2 | 0.003 | 204 | 3002 | |
-| cyclonedds | deadline 1 s | 0.056 | 16.9 | 0.013 | 592 | 1998 | |
-| cyclonedds | manual liveliness | 0.020 | 6.0 | 0.003 | 737 | 3919 | worst |
-| cyclonedds | **buffer 16 MB** | 0.075 | 22.9 | 0.016 | 612 | 1995 | **only knob that helps (+17 %)** |
-| **zenoh** | baseline | 0.146 | 44.4 | 0.136 | 11.6 | 1366 | |
-| zenoh | best_effort | 0.247 | 75.2 | 0.211 | 21.0 | 2146 | +69 % rate |
-| zenoh | depth=1 | 0.261 | 79.3 | 0.177 | 16.9 | 446 | |
-| zenoh | keep_all | 0.269 | 81.7 | 0.237 | 30.6 | 9312 | |
-| zenoh | transient_local | 0.189 | 57.4 | 0.151 | 22.9 | 3110 | |
-| zenoh | lifespan 500 ms | 0.189 | 57.4 | 0.168 | 15.1 | 1862 | |
-| zenoh | deadline 1 s | 0.152 | 46.1 | 0.132 | 11.5 | 1870 | ~no effect |
-| zenoh | manual liveliness | **0.314** | **95.4** | 0.227 | 26.9 | 3445 | **best single knob (2.1×)** |
-| zenoh | buffer 16 MB | 0.180 | 54.7 | 0.161 | 14.6 | 1728 | kernel-buffer raise helps even TCP |
+## Fast DDS — a deterministic ~33-participant ceiling
 
-Host stayed ≥22 GB free on every cell (the bridge + 96–192 procs is never the
-limit), so every number above is middleware behavior.
+The defining trait is **invariance**, and it is absolute:
 
-## Per-RMW characterization
+- mesh = 0.112 (1022 connected pairs) at N=96, on **5/5** replicate runs, CV 0 %.
+- the same 1022 pairs at **N=48** (mesh 0.453) — pair *count* is N-independent.
+- the same 1022 pairs at a **300 s** window (mesh still 0.112 — frozen, not slow).
+- the same 1022 pairs under **every** QoS knob (reliable/best-effort,
+  KEEP_LAST(1)/KEEP_ALL, volatile/transient-local, deadline, lifespan,
+  liveliness) and **every** buffer size (4/16/64 MB).
 
-### Fast DDS — a metronome you can't speed up (in this plane)
-The defining trait is **invariance**. Rate is 34 pairs/s to three digits across
-the entire QoS+buffer+discovery-server plane and across N. Nothing in this study
-moves it. QoS knobs change only the *discovery-latency distribution* and the tail
-(e.g. best_effort pushes the slowest-pair time out to the full 30 s; depth=1
-tightens it to 1.2 s) — but the same ~1020 pairs get wired either way. The
-limiter is the **SEDP/data endpoint-matching throughput** itself, a fixed
-~34 reliable reader↔writer completions per second, and it is downstream of
-participant discovery (the Discovery Server, which removes SPDP entirely, also
-left it at 0.112 — see `dds-rmw-tuning.md`). **Lever: time, not tuning.** The
-window phase below tests the direct prediction — full 96-mesh at ~268 s.
+What is 1022 pairs? The per-node receive distribution at N=96 (300 s run) is
+**bimodal**: **61 of 96 nodes hear from 0 peers**, while **35 nodes form a near
+clique**, each hearing ~31 others (35 × ~29 ≈ 1020). So Fast DDS doesn't degrade
+gracefully — it elects a **~33–35-participant fully-connected clique and leaves
+the other ~63 completely deaf**, within ~2 s, then freezes. The clique size is
+the same (~33) at N=48 and N=96, which is why pair count is constant.
 
-### Cyclone DDS — slower and self-poisoning
-Cyclone is rate-limited too (~20 pairs/s baseline) but, unlike Fast DDS, its rate
-is *fragile*: almost every QoS knob makes it worse, because Cyclone is already in
-a reliable-retransmit storm (baseline p50 662 ms, p99 ~2 s — pathological) and
-anything that adds reliability/liveliness/queue pressure feeds the storm.
-KEEP_ALL is catastrophic (p99 18.6 s, unbounded queues, processes don't exit
-clean). best_effort and depth=1 cut latency but starve the mesh further. **The
-one knob that helps is the buffer** (16 MB → +17 % rate), exactly because the
-storm starts with socket-overflow drops — consistent with the tuning-doc
-prediction. Cyclone is the stack most in need of buffer + unicast-peers, and the
-least forgiving of casual QoS choices.
+Levers tested against it, all negative or near-negative:
+- **QoS / buffer:** zero effect (above).
+- **Discovery Server** (`dds-rmw-tuning.md`): zero effect — so it is *not*
+  participant (SPDP) discovery; the cap is downstream, in endpoint/data matching.
+- **Time:** zero effect at 300 s — it is a hard cap, not a rate limit.
+- **Startup stagger:** spawning the 96 participants 200 ms apart (incremental
+  join over ~19 s) lifted it only to 0.126 (1148 pairs, +12 %) — a real but tiny
+  nudge. So it is *not* primarily a simultaneous-startup race either.
 
-### Zenoh — fastest base rate, and the only QoS-tunable one
-Zenoh starts at 44 pairs/s (already 1.3× Fast DDS, 2.2× Cyclone) and its rate
-*responds* to loosening the contract: manual liveliness 95/s, KEEP_ALL 82/s,
-depth=1 79/s, best_effort 75/s. These are the knobs that reduce per-pair
-bookkeeping in its router-brokered session layer. transient_local and lifespan
-help a little; deadline does nothing. Even the "buffer" cell helps (+23 %) —
-because the kernel `rmem_max`/`wmem_max` raise benefits Zenoh's TCP session
-sockets too, not just the DDS UDP path. **Zenoh is where stacking the winning
-knobs should pay off** (tested in the beststack phase).
+The signature (a fixed-size mutually-discovered clique, immovable by discovery
+brokering, time, or QoS) points at a **default resource/allocation limit on
+matched remote participants or readers** in the Fast DDS participant — the
+remaining untested lever is raising those allocation limits explicitly
+(`ResourceLimitsQosPolicy` / participant allocation config). The practical
+takeaway today: **Fast DDS on a flat segment tops out near ~33 mutually-connected
+participants regardless of tuning; to go higher you must reduce the
+participant/endpoint count (aggregate, partition) — not touch QoS.**
 
-## Window phase — testing the rate law  (`results/dds/qos/window/`)
+## Cyclone DDS — a self-poisoning retransmit storm that staggering defuses
 
-_Pending — runs fastrtps at 120 s & 300 s, cyclone/zenoh at 120 s, N=96. The
-prediction: fastrtps mesh ≈ 34·120/9120 = 0.45 at 120 s and ≈ 1.0 (full) near
-268 s. If it holds, "Fast DDS fails at 96" becomes "Fast DDS needs a 9× window."_
+Cyclone at N=96 is broadly broken: mesh 0.057 ± 32 %, with a pathological tail
+(p50 ~700 ms, p99 ~2 s) — the reliable-retransmit storm diagnosed in
+`dds-rmw-tuning.md`. Within the QoS plane, every knob is **≤ the 32 % noise band
+or actively harmful**:
+- best_effort and depth=1 cut latency (p50 → ~1–8 ms) but not mesh — they shed
+  the backlog without connecting more pairs.
+- **KEEP_ALL is catastrophic**: p99 18.6 s, unbounded queues, processes don't
+  exit clean. Never use KEEP_ALL + reliable at scale on Cyclone.
+- the buffer's apparent "+17 %" (screening) is **inside the noise** — the buffer
+  sweep gave 0.040 / 0.040 / 0.046 / 0.040 across 0/4/16/64 MB, i.e. flat.
 
-## Buffer sweep — the "increase the buffer" hypothesis  (`results/dds/qos/buffer/`)
+The one thing that **reliably** helps is **staggering joins**: 50 ms → 0.118,
+200 ms → 0.145 — both clearly above the entire baseline band (max 0.082). And
+Cyclone is the one RMW whose mesh **grows with time** (588 pairs @30 s → 1045
+@120 s), i.e. it is slow-but-progressing rather than frozen. Both point the same
+way: Cyclone's wall is the **burst** of simultaneous SPDP + reliable retransmits;
+spread the participant joins out (or just give it much longer) and it crawls
+further. **Lever: stagger joins + longer settling time; do not pile on QoS.**
 
-_Pending — {0, 4, 16, 64 MB} at N=96. Screening already shows the buffer is inert
-for Fast DDS, helps Cyclone (+17 % at 16 MB) and helps Zenoh via the kernel
-ceiling raise. The sweep maps the response curve and finds the knee per RMW._
+## Zenoh — fastest mean, but dominated by startup variance
 
-## Beststack & ceiling — best config pushed past 96  (`results/dds/qos/{beststack,ceiling}/`)
+Zenoh has the **highest mean mesh (0.275)** — roughly 2.5× Fast DDS and ~5×
+Cyclone — but also the **largest variance (CV 35 %, 0.163–0.428)**. Replication
+shows the screening QoS "effects" (best_effort, manual-liveliness, KEEP_ALL all
+"helping") do **not** survive: manual-liveliness ×5 averages *below* baseline.
+The knobs also **don't stack** — the beststack combo (best_effort + KEEP_ALL +
+manual-liveliness + buffer) gave 0.214, worse than baseline's mean. And unlike
+Cyclone, Zenoh does **not** improve with time (≈flat 30 s → 120 s), so it
+plateaus rather than crawls.
 
-_Pending — each RMW's winning knobs combined, then pushed to N=128/192 to find
-each one's participant wall._
+The variance traces to the **pre-wired full TCP router mesh** (one `rmw_zenohd`
+per netns, N(N−1)/2 ≈ 4560 links at 96): how many sessions/declarations converge
+depends on a startup race that lands anywhere in 0.16–0.43 mesh. So Zenoh's
+limitation is **unpredictability, not a hard cap or a thrash** — and the lever
+that `dds-rmw-tuning.md` flagged (collapse the full router mesh to a star/hub,
+nodes as clients) attacks exactly the source of the variance. QoS tuning does
+not. **Lever: fewer/hierarchical routers, not QoS.**
+
+## The rate-law that wasn't (an honest detour)
+
+The screening data first looked like a clean law: connected-pair *count* is
+constant per (stack, QoS) regardless of N (Fast DDS 1022 @48, 1021 @96), implying
+mesh = rate·T/N(N−1) and predicting Fast DDS reaches a full 96-mesh at ~268 s.
+The **window phase refuted it**: Fast DDS at 120 s and 300 s is still exactly
+1022 pairs — frozen, not rate-limited. The "constant pair count" was real but the
+mechanism was a **ceiling**, not a rate. Only Cyclone turned out to be genuinely
+rate-limited (it crawls with time); Fast DDS and Zenoh both plateau. Recording
+the dead end because it is the reason the window and replicate phases existed —
+and the reason the final model is trustworthy.
+
+## Buffer sweep — the "increase the buffer" hypothesis, settled
+
+`{0, 4, 16, 64 MB}` socket + kernel buffer at N=96 (`results/dds/qos/buffer/`):
+- **Fast DDS:** 1022 pairs at every size ≥ 4 MB — flat (the ceiling dominates).
+- **Cyclone:** 0.040 / 0.040 / 0.046 / 0.040 — flat within noise. The buffer does
+  **not** fix Cyclone's storm by itself (staggering does).
+- **Zenoh:** 0.365 / 0.130 / 0.122 / 0.163 — pure variance, no monotonic trend.
+
+So raising the buffer is necessary plumbing (Cyclone won't even *start* with a
+large `SocketReceiveBufferSize` unless the kernel ceiling is raised first), but on
+this all-to-all workload it is **not** the lever that reaches high participant
+counts. The earlier tuning-doc prediction that bigger buffers would help Cyclone
+holds only weakly and within noise; staggering is the stronger, reproducible win.
+
+## Ceiling probe — pushing past N=96 confirms the cap  (`results/dds/qos/ceiling/`)
+
+Baseline at N=128 and N=192 (45 s):
+
+| RMW | N | mesh | connected pairs | 1022/N(N−1) |
+|---|---|---|---|---|
+| **fastrtps** | 128 | 0.063 | **1020** | 0.063 |
+| **fastrtps** | 192 | 0.028 | **1022** | 0.028 |
+| cyclonedds | 128 | 0.046 | 744 | — |
+| cyclonedds | 192 | 0.019 | 693 | — |
+| zenoh | 128 | 0.163 | 2652 | — |
+| zenoh | 192 | 0.038 | 1396 | — |
+
+**Fast DDS connects ~1021 pairs at N = 48, 96, 128 *and* 192** — the mesh tracks
+1022/N(N−1) to three digits. The ~33-participant clique cap is **absolute**: it
+is the same fixed set size whether the swarm is 48 or 192. (At N=192 a few Fast
+DDS processes didn't exit clean — the host was down to ~20 GB free with 192
+participants — but the pair count held.)
+
+**Cyclone gets *worse* in absolute terms as N grows** (744 → 693 pairs): more
+participants = a bigger simultaneous storm, so it's not a fixed cap but an
+N-sensitive collapse. **Zenoh reaches furthest** (2652 pairs at N=128) but falls
+back by N=192 (1396) and is the heaviest on the host — its per-netns router means
+2N processes and an N(N−1)/2 router mesh (≈18 000 TCP links at 192), pushing p99
+to ~20 s and leaving processes unclean. So Zenoh's *own* scaling cost is the
+router fan-out, independent of the DDS pair's discovery problems.
+
+## Practical guidance — reaching high participant counts
+
+1. **Fast DDS:** QoS/buffer/time won't help — it caps near ~33 mutually-connected
+   participants on a flat segment. Reduce participant/endpoint count (aggregation
+   topic, partitions, fewer-larger nodes), or investigate raising the
+   participant/reader allocation resource limits. Within its clique it is the most
+   *predictable* stack (CV 0 %, tight latency).
+2. **Cyclone:** **stagger participant joins** and give it settling time; keep QoS
+   minimal (volatile, KEEP_LAST small, reliable is fine); never KEEP_ALL. Raise
+   kernel/socket buffers as hygiene but don't expect it to be the fix.
+3. **Zenoh:** best mean reach but plan for ±⅓ variance; the lever is **topology**
+   (a star/hub or hierarchical routers instead of the full P2P router mesh), not
+   QoS. Re-measure with replicates, never a single run.
 
 ## Method notes
 
 - One ScenarioEngine bridge run per cell; full QoS contract + socket/kernel
-  buffer set per the [`dds_qos_lab`](../../sim/netcom_zen/harness/dds_qos_lab.py)
-  driver. Pub and sub share one QoS profile so offered==requested always.
+  buffer + spawn stagger set per the `dds_qos_lab` driver. Pub and sub share one
+  QoS profile so offered==requested always.
 - The buffer lever raises host `net.core.{r,w}mem_max` (root writes `/proc/sys`)
-  before any DDS proc starts — Cyclone treats its `SocketReceiveBufferSize` min
-  as a hard floor and won't start otherwise — then restores them.
-- Single host (24-core/62 GB), single seed, 255 B @ 5 Hz. This is the
-  scaling-rate characterization, not an exhaustive payload/rate study.
+  before any DDS proc starts — Cyclone treats its `SocketReceiveBufferSize` min as
+  a hard floor and won't start otherwise — then restores them.
+- Single host, single seed per cell, 255 B @ 5 Hz. The replicate phase is what
+  makes the Cyclone/Zenoh numbers usable; treat any unreplicated single run for
+  those two as indicative only.
