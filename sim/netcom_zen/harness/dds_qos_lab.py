@@ -112,6 +112,29 @@ FACTORIAL_AXES: dict[str, list] = {
     "history": ["keep_last", "keep_all"],
 }
 
+# ── Phase: window — the rate-law confirmation ───────────────────────────────
+# Screening showed connected-pair COUNT is fixed per (stack,QoS) regardless of N
+# (Fast DDS: 1022 pairs @N=48, 1021 @N=96) -> establishment is rate-limited and
+# the 30s window is the binding constraint. Prediction: mesh = rate*T/N(N-1), so
+# longer T should grow mesh ~linearly until full. Fast DDS @34/s needs ~268s for
+# a full 96-mesh. Per-RMW windows (300s only where it's worth the wall-clock).
+WINDOW_PLAN: dict[str, list[float]] = {
+    "fastrtps": [120.0, 300.0],   # the decisive test: 0.45 @120s, ~full @300s?
+    "cyclonedds": [120.0],        # rate-limited, or does it plateau (thrash)?
+    "zenoh": [120.0],
+}
+
+# ── Phase: beststack — each RMW's winning knobs combined (max rate) ──────────
+# From screening: zenoh's rate-lifters stack-test (best_effort+keep_all+manual
+# liveliness+buffer); cyclone only the buffer helped; fast DDS nothing did.
+BESTSTACK: dict[str, dict] = {
+    "zenoh": {"reliability": "best_effort", "history": "keep_all",
+              "liveliness": "manual_by_topic", "liveliness_lease_ms": 2000.0,
+              "socket_buffer_bytes": 16 * _MB},
+    "cyclonedds": {"socket_buffer_bytes": 64 * _MB},
+    "fastrtps": {"socket_buffer_bytes": 16 * _MB},  # control: still inert?
+}
+
 # ── Phase: ceiling — best config per RMW pushed past 96 ─────────────────────
 CEILING_N = [128, 192]
 
@@ -130,8 +153,16 @@ async def _run_cell(n: int, rmw: str, label: str, overrides: dict,
         await ScenarioEngine(scn, cell_dir).run()
     m = report.bridge_run_metrics(cell_dir)
     mani = json.loads((cell_dir / "manifest.json").read_text())
-    return {"rmw": rmw, "label": label, "n": n, "overrides": overrides,
-            "mesh": m.get("mesh_completeness"),
+    mesh = m.get("mesh_completeness")
+    # The unifying metric of this study: connected (receiver,sender) pairs and
+    # the rate at which they were established over the window. mesh = rate*T /
+    # N(N-1), so the *rate* is the N- and window-independent characteristic of a
+    # stack+QoS, while mesh-at-30s is just a slice of it.
+    pairs = mesh * n * (n - 1) if isinstance(mesh, (int, float)) else None
+    rate = pairs / duration_s if pairs is not None else None
+    return {"rmw": rmw, "label": label, "n": n, "duration_s": duration_s,
+            "overrides": overrides,
+            "mesh": mesh, "pairs": pairs, "rate_pairs_s": rate,
             "delivery": m.get("delivery_ratio"),
             "discovery_s": m.get("discovery_time_s"),
             "p50_ms": m.get("latency_p50_ms"),
@@ -155,6 +186,22 @@ async def run_phase(phase: str, out_root: Path, rmws: tuple[str, ...]) -> None:
                 rows.append(await _run_cell(
                     96, rmw, f"buf{b // _MB}m", {"socket_buffer_bytes": b},
                     out_root, 30.0))
+    elif phase == "window":
+        for rmw in rmws:
+            for dur in WINDOW_PLAN.get(rmw, [120.0]):
+                rows.append(await _run_cell(
+                    96, rmw, f"dur{int(dur)}s", {}, out_root, dur))
+    elif phase == "beststack":
+        for rmw in rmws:
+            # give the stack room (120s) so a higher rate shows as higher mesh
+            rows.append(await _run_cell(
+                96, rmw, "beststack", BESTSTACK.get(rmw, {}), out_root, 120.0))
+    elif phase == "ceiling":
+        # best config per RMW pushed past 96 to find each one's wall, long window
+        for rmw in rmws:
+            for n in CEILING_N:
+                rows.append(await _run_cell(
+                    n, rmw, f"n{n}", BESTSTACK.get(rmw, {}), out_root, 120.0))
     elif phase == "factorial":
         keys = list(FACTORIAL_AXES)
         for rmw in rmws:
@@ -171,18 +218,20 @@ async def run_phase(phase: str, out_root: Path, rmws: tuple[str, ...]) -> None:
 
 def _write_summary(out_root: Path, rows: list[dict]) -> None:
     (out_root / "summary.json").write_text(json.dumps(rows, indent=2, default=str))
-    hdr = ("| rmw | label | n | mesh | delivery | disc(s) | p50 | p99 | "
-           "rss(MB) | host free(GB) | ok |")
-    sep = "|" + "---|" * 11
+    hdr = ("| rmw | label | n | T(s) | mesh | pairs | rate(/s) | delivery | "
+           "disc(s) | p50 | p99 | rss(MB) | free(GB) | ok |")
+    sep = "|" + "---|" * 14
     lines = [hdr, sep]
     for r in rows:
         def f(x, p=3):
             return f"{x:.{p}f}" if isinstance(x, (int, float)) else str(x)
         lines.append(
-            f"| {r['rmw']} | {r['label']} | {r['n']} | {f(r['mesh'])} | "
-            f"{f(r['delivery'])} | {f(r['discovery_s'],2)} | {f(r['p50_ms'],2)} | "
-            f"{f(r['p99_ms'],2)} | {f(r['rss_mb'],0)} | "
-            f"{r['min_host_mem_avail_gb']} | {'Y' if r['exits_ok'] else 'N'} |")
+            f"| {r['rmw']} | {r['label']} | {r['n']} | "
+            f"{f(r.get('duration_s'),0)} | {f(r['mesh'])} | {f(r.get('pairs'),0)} | "
+            f"{f(r.get('rate_pairs_s'),1)} | {f(r['delivery'])} | "
+            f"{f(r['discovery_s'],2)} | {f(r['p50_ms'],2)} | {f(r['p99_ms'],2)} | "
+            f"{f(r['rss_mb'],0)} | {r['min_host_mem_avail_gb']} | "
+            f"{'Y' if r['exits_ok'] else 'N'} |")
     (out_root / "table.md").write_text("\n".join(lines) + "\n")
     print("\n".join(lines))
 
@@ -197,10 +246,14 @@ def _report_existing(out_root: Path, rmws: tuple[str, ...]) -> None:
         rmw, label = cell_dir.name.split("__", 1)
         m = report.bridge_run_metrics(cell_dir)
         mani = json.loads((cell_dir / "manifest.json").read_text())
+        n = mani.get("n_nodes")
+        dur = mani.get("scenario", {}).get("duration_s")
+        mesh = m.get("mesh_completeness")
+        pairs = mesh * n * (n - 1) if isinstance(mesh, (int, float)) and n else None
+        rate = pairs / dur if pairs is not None and dur else None
         rows.append({
-            "rmw": rmw, "label": label,
-            "n": mani.get("n_nodes"), "overrides": {},
-            "mesh": m.get("mesh_completeness"),
+            "rmw": rmw, "label": label, "n": n, "duration_s": dur,
+            "overrides": {}, "mesh": mesh, "pairs": pairs, "rate_pairs_s": rate,
             "delivery": m.get("delivery_ratio"),
             "discovery_s": m.get("discovery_time_s"),
             "p50_ms": m.get("latency_p50_ms"), "p99_ms": m.get("latency_p99_ms"),
@@ -214,7 +267,8 @@ def _report_existing(out_root: Path, rmws: tuple[str, ...]) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("phase", choices=["screen", "buffer", "factorial", "report"])
+    ap.add_argument("phase", choices=["screen", "buffer", "window", "beststack",
+                                      "ceiling", "factorial", "report"])
     ap.add_argument("path", nargs="?", help="for 'report': the phase dir to aggregate")
     ap.add_argument("--out", default="results/dds/qos",
                     help="root for phase output dirs")
