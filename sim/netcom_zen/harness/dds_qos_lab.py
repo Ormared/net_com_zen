@@ -191,6 +191,21 @@ async def run_phase(phase: str, out_root: Path, rmws: tuple[str, ...]) -> None:
             for dur in WINDOW_PLAN.get(rmw, [120.0]):
                 rows.append(await _run_cell(
                     96, rmw, f"dur{int(dur)}s", {}, out_root, dur))
+    elif phase == "replicate":
+        # The buffer/beststack phases exposed large run-to-run variance (zenoh
+        # baseline swung 0.146<->0.365 on identical config). Replicate baseline
+        # x5 per RMW to get a variance band, plus zenoh's manual-liveliness knob
+        # x5 to test whether that "2.1x" effect survives the noise floor.
+        reps = 5
+        for rmw in rmws:
+            for r in range(reps):
+                rows.append(await _run_cell(
+                    96, rmw, f"baseline_r{r}", {}, out_root, 30.0))
+        for r in range(reps):
+            rows.append(await _run_cell(
+                96, "zenoh", f"manualliv_r{r}",
+                {"liveliness": "manual_by_topic", "liveliness_lease_ms": 2000.0},
+                out_root, 30.0))
     elif phase == "stagger":
         # test whether staggering participant joins breaks the Fast DDS ~33-node
         # discovery ceiling (simultaneous-startup SPDP collapse hypothesis).
@@ -279,8 +294,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("phase", choices=["screen", "buffer", "window", "stagger",
-                                      "beststack", "ceiling", "factorial",
-                                      "report"])
+                                      "replicate", "beststack", "ceiling",
+                                      "factorial", "report"])
     ap.add_argument("path", nargs="?", help="for 'report': the phase dir to aggregate")
     ap.add_argument("--out", default="results/dds/qos",
                     help="root for phase output dirs")
