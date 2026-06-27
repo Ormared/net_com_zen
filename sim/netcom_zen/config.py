@@ -121,6 +121,21 @@ class Ros2WorkloadConfig(BaseModel):
     period_ms: int = Field(gt=0, default=500)
     payload_bytes: int = Field(gt=0, default=255)  # ~ one state-sync snapshot
     reliability: Literal["reliable", "best_effort"] = "reliable"  # stock default
+    # Full DDS QoS contract under study (dds-rmw-qos-plane). Pub and sub use the
+    # same profile so offered==requested always. Stock-ROS2 defaults here.
+    durability: Literal["volatile", "transient_local"] = "volatile"
+    history: Literal["keep_last", "keep_all"] = "keep_last"
+    depth: int = Field(gt=0, default=10)  # KEEP_LAST queue depth
+    deadline_ms: float = Field(ge=0, default=0.0)  # 0 = infinite (off)
+    lifespan_ms: float = Field(ge=0, default=0.0)  # 0 = samples never expire
+    liveliness: Literal["automatic", "manual_by_topic"] = "automatic"
+    liveliness_lease_ms: float = Field(ge=0, default=0.0)  # 0 = default lease
+    # Transport buffer tuning (the "increase the buffer" lever). 0 = leave the
+    # RMW + kernel at their defaults; >0 requests this many bytes for the DDS
+    # socket receive buffer AND raises the host net.core.{r,w}mem_max ceiling so
+    # the request isn't silently clamped. Applies to fastrtps/cyclonedds (UDP);
+    # zenoh is TCP-meshed so it's a no-op there.
+    socket_buffer_bytes: int = Field(ge=0, default=0)
     port: int = 7447  # router port inside each netns (zenoh only)
     # Fast DDS Discovery Server (tuning experiment, dds-rmw-tuning.md #4): when
     # true, run one `fast-discovery-server` broker on the bridge and point every

@@ -23,27 +23,73 @@ from .propagation import CompositePathloss
 from .terrain import FoliageRegion, Terrain
 
 
-# Cyclone DDS config for the bridge substrate: SHM/Iceoryx off (force real UDP
-# over the veth, no same-host shortcut) and multicast on so native discovery
-# floods across the bridge. autodetermine picks the single non-lo veth in each
-# netns. Domain id="any" so it applies whatever ROS_DOMAIN_ID is in use.
-_CYCLONEDDS_XML = """<?xml version="1.0" encoding="UTF-8" ?>
-<CycloneDDS xmlns="https://cdds.io/config"
-    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-    xsi:schemaLocation="https://cdds.io/config https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
-  <Domain id="any">
-    <General>
-      <Interfaces>
-        <NetworkInterface autodetermine="true" multicast="true"/>
-      </Interfaces>
-      <AllowMulticast>true</AllowMulticast>
-    </General>
-    <SharedMemory>
-      <Enable>false</Enable>
-    </SharedMemory>
-  </Domain>
-</CycloneDDS>
-"""
+# Host kernel socket-buffer ceilings raised when socket_buffer_bytes>0. A DDS
+# SocketReceiveBufferSize request is silently clamped to net.core.rmem_max (and
+# Cyclone treats its `min` as a HARD floor — it refuses to start the domain if
+# the kernel ceiling is below the request), so the ceiling MUST be raised first.
+# Root (the orchestrator runs under sudo) writes /proc/sys directly; the `sysctl`
+# binary isn't on the NOPASSWD list. These are global (not netns-scoped).
+_KERNEL_BUF_SYSCTLS = ("rmem_max", "wmem_max", "rmem_default", "wmem_default")
+
+
+def _cyclonedds_xml(socket_buffer_bytes: int = 0) -> str:
+    """Cyclone DDS config for the bridge substrate: SHM/Iceoryx off (force real
+    UDP over the veth, no same-host shortcut) and multicast on so native
+    discovery floods across the bridge. autodetermine picks the single non-lo
+    veth in each netns. Domain id="any" applies under any ROS_DOMAIN_ID.
+
+    socket_buffer_bytes>0 adds Internal/SocketReceiveBufferSize (the buffer
+    lever); the host rmem_max must already be >= it or Cyclone fails to start."""
+    buf = (f'    <Internal><SocketReceiveBufferSize min="{socket_buffer_bytes} B"/>'
+           f'</Internal>\n' if socket_buffer_bytes > 0 else "")
+    return ('<?xml version="1.0" encoding="UTF-8" ?>\n'
+            '<CycloneDDS xmlns="https://cdds.io/config"\n'
+            '    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"\n'
+            '    xsi:schemaLocation="https://cdds.io/config '
+            'https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/'
+            'master/etc/cyclonedds.xsd">\n'
+            '  <Domain id="any">\n'
+            '    <General>\n'
+            '      <Interfaces>\n'
+            '        <NetworkInterface autodetermine="true" multicast="true"/>\n'
+            '      </Interfaces>\n'
+            '      <AllowMulticast>true</AllowMulticast>\n'
+            '    </General>\n'
+            '    <SharedMemory>\n'
+            '      <Enable>false</Enable>\n'
+            '    </SharedMemory>\n'
+            f'{buf}'
+            '  </Domain>\n'
+            '</CycloneDDS>\n')
+
+
+def _fastdds_profiles_xml(socket_buffer_bytes: int) -> str:
+    """Fast DDS XML profiles defining a single UDPv4 transport with enlarged
+    socket buffers, set as the default participant profile. useBuiltinTransports
+    false means ONLY this transport is used — which also keeps SHM off (the same
+    isolation FASTDDS_BUILTIN_TRANSPORTS=UDPv4 gives), so the buffer route is a
+    drop-in replacement for the env-var route. Needs the <profiles> wrapper
+    (Fast DDS 8.x) or the parser rejects transport_descriptors."""
+    return ('<?xml version="1.0" encoding="UTF-8" ?>\n'
+            '<dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">\n'
+            '  <profiles>\n'
+            '    <transport_descriptors>\n'
+            '      <transport_descriptor>\n'
+            '        <transport_id>udp_big</transport_id>\n'
+            '        <type>UDPv4</type>\n'
+            f'        <receiveBufferSize>{socket_buffer_bytes}</receiveBufferSize>\n'
+            f'        <sendBufferSize>{socket_buffer_bytes}</sendBufferSize>\n'
+            '      </transport_descriptor>\n'
+            '    </transport_descriptors>\n'
+            '    <participant profile_name="big" is_default_profile="true">\n'
+            '      <rtps>\n'
+            '        <userTransports><transport_id>udp_big</transport_id>'
+            '</userTransports>\n'
+            '        <useBuiltinTransports>false</useBuiltinTransports>\n'
+            '      </rtps>\n'
+            '    </participant>\n'
+            '  </profiles>\n'
+            '</dds>\n')
 
 
 def _git_hash() -> str:
@@ -147,6 +193,13 @@ class ScenarioEngine:
                 "--period-ms", str(cfg.period_ms),
                 "--payload-bytes", str(cfg.payload_bytes),
                 "--reliability", cfg.reliability,
+                "--durability", cfg.durability,
+                "--history", cfg.history,
+                "--depth", str(cfg.depth),
+                "--deadline-ms", str(cfg.deadline_ms),
+                "--lifespan-ms", str(cfg.lifespan_ms),
+                "--liveliness", cfg.liveliness,
+                "--liveliness-lease-ms", str(cfg.liveliness_lease_ms),
                 "--duration-s", str(self.scenario.duration_s),
                 "--metrics", str(self.out_dir / f"agent_{nid}.jsonl")]
 
@@ -167,9 +220,18 @@ class ScenarioEngine:
         log_dir.mkdir(parents=True, exist_ok=True)
         if rmw == "zenoh":
             return self._spawn_zenoh(log_dir)
+        buf = self.scenario.ros2.socket_buffer_bytes
         if rmw == "fastrtps":
             if self.scenario.ros2.discovery_server:
                 return self._spawn_fastdds_server(log_dir)
+            if buf > 0:
+                # profiles XML: a UDPv4-only transport with enlarged buffers.
+                # useBuiltinTransports=false keeps SHM off, same as the env route.
+                prof = self.out_dir / "fastdds_profiles.xml"
+                prof.write_text(_fastdds_profiles_xml(buf))
+                return self._spawn_routerless(
+                    "rmw_fastrtps_cpp", log_dir,
+                    lambda nid: {"FASTDDS_DEFAULT_PROFILES_FILE": str(prof)})
             # UDPv4 builtin transport drops the default SHM transport, forcing
             # real UDP over the veth; native SPDP multicast handles discovery.
             return self._spawn_routerless(
@@ -177,7 +239,7 @@ class ScenarioEngine:
                 lambda nid: {"FASTDDS_BUILTIN_TRANSPORTS": "UDPv4"})
         if rmw == "cyclonedds":
             xml = self.out_dir / "cyclonedds.xml"
-            xml.write_text(_CYCLONEDDS_XML)
+            xml.write_text(_cyclonedds_xml(buf))
             return self._spawn_routerless(
                 "rmw_cyclonedds_cpp", log_dir,
                 lambda nid: {"CYCLONEDDS_URI": f"file://{xml}"})
@@ -414,6 +476,11 @@ class ScenarioEngine:
         agent_exit: dict[str, int | None] = {}
         samples: list[dict] = []
         sample_dt = 1.0  # resource sampling cadence (s)
+        # raise host socket-buffer ceilings BEFORE any DDS proc starts, else a
+        # SocketReceiveBufferSize request is clamped (and Cyclone refuses to
+        # start). 0 -> no-op. Restored in finally.
+        kbuf_orig = self._apply_kernel_buffers(
+            self.scenario.ros2.socket_buffer_bytes)
         try:
             agents = (self._spawn_ros2() if self.scenario.workload == "ros2"
                       else self._spawn_agents()
@@ -454,6 +521,7 @@ class ScenarioEngine:
                 if p.poll() is None:
                     p.kill()
             self.topo.teardown()
+            self._restore_kernel_buffers(kbuf_orig)
         self._write_resources(samples)
         # peak host pressure = the "was the rig saturated?" evidence
         peak_mem = max((s["host_mem_used"] for s in samples), default=0)
@@ -470,8 +538,43 @@ class ScenarioEngine:
             "peak_host_mem_used_bytes": peak_mem,
             "min_host_mem_avail_bytes": min_avail,
             "peak_host_swap_used_bytes": peak_swap,
+            "socket_buffer_bytes": self.scenario.ros2.socket_buffer_bytes,
             "agent_exit_codes": agent_exit,
         }, indent=2))
+
+    @staticmethod
+    def _apply_kernel_buffers(nbytes: int) -> dict[str, str]:
+        """Raise net.core.{r,w}mem_max/default to >= nbytes and netdev backlog,
+        returning the original values for restore. No-op (returns {}) when
+        nbytes<=0. Root writes /proc/sys directly (the orchestrator runs under
+        sudo; the `sysctl` binary is not on the NOPASSWD list)."""
+        if nbytes <= 0:
+            return {}
+        orig: dict[str, str] = {}
+        try:
+            for key in _KERNEL_BUF_SYSCTLS:
+                path = f"/proc/sys/net/core/{key}"
+                orig[path] = Path(path).read_text().strip()
+                # only raise, never lower a generously-configured host
+                if int(orig[path]) < nbytes:
+                    Path(path).write_text(str(nbytes))
+            blog = "/proc/sys/net/core/netdev_max_backlog"
+            orig[blog] = Path(blog).read_text().strip()
+            if int(orig[blog]) < 5000:
+                Path(blog).write_text("5000")
+        except (PermissionError, OSError):
+            # not root / locked-down: leave whatever we managed to set, restore
+            # only those. The DDS layer will surface a clamp if it matters.
+            pass
+        return orig
+
+    @staticmethod
+    def _restore_kernel_buffers(orig: dict[str, str]) -> None:
+        for path, val in orig.items():
+            try:
+                Path(path).write_text(val)
+            except (PermissionError, OSError):
+                pass
 
     def _sample_resources(self, t: float, meters: dict) -> dict:
         """One resource sample: per-PID cpu%/RSS plus host cpu/mem/swap."""
