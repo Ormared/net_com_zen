@@ -1,0 +1,14 @@
+# Fast DDS Discovery Server A/B — tuning experiment (docs/results/dds-rmw-tuning.md #4)
+# NOT auto-generated: a focused 2-cell experiment, fastrtps only.
+#   discovery_server=false -> distributed SPDP/SEDP multicast (the baseline)
+#   discovery_server=true  -> one fast-discovery-server broker, clients in a star
+# Re-running the false baseline in the same session controls for host drift.
+base: bridge_n48.yaml
+axes:
+  ros2.rmw:
+  - fastrtps
+  ros2.discovery_server:
+  - false
+  - true
+seeds:
+- 0

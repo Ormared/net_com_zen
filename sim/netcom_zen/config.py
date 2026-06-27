@@ -122,6 +122,21 @@ class Ros2WorkloadConfig(BaseModel):
     payload_bytes: int = Field(gt=0, default=255)  # ~ one state-sync snapshot
     reliability: Literal["reliable", "best_effort"] = "reliable"  # stock default
     port: int = 7447  # router port inside each netns (zenoh only)
+    # Fast DDS Discovery Server (tuning experiment, dds-rmw-tuning.md #4): when
+    # true, run one `fast-discovery-server` broker on the bridge and point every
+    # node at it (client-server discovery) instead of distributed SPDP/SEDP
+    # multicast — turns the O(N^2) participant mesh into O(N). Fast DDS ONLY:
+    # Cyclone has no broker equivalent (its analog is unicast peers + buffers)
+    # and zenoh is already router-brokered, so this flag is rejected for them.
+    discovery_server: bool = False
+
+    @model_validator(mode="after")
+    def _discovery_server_is_fastrtps_only(self):
+        if self.discovery_server and self.rmw != "fastrtps":
+            raise ValueError(
+                f"discovery_server=True is Fast DDS only, not rmw={self.rmw!r} "
+                "(cyclonedds has no broker; zenoh is already router-brokered)")
+        return self
 
 
 class MobilityConfig(BaseModel):

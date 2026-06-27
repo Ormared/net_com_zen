@@ -88,16 +88,23 @@ thread-pool reception model and is less sensitive to a single overflowing socket
 
 ### The knobs, what each one actually does, and expected effect
 
-1. **Discovery Server (the big lever).** `ROS_DISCOVERY_SERVER=<ip:port>` (or XML
+1. **Discovery Server.** `ROS_DISCOVERY_SERVER=<ip:port>` (or XML
    `<discoveryServer>`). Replaces distributed discovery with a **client–server
    broker**: every node connects only to one (or a few) server participants; the
-   server redistributes discovery data. This turns the O(N²) participant mesh
-   into **O(N)** — each client has one discovery link instead of 95. This is the
-   single highest-leverage change for Fast DDS at scale and is the officially
-   recommended large-fleet path. *Expected:* pushes the knee well past 96; the
-   SPDP multicast storm disappears entirely (discovery becomes unicast to the
-   server). Cost: the server is a new SPOF (mitigate with redundant/backup
-   servers) and a topology decision (which netns hosts it).
+   server redistributes discovery data. This turns the O(N²) *participant*
+   discovery mesh into **O(N)** — each client has one discovery link instead of
+   95 — and removes the SPDP multicast storm entirely. It is the officially
+   recommended large-fleet path. ***We ran this (experiment §8.1) and it did NOT
+   move the mesh*** — identical 0.45 (N=48) / 0.11 (N=96) with and without it.
+   The reason is the crux of this whole study: the Discovery Server brokers
+   discovery **metadata**, not **user data**. Our workload is all-to-all
+   (every node subscribes to every peer), so the binding constraint is the
+   **data-plane reliable endpoint matrix** — N(N−1) matched reader/writer pairs,
+   each a stateful RELIABLE RTPS connection with its own heartbeat/ACKNACK loop,
+   entirely peer-to-peer. The server doesn't touch that. Discovery Server is the
+   right tool when *participant discovery* is the bottleneck (many participants,
+   **sparse** pub/sub matching); it does little for a dense all-to-all mesh. See
+   §8.1 for the data and the corrected mental model.
 
 2. **Initial peers + disable multicast.** `<initialPeersList>` with an explicit
    unicast locator list, plus turning off multicast announcements. Converts SPDP
@@ -128,8 +135,15 @@ thread-pool reception model and is less sensitive to a single overflowing socket
    builtin endpoints trims per-endpoint state. Second-order vs. the topology
    levers above.
 
-**If you change one thing in Fast DDS: run a Discovery Server.** Everything else
-is incremental; the server is the structural fix.
+**If you change one thing in Fast DDS: drop reliable QoS, or break the all-to-all
+matrix.** This is the *corrected* recommendation after §8.1. The Discovery Server
+(the obvious first guess, and our first experiment) does **not** help here because
+the bottleneck is the N² *reliable data-plane* endpoint mesh, not participant
+discovery. The structural fix is to shrink that matrix: best-effort QoS removes
+the per-pair heartbeat/ACKNACK handshake, and an aggregation topology (hub topic
+instead of every-node-subscribes-to-every-node) removes the N² entirely. Static
+EDP (#4) still helps the *discovery-time* component; the Discovery Server is the
+right call only for **sparse** large fleets.
 
 ---
 
@@ -311,9 +325,12 @@ bottleneck so any improvement is attributable to the tweak.
 | 1 | **Longer window** (120–300 s) at N = 48, 96 | all | Separates "slow" from "broken"; expect Cyclone/Fast DDS mesh to climb materially given time | mesh & delivery vs. the 30 s baseline at same N |
 | 2 | **Cyclone: raise socket + kernel recv buffers** | Cyclone | 26 s discovery at 48 drops sharply; tail latency (p99 2 s) shrinks — breaks the retransmit storm | discovery_time_s, p99 at N = 48 |
 | 3 | **Zenoh: star topology** (one hub router, nodes `client`) | Zenoh | Largest single win; N = 96 should recover toward full mesh (links per node 95 → 1) | mesh/delivery at N = 96; router connection count |
-| 4 | **Fast DDS: Discovery Server** | Fast DDS | Knee pushed past 96; SPDP multicast storm gone | discovery_time_s flat vs. N; mesh at 96 |
-| 5 | **Cyclone: unicast peers list** (multicast off) | Cyclone | Removes the SPDP flood; complements #2 | per-port multicast frame rate; discovery at 48/96 |
-| 6 | **Best-effort QoS** diagnostic cell | all | Isolates how much collapse is reliability retransmit vs. discovery | delivery/latency delta vs. reliable at N = 48 |
+| 4 | ~~**Fast DDS: Discovery Server**~~ **— DONE, §8.1: no effect** | Fast DDS | ~~Knee pushed past 96~~ — mesh unchanged (0.45/0.11); brokers metadata, not the reliable data-plane mesh | mesh identical ±0 with/without; see §8.1 |
+| 5 | **Best-effort QoS** (the new #1 lever for the DDS pair) | Fast DDS, Cyclone | Removes the per-pair reliable heartbeat/ACKNACK handshake — the actual N² data-plane cost §8.1 exposed | mesh/delivery at N = 48, 96 vs. reliable baseline |
+| 6 | **Cyclone: raise socket + kernel recv buffers** | Cyclone | 26 s discovery at 48 drops sharply; tail latency shrinks — breaks the retransmit storm | discovery_time_s, p99 at N = 48 |
+| 7 | **Zenoh: star topology** (one hub, nodes `client`) | Zenoh | N = 96 recovers toward full mesh (links/node 95 → 1) | mesh/delivery at N = 96 |
+| 8 | **Longer window** (120–300 s) at N = 48, 96 | all | Separates "slow" from "broken" | mesh & delivery vs. the 30 s baseline |
+| 9 | **Aggregation topology** (hub topic, not all-to-all) | all | Removes the N² endpoint matrix at the source — the structural fix §8.1 points to | mesh/delivery, endpoint count |
 
 The harness change for each is small: a new env/XML/topology branch in
 `_spawn_*` plus a per-N scenario, reusing `dds_report.py` to re-aggregate. The
@@ -322,13 +339,70 @@ RMW on the same axes as `dds-rmw-scaling.md`, so the knee visibly moves.
 
 ## 7. One-line summary per architecture
 
-- **Fast DDS** plateaus (doesn't thrash); its N² is the *endpoint* mesh →
-  **broker it with a Discovery Server.**
+- **Fast DDS** plateaus (doesn't thrash); its binding N² is the *reliable
+  data-plane endpoint matrix*, not discovery → **drop reliable QoS / break the
+  all-to-all mesh** (the Discovery Server, §8.1, does *not* help here).
 - **Cyclone** thrashes on a buffer-overflow retransmit storm; it has no broker →
-  **enlarge receive buffers, then go unicast-peers.**
+  **enlarge receive buffers, then go unicast-peers** (and best-effort QoS, same
+  data-plane lever as Fast DDS).
 - **Zenoh** was capped by *our* full router mesh, not by Zenoh → **make it a star
   (one hub, clients).**
 
-All three share the same disease — every node discovering every node on a flat
-segment — and the cure is always the same shape: **stop doing O(N²); broker,
-unicast, or hub the discovery so each node only does O(1) discovery work.**
+All three share the same disease — **every node connecting to every node** on a
+flat segment — but §8.1 sharpened *where* the O(N²) bites: not (only) discovery,
+but the **reliable data-plane endpoint matrix**. The cure is the same shape —
+stop doing O(N²) — but it has to attack the *data plane* (best-effort QoS,
+aggregation/hub topology), not just discovery (broker/unicast). Brokering
+discovery alone, as the Discovery Server experiment showed, fixes a cost that
+wasn't the binding one for an all-to-all telemetry mesh.
+
+---
+
+## 8. Experiment log
+
+Results from actually running the tweaks, newest first. Each is an A/B on the
+existing sweep harness; host-pressure counters confirm the host was never the
+limit (all cells: every process exited 0, ~30 GB free), so any delta is
+middleware, not rig.
+
+### 8.1 Fast DDS Discovery Server — **no effect on mesh** (2026-06-27)
+
+Ran `discovery_server` ∈ {false, true} for Fast DDS at N = 48 and N = 96
+(`scenarios/dds/ds_experiment_n{48,96}.yaml`, results in
+`results/dds/ds_n{48,96}/`). One `fast-discovery-server` broker per run in
+node 0's netns on the bridge; all nodes joined as discovery clients
+(`ROS_DISCOVERY_SERVER=10.99.0.1:11811`), SHM still off — the *only* change vs.
+baseline is the discovery mechanism.
+
+| N | config | discovery (s) | p50 (ms) | p99 (ms) | delivery | mesh |
+|---|---|---|---|---|---|---|
+| 48 | distributed (baseline) | 1.58 | 1.40 | 8.56 | 0.449 | **0.453** |
+| 48 | **Discovery Server** | 2.05 | 1.44 | 8.30 | 0.439 | **0.453** |
+| 96 | distributed (baseline) | 6.38 | 6.45 | 32.5 | 0.111 | **0.112** |
+| 96 | **Discovery Server** | 7.56 | 8.35 | 51.6 | 0.098 | **0.112** |
+
+**The mesh is identical to three digits** with and without the broker (0.453 at
+48, 0.112 at 96), and the Discovery Server is marginally *worse* on
+discovery-time and tail latency (the extra startup + the broker as a metadata
+serialization point). **Prediction #4 was wrong, and instructively so.**
+
+Why it doesn't help — the corrected mental model. The benchmark workload is
+**all-to-all**: every node publishes one telemetry topic and subscribes to all
+N−1 peers (`ros2_workload/node.py` creates one subscription per peer). That is an
+N(N−1) matrix of matched reader/writer pairs — **9 120 pairs at N = 96** — and
+under reliable QoS each pair is a stateful RTPS connection with its own
+heartbeat/ACKNACK loop. The Discovery Server brokers **discovery metadata**
+(who exists, what endpoints they have) and turns *participant* discovery O(N²) →
+O(N). It does **not** broker **user data** — the reliable data-plane mesh stays
+fully peer-to-peer and stays O(N²). Since mesh completeness is gated by that data
+plane (note the N = 48 baseline discovered in 1.58 s yet still only reached 0.45
+mesh — discovery was *not* the binding constraint), brokering discovery moves
+nothing.
+
+The takeaway re-frames the whole study: for a **dense all-to-all** telemetry
+mesh, the scaling wall is the **reliable endpoint matrix in the data plane**, not
+discovery messaging. The Discovery Server is the right tool for the *opposite*
+regime — many participants with **sparse** pub/sub matching. The levers that
+actually attack our wall are **best-effort QoS** (deletes the per-pair reliable
+handshake) and an **aggregation/hub topology** (deletes the N² matrix itself) —
+now experiments #5 and #9.

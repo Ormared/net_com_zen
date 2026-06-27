@@ -1,0 +1,9 @@
+# Fast DDS Discovery Server smoke (N=4) — de-risk the broker spawn path only.
+base: bridge_n4.yaml
+axes:
+  ros2.rmw:
+  - fastrtps
+  ros2.discovery_server:
+  - true
+seeds:
+- 0

@@ -168,6 +168,8 @@ class ScenarioEngine:
         if rmw == "zenoh":
             return self._spawn_zenoh(log_dir)
         if rmw == "fastrtps":
+            if self.scenario.ros2.discovery_server:
+                return self._spawn_fastdds_server(log_dir)
             # UDPv4 builtin transport drops the default SHM transport, forcing
             # real UDP over the veth; native SPDP multicast handles discovery.
             return self._spawn_routerless(
@@ -190,6 +192,54 @@ class ScenarioEngine:
         for nid in self.topo.nodes:
             agents[nid] = subprocess.Popen(self._workload_cmd(nid),
                                            env={**base, **extra_env(nid)})
+        return agents
+
+    # Fast DDS Discovery Server port (the impl's well-known default). The server
+    # binds this on node 0's bridge address; every client unicasts discovery to
+    # it instead of flooding SPDP multicast.
+    _DS_PORT = 11811
+
+    def _spawn_fastdds_server(self, log_dir: Path) -> dict[str, subprocess.Popen]:
+        """Fast DDS client-server discovery (tuning experiment, dds-rmw-tuning.md
+        #4). One `fast-discovery-server` broker runs in node 0's netns bound to
+        its bridge address; every workload node points at it via
+        ROS_DISCOVERY_SERVER and joins as a discovery CLIENT. This replaces the
+        distributed O(N^2) SPDP/SEDP multicast mesh with an O(N) star — each node
+        keeps one discovery link to the server instead of 95 peer participants.
+
+        The server lives in node 0's existing netns (reusing its veth on the
+        bridge, no extra namespace) and is tracked in self._routers so the run
+        lifecycle meters and tears it down exactly like a zenoh router. SHM is
+        still forced off (FASTDDS_BUILTIN_TRANSPORTS=UDPv4) so user data is real
+        UDP over the veth, identical to the routerless baseline — the ONLY thing
+        that changes between the two fastrtps cells is the discovery mechanism."""
+        prefix = Path(sys.executable).resolve().parents[1]
+        server_bin = prefix / "bin" / "fast-discovery-server"
+        if not server_bin.exists():
+            raise RuntimeError(
+                f"{server_bin} not found: discovery_server needs the ros2 pixi "
+                "env (sudo .pixi/envs/ros2/bin/python ...)")
+        nodes = list(self.topo.nodes)
+        server_addr = self.topo.addrs[nodes[0]]
+        base = self._ros2_base_env("rmw_fastrtps_cpp", log_dir)
+        # server id 0 -> first (only) position in ROS_DISCOVERY_SERVER; clients
+        # derive the expected server GUID from that position, so they must match.
+        self._routers["ds"] = subprocess.Popen(
+            ["ip", "netns", "exec", self.topo.ns_names[nodes[0]],
+             str(server_bin), "-i", "0", "-l", server_addr,
+             "-p", str(self._DS_PORT)],
+            env=base,
+            stdout=(self.out_dir / "fastdds_discovery_server.log").open("w"),
+            stderr=subprocess.STDOUT)
+        time.sleep(1.0)  # let the server bind+listen before clients dial in
+        client_env = {
+            "FASTDDS_BUILTIN_TRANSPORTS": "UDPv4",
+            "ROS_DISCOVERY_SERVER": f"{server_addr}:{self._DS_PORT}",
+        }
+        agents: dict[str, subprocess.Popen] = {}
+        for nid in nodes:
+            agents[nid] = subprocess.Popen(self._workload_cmd(nid),
+                                           env={**base, **client_env})
         return agents
 
     def _spawn_zenoh(self, log_dir: Path) -> dict[str, subprocess.Popen]:

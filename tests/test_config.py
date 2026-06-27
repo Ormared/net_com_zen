@@ -44,6 +44,17 @@ def test_duplicate_node_ids_rejected(tmp_path):
         load_scenario(p)
 
 
+def test_discovery_server_is_fastrtps_only():
+    from netcom_zen.config import Ros2WorkloadConfig
+    # Fast DDS Discovery Server is a Fast DDS feature; cyclonedds has no broker
+    # equivalent and zenoh is already router-brokered (dds-rmw-tuning.md §8.1).
+    assert Ros2WorkloadConfig(rmw="fastrtps", discovery_server=True).discovery_server
+    assert not Ros2WorkloadConfig(rmw="zenoh").discovery_server  # default off
+    for bad in ("zenoh", "cyclonedds"):
+        with pytest.raises(ValidationError):
+            Ros2WorkloadConfig(rmw=bad, discovery_server=True)
+
+
 def test_jammer_kind_params():
     base = {"id": "j", "position": (0, 0), "tx_power_dbm": 30}
     from netcom_zen.config import JammerConfig
