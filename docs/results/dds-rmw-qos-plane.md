@@ -9,7 +9,11 @@
 > partly the same artifact sheltering its router mesh from its real overload.
 > The enduring contributions of this doc are methodological: replicate
 > everything, distrust single runs, and distrust invariant round numbers.
-> See [dds-neighbor-table.md](dds-neighbor-table.md).
+> The QoS plane has been **re-measured on the fixed rig** — headline
+> reversal: the socket buffer, null here, is in fact THE Fast DDS lever
+> (mesh 0.31 → 1.00 at N=96). See
+> [dds-neighbor-table.md](dds-neighbor-table.md) § "The QoS plane,
+> re-measured".
 
 Third in the DDS/RMW series, and the one that gets to the bottom of it.
 [`dds-rmw-scaling.md`](dds-rmw-scaling.md) found the *what* (a knee at N=48, no

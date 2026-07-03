@@ -69,6 +69,60 @@ effective value).
   broker can't fix a data-plane limit), zenoh's star-topology result, and
   the netem/cluster/topology harnesses.
 
+## The QoS plane, re-measured (results/dds/qos2)
+
+With the rig fixed, the full OFAT screen + buffer sweep + replicated
+combinations were re-run (Fast DDS / Cyclone at N=96, Zenoh at N=48 where its
+delivery margin leaves room for effects; 33 + 15 cells). The corrected story:
+
+### Fast DDS: the socket buffer is THE lever — the original instinct was right
+
+| config (N=96) | mesh @30 s | delivery |
+|---|---|---|
+| baseline ×3 | 0.29–0.32 | 0.09 |
+| buf 4 MB | 0.70 | 0.37 |
+| buf 16 MB | 0.83 | 0.51 |
+| buf 64 MB ×3 | **0.95–0.96** | **0.66–0.67** |
+| buf 64 MB, 60 s | **1.000** | **0.854** |
+
+A clean, replicated, monotone dose-response — and with 64 MB + 60 s Fast DDS
+reaches **full mesh at N=96 with 85 % delivery**. The original study measured
+this exact sweep as *null*: the neighbor table capped everything at 1022
+pairs, so no socket-level improvement could ever show. Mechanism: ~95
+reliable writers fan into each participant's single UDP socket; the default
+receive buffer drops the bursts, and the NACK/retransmit churn consumes the
+window. Every *other* QoS knob (reliability, durability, history, depth,
+deadline, lifespan, liveliness) moves Fast DDS by ≤±15 % — noise next to the
+buffer. Even best_effort adds almost nothing *on top of* the buffer
+(0.95–0.97 mesh): once the socket stops dropping, the reliable protocol was
+never the bottleneck.
+
+### Cyclone: insensitive to the entire QoS plane — robust by default
+
+Mesh 1.000 in **every** cell; delivery 0.90–0.95 across all nine QoS knobs,
+all buffer sizes, and the transient_local+buf64 stack (0.94). Nothing helps
+much because nothing is broken; depth=1 costs ~3 % delivery, everything else
+is noise. Cyclone's internal pacing does at N=96 what Fast DDS needs 64 MB of
+socket buffer to approximate.
+
+### Zenoh: QoS effects are marginal; the lever stays topology
+
+At N=48 (mesh 1.0 everywhere): baseline delivery 0.34–0.38, keep_all
+0.36–0.44, best_effort 0.34–0.41 — ~+10 % means with overlapping spreads.
+Consistent with the old study's one durable zenoh finding: QoS is not where
+zenoh scales; router topology is (star = 94/94 at N=48; full mesh = collapse
+at 96).
+
+### Practical guidance (supersedes the old doc's)
+
+1. **Fast DDS:** set `socket_buffer_bytes` ≥ 64 MB (and kernel rmem to
+   match) — it is the difference between 10 % and 85 % delivery at N=96.
+   Leave the rest of the QoS contract at stock.
+2. **Cyclone:** use it. Stock config full-meshes N=96 at 96 % delivery and
+   still moves data at N=192 (mesh ~0.5) — the strongest all-to-all scaler.
+3. **Zenoh:** don't tune QoS; fix the router topology (star/tree), and
+   replicate every measurement (delivery CV ~10 % even at N=48).
+
 ## Implications
 
 1. **The user's realism requirement was the compass.** On real distributed
