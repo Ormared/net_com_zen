@@ -7,6 +7,7 @@ config schema parsing, XML string generators, and argv construction.
 """
 from __future__ import annotations
 
+import shlex
 from pathlib import Path
 
 import pytest
@@ -249,11 +250,23 @@ class TestFastDDSWhitelistPinning:
 # ---------------------------------------------------------------------------
 
 class TestLanNodeCmd:
+    """Tests for _lan_node_cmd argv structure.
+
+    The remote command is now a 5-element list:
+        ["ssh", "-o", "BatchMode=yes", target, <one shlex-joined string>]
+    where cmd[-1] is the shlex.join of the entire docker-exec argv.  Tests
+    that inspect the remote argv must parse cmd[-1] with shlex.split to
+    reconstruct the individual tokens — doing `"docker" in cmd` would fail
+    because "docker" lives inside the joined string, not as its own element.
+    """
+
     @pytest.fixture
     def engine(self, tmp_path):
         """ScenarioEngine initialised with the two-host lan scenario, no run."""
         s = Scenario.model_validate(_lan_dict())
         return ScenarioEngine(s, out_dir=tmp_path / "run_smoke")
+
+    # ---- local node tests (cmd is a flat argv list, no shlex wrapping) ------
 
     def test_local_node_has_no_ssh_in_argv(self, engine):
         """Local node command must not contain 'ssh' anywhere in argv."""
@@ -265,36 +278,6 @@ class TestLanNodeCmd:
         cmd = engine._lan_node_cmd("d1", "local")
         assert "-m" in cmd
         assert "netcom_zen.ros2_workload" in cmd
-
-    def test_remote_node_starts_with_ssh_batchmode(self, engine):
-        """Remote node command must start with ssh -o BatchMode=yes <target>."""
-        cmd = engine._lan_node_cmd("d3", "mini")
-        assert cmd[0] == "ssh"
-        assert "-o" in cmd
-        ssh_o_idx = cmd.index("-o")
-        assert cmd[ssh_o_idx + 1] == "BatchMode=yes"
-
-    def test_remote_node_contains_docker_exec(self, engine):
-        """Remote command must have 'docker' followed eventually by 'exec'."""
-        cmd = engine._lan_node_cmd("d3", "mini")
-        assert "docker" in cmd
-        docker_idx = cmd.index("docker")
-        exec_idx = cmd.index("exec")
-        assert docker_idx < exec_idx
-
-    def test_remote_node_contains_container_name(self, engine):
-        """Remote command must reference the configured container name."""
-        cmd = engine._lan_node_cmd("d3", "mini")
-        container = engine.scenario.hosts["mini"].container
-        assert container in cmd
-
-    def test_remote_node_metrics_path_is_remote(self, engine):
-        """Remote node --metrics must point into the container workdir, not out_dir."""
-        cmd = engine._lan_node_cmd("d3", "mini")
-        h = engine.scenario.hosts["mini"]
-        run_name = engine.out_dir.name
-        expected = f"{h.workdir}/results/lan/{run_name}/agent_d3.jsonl"
-        assert expected in cmd
 
     def test_local_node_metrics_is_in_out_dir(self, engine):
         """Local node --metrics must point into the local out_dir."""
@@ -310,13 +293,91 @@ class TestLanNodeCmd:
         assert "d1" not in peers
         assert set(peers) == {"d2", "d3", "d4"}
 
+    # ---- remote node tests (cmd[-1] is the shlex-joined remote command) -----
+
+    def test_remote_node_outer_shape(self, engine):
+        """Remote argv outer shape: exactly ["ssh", "-o", "BatchMode=yes",
+        target, <one joined string>] — 5 elements total."""
+        cmd = engine._lan_node_cmd("d3", "mini")
+        assert cmd[0] == "ssh"
+        assert cmd[1] == "-o"
+        assert cmd[2] == "BatchMode=yes"
+        assert cmd[3] == engine.scenario.hosts["mini"].ssh
+        assert len(cmd) == 5   # cmd[4] is the single shlex-joined string
+
+    def test_remote_node_inner_starts_with_docker_exec(self, engine):
+        """Parsed remote argv must start with ['docker', 'exec']."""
+        cmd = engine._lan_node_cmd("d3", "mini")
+        inner = shlex.split(cmd[-1])
+        assert inner[0] == "docker"
+        assert inner[1] == "exec"
+
+    def test_remote_node_inner_contains_container_name(self, engine):
+        """Parsed remote argv must contain the configured container name."""
+        cmd = engine._lan_node_cmd("d3", "mini")
+        inner = shlex.split(cmd[-1])
+        container = engine.scenario.hosts["mini"].container
+        assert container in inner
+
+    def test_remote_node_inner_contains_remote_metrics_path(self, engine):
+        """Parsed remote argv must contain the container-side metrics path."""
+        cmd = engine._lan_node_cmd("d3", "mini")
+        inner = shlex.split(cmd[-1])
+        h = engine.scenario.hosts["mini"]
+        run_name = engine.out_dir.name
+        expected = f"{h.workdir}/results/lan/{run_name}/agent_d3.jsonl"
+        assert expected in inner
+
     def test_peers_exclude_self_remote(self, engine):
         """--peers for a remote node must not include the node itself."""
         cmd = engine._lan_node_cmd("d3", "mini")
-        peers_val = cmd[cmd.index("--peers") + 1]
+        inner = shlex.split(cmd[-1])
+        peers_val = inner[inner.index("--peers") + 1]
         peers = peers_val.split(",")
         assert "d3" not in peers
         assert set(peers) == {"d1", "d2", "d4"}
+
+    def test_extra_env_embedded_as_e_flags(self, engine):
+        """extra_env dict must appear as -e KEY=VAL pairs inside the joined string."""
+        cmd = engine._lan_node_cmd("d3", "mini",
+                                   extra_env={"FOO": "bar", "BAZ": "qux"})
+        inner = shlex.split(cmd[-1])
+        # Collect all -e values
+        e_vals = {inner[i + 1]
+                  for i, tok in enumerate(inner)
+                  if tok == "-e" and i + 1 < len(inner)}
+        assert "FOO=bar" in e_vals
+        assert "BAZ=qux" in e_vals
+
+    def test_remote_env_shlex_roundtrip_preserves_bracketed_quotes(self, engine):
+        """ZENOH_CONFIG_OVERRIDE value with bracketed endpoint list must survive
+        the shlex.join / shlex.split round-trip that ssh uses for remote commands.
+
+        This is the regression guard for the bug where the remote shell stripped
+        double-quotes from `["tcp/127.0.0.1:7447"]`, leaving `[tcp/127.0.0.1:7447]`
+        and causing zenoh to reject the config with Json5Err.
+        """
+        zenoh_val = 'connect/endpoints=["tcp/127.0.0.1:7447"]'
+        cmd = engine._lan_node_cmd("d3", "mini", extra_env={
+            "ZENOH_CONFIG_OVERRIDE": zenoh_val,
+            "RMW_IMPLEMENTATION": "rmw_zenoh_cpp",
+        })
+        # cmd[-1] is the single string ssh hands to the remote shell.
+        # Parsing it with shlex.split simulates what the remote shell does.
+        inner = shlex.split(cmd[-1])
+        recovered: str | None = None
+        for i, tok in enumerate(inner):
+            if tok == "-e" and i + 1 < len(inner):
+                kv = inner[i + 1]
+                if kv.startswith("ZENOH_CONFIG_OVERRIDE="):
+                    # split on first "=" only; the value may contain "="
+                    recovered = kv.split("=", 1)[1]
+                    break
+        assert recovered is not None, (
+            "ZENOH_CONFIG_OVERRIDE -e flag not found in parsed remote argv")
+        assert recovered == zenoh_val, (
+            f"double-quotes were lost through shlex round-trip: "
+            f"got {recovered!r}, expected {zenoh_val!r}")
 
 
 # ---------------------------------------------------------------------------

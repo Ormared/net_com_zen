@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -175,6 +176,26 @@ def _git_hash() -> str:
                               text=True, check=True).stdout.strip()
     except (subprocess.CalledProcessError, FileNotFoundError):
         return "unknown"
+
+
+def _ssh_cmd(target: str, remote_argv: list[str]) -> list[str]:
+    """Build an ssh argv that reconstructs the remote command exactly.
+
+    ssh(1) joins all arguments after the destination with spaces and passes
+    the result to the remote login shell as a single string.  If remote_argv
+    is passed as separate list elements, the remote shell re-parses them and
+    loses quoting:
+      - A `sh -c 'cat > /path'` arg becomes `sh -c cat` with `> /path` as a
+        REDIRECT ON THE REMOTE HOST (not inside the container).
+      - A `-e KEY=val["with","brackets"]` element has its quotes stripped,
+        producing `[with,brackets]` instead of `["with","brackets"]`.
+
+    shlex.join() produces one properly-quoted string; the remote shell splits
+    it back into exactly the original tokens.  Equivalent to writing:
+        ssh target 'docker exec -e "K=v" container cmd arg'
+    but constructed programmatically without manual quoting.
+    """
+    return ["ssh", "-o", "BatchMode=yes", target, shlex.join(remote_argv)]
 
 
 @dataclass
@@ -726,24 +747,33 @@ class ScenarioEngine:
             pass
         return None
 
-    def _lan_node_cmd(self, nid: str, host_name: str) -> list[str]:
+    def _lan_node_cmd(self, nid: str, host_name: str,
+                      extra_env: dict | None = None) -> list[str]:
         """Pure command-list builder for a single workload node in a lan run.
 
-        Returns the argv for `subprocess.Popen` WITHOUT environment variables —
-        those are injected by the caller (_run_lan) either via Popen's env=
-        keyword (local) or as `docker exec -e KEY=VAL` flags (remote).
+        Local host (ssh=""): returns [sys.executable, "-m", workload, ...args].
+        env= for local processes is set by the caller via Popen(env=...) and is
+        NOT embedded in the argv — extra_env is ignored for local nodes.
 
-        Local host (ssh=""): python -m netcom_zen.ros2_workload <args>
-        Remote host: ssh -o BatchMode=yes <target> docker exec <container>
-                     .pixi/envs/ros2/bin/python -m netcom_zen.ros2_workload <args>
+        Remote host: returns _ssh_cmd(target, docker_exec_argv) — a 5-element
+        list ["ssh", "-o", "BatchMode=yes", target, <one shlex-joined string>].
+        The shlex.join step is critical: ssh passes everything after the target
+        to the remote login shell as a SINGLE string; without it the shell
+        re-parses the tokens and:
+          - Strips double-quotes from ZENOH_CONFIG_OVERRIDE endpoint lists
+            (e.g. ["tcp/127.0.0.1:7447"] → [tcp/127.0.0.1:7447]), causing
+            zenoh to reject the config with Json5Err.
+          - Treats `sh -c 'cat > /path'` as `sh -c cat` with `> /path` as a
+            redirect on the REMOTE HOST (not inside the container), so XML
+            distribution fails with exit 1 because /work/ doesn't exist there.
+        With shlex.join the remote shell sees one properly-quoted string and
+        splits it back into exactly the original docker-exec argv.
 
-        Remote nodes write their metrics inside the container at
-        <workdir>/results/lan/<run_name>/agent_<nid>.jsonl; the bind mount
-        (~/net_com_zen:/work) makes this visible to rsync via the HOST path.
-        Local nodes write to out_dir as in the bridge and channel paths.
+        extra_env: environment variables embedded as `-e KEY=VAL` flags in the
+        docker exec argv for remote nodes.  Caller constructs the complete env
+        dict (base vars + RMW-specific extras) and passes it here.
 
-        Unit-testable: no subprocess is started, no filesystem access, no
-        network I/O — just string manipulation of self.scenario and self.out_dir.
+        Unit-testable: no subprocess, no filesystem, no network I/O.
         """
         cfg = self.scenario.ros2
         h = self.scenario.hosts[host_name]
@@ -751,7 +781,7 @@ class ScenarioEngine:
         peers = ",".join(p for p in all_ids if p != nid)
 
         # Workload arguments are identical across local and remote; only the
-        # interpreter prefix and --metrics path differ.
+        # interpreter prefix, --metrics path, and env-injection method differ.
         workload_args = [
             "-m", "netcom_zen.ros2_workload",
             "--id", nid,
@@ -770,25 +800,29 @@ class ScenarioEngine:
         ]
 
         if h.ssh == "":
-            # Local: use the same interpreter that is running the orchestrator.
-            # env= is set by the caller, not embedded in the argv.
+            # Local: interpreter runs directly; env= set by caller via Popen.
             metrics = str(self.out_dir / f"agent_{nid}.jsonl")
             return [sys.executable, *workload_args, "--metrics", metrics]
 
-        # Remote: argv passes through ssh → docker exec → container python.
-        # docker exec -e flags (added by the caller after "exec") carry the RMW
-        # env.  The container python is the ros2 pixi env interpreter; its path
-        # is fixed regardless of the container entrypoint.
+        # Remote: build docker exec argv with env vars embedded as -e flags,
+        # then wrap in _ssh_cmd so the whole thing arrives at the remote shell
+        # as one shlex-quoted string (see class docstring for the bug context).
         run_name = self.out_dir.name
-        remote_metrics = (f"{h.workdir}/results/lan/{run_name}/agent_{nid}.jsonl")
-        return [
-            "ssh", "-o", "BatchMode=yes", h.ssh,
+        remote_metrics = f"{h.workdir}/results/lan/{run_name}/agent_{nid}.jsonl"
+        e_flags = [
+            flag
+            for k, v in (extra_env or {}).items()
+            for flag in ("-e", f"{k}={v}")
+        ]
+        remote_argv = [
             "docker", "exec",
+            *e_flags,
             h.container,
             ".pixi/envs/ros2/bin/python",
             *workload_args,
             "--metrics", remote_metrics,
         ]
+        return _ssh_cmd(h.ssh, remote_argv)
 
     async def _run_lan(self) -> None:
         """Real-NIC multi-host substrate (substrate=lan).
@@ -859,9 +893,9 @@ class ScenarioEngine:
             for name, h in remote_hosts.items():
                 remote_res = f"{h.workdir}/results/lan/{run_name}"
                 subprocess.run(
-                    ["ssh", "-o", "BatchMode=yes", h.ssh,
-                     "docker", "exec", h.container,
-                     "mkdir", "-p", remote_res],
+                    _ssh_cmd(h.ssh,
+                             ["docker", "exec", h.container,
+                              "mkdir", "-p", remote_res]),
                     check=True)
 
             # --- 2. Generate and distribute per-host XML configs -------------
@@ -882,13 +916,15 @@ class ScenarioEngine:
                         remote_xml = (
                             f"{h.workdir}/results/lan/{run_name}/"
                             f"fastdds_profiles_{name}.xml")
-                        # Pipe XML into the container — `cat > path` is the
-                        # simplest approach that avoids scp and works with the
-                        # existing bind-mount path mapping.
+                        # Pipe XML into the container via stdin.  `cat > path`
+                        # is the sh -c argument; shlex-quoting inside _ssh_cmd
+                        # keeps the redirect INSIDE the container shell, not on
+                        # the remote host (the pre-fix bug: remote shell parsed
+                        # `sh -c cat > /path` and ran the redirect locally).
                         subprocess.run(
-                            ["ssh", "-o", "BatchMode=yes", h.ssh,
-                             "docker", "exec", "-i", h.container,
-                             "sh", "-c", f"cat > {remote_xml}"],
+                            _ssh_cmd(h.ssh,
+                                     ["docker", "exec", "-i", h.container,
+                                      "sh", "-c", f"cat > {remote_xml}"]),
                             input=xml_content.encode(), check=True)
                         xml_env[name] = {
                             "FASTDDS_DEFAULT_PROFILES_FILE": remote_xml}
@@ -909,9 +945,9 @@ class ScenarioEngine:
                             f"{h.workdir}/results/lan/{run_name}/"
                             f"cyclonedds_{name}.xml")
                         subprocess.run(
-                            ["ssh", "-o", "BatchMode=yes", h.ssh,
-                             "docker", "exec", "-i", h.container,
-                             "sh", "-c", f"cat > {remote_xml}"],
+                            _ssh_cmd(h.ssh,
+                                     ["docker", "exec", "-i", h.container,
+                                      "sh", "-c", f"cat > {remote_xml}"]),
                             input=xml_content.encode(), check=True)
                         xml_env[name] = {
                             "CYCLONEDDS_URI": f"file://{remote_xml}"}
@@ -951,15 +987,17 @@ class ScenarioEngine:
                                  "ZENOH_CONFIG_OVERRIDE": override},
                             stdout=router_log, stderr=subprocess.STDOUT)
                     else:
-                        # Remote router: env travels as docker exec -e flags;
-                        # no profiles file needed for the router itself.
+                        # Remote router: env travels as docker exec -e flags.
+                        # override contains quoted endpoint lists; _ssh_cmd's
+                        # shlex.join keeps them intact through the remote shell.
                         self._routers[host_name] = subprocess.Popen(
-                            ["ssh", "-o", "BatchMode=yes", h.ssh,
-                             "docker", "exec",
-                             "-e", f"ZENOH_CONFIG_OVERRIDE={override}",
-                             "-e", f"AMENT_PREFIX_PATH={remote_ament}",
-                             "-e", "PYTHONNOUSERSITE=1",
-                             h.container, zenohd_remote],
+                            _ssh_cmd(h.ssh, [
+                                "docker", "exec",
+                                "-e", f"ZENOH_CONFIG_OVERRIDE={override}",
+                                "-e", f"AMENT_PREFIX_PATH={remote_ament}",
+                                "-e", "PYTHONNOUSERSITE=1",
+                                h.container, zenohd_remote,
+                            ]),
                             stdout=router_log, stderr=subprocess.STDOUT)
                 # Give all routers time to bind and accept before sessions
                 # connect (same 1-second grace as _spawn_zenoh).
@@ -970,27 +1008,27 @@ class ScenarioEngine:
             for i, nid in enumerate(node_ids):
                 host_name = host_of[nid]
                 h = hosts[host_name]
-                base_cmd = self._lan_node_cmd(nid, host_name)
 
                 if rmw == "zenoh":
                     # All nodes (local and remote) connect to loopback; the
                     # router on each host exposes loopback + its LAN IP so the
                     # host-level mesh carries cross-host traffic transparently.
-                    zenoh_connect = (
-                        f'connect/endpoints=["tcp/127.0.0.1:{cfg.port}"]')
-                    node_extra = {"ZENOH_CONFIG_OVERRIDE": zenoh_connect}
+                    node_extra = {
+                        "ZENOH_CONFIG_OVERRIDE":
+                            f'connect/endpoints=["tcp/127.0.0.1:{cfg.port}"]'}
                 else:
                     node_extra = xml_env.get(host_name, {})
 
                 if h.ssh == "":
-                    # Local: set env via Popen env= (no -e flag needed).
+                    # Local: env injected via Popen(env=); _lan_node_cmd returns
+                    # a plain argv (sys.executable -m netcom_zen.ros2_workload …).
+                    cmd = self._lan_node_cmd(nid, host_name)
                     agents[nid] = subprocess.Popen(
-                        base_cmd, env={**local_base, **node_extra})
+                        cmd, env={**local_base, **node_extra})
                 else:
-                    # Remote: env must travel through ssh → docker exec.
-                    # Build the complete docker exec env: base remote vars
-                    # (AMENT, RMW_IMPL, log dir, no user site) plus node-
-                    # specific extras (xml path or zenoh connect string).
+                    # Remote: env travels as docker exec -e flags embedded by
+                    # _lan_node_cmd so _ssh_cmd can shlex-quote them correctly.
+                    # No splice code needed — the env dict is passed directly.
                     remote_log_dir = f"{h.workdir}/results/lan/{run_name}"
                     remote_env = {
                         "RMW_IMPLEMENTATION": rmw_impl,
@@ -999,16 +1037,9 @@ class ScenarioEngine:
                         "AMENT_PREFIX_PATH": remote_ament,
                         **node_extra,
                     }
-                    # Insert -e KEY=VAL flags between "exec" and the container
-                    # name in the base_cmd produced by _lan_node_cmd.
-                    exec_idx = base_cmd.index("exec")
-                    e_flags: list[str] = []
-                    for k, v in remote_env.items():
-                        e_flags += ["-e", f"{k}={v}"]
-                    full_cmd = (base_cmd[:exec_idx + 1]
-                                + e_flags
-                                + base_cmd[exec_idx + 1:])
-                    agents[nid] = subprocess.Popen(full_cmd)
+                    cmd = self._lan_node_cmd(nid, host_name,
+                                             extra_env=remote_env)
+                    agents[nid] = subprocess.Popen(cmd)
 
                 # Global stagger paces ALL nodes (local + remote) from the
                 # orchestrator's clock — interleaved across hosts.
@@ -1073,9 +1104,9 @@ class ScenarioEngine:
             for name, h in remote_hosts.items():
                 for target in ("netcom_zen.ros2_workload", "rmw_zenohd"):
                     subprocess.run(
-                        ["ssh", "-o", "BatchMode=yes", h.ssh,
-                         "docker", "exec", h.container,
-                         "pkill", "-f", target],
+                        _ssh_cmd(h.ssh,
+                                 ["docker", "exec", h.container,
+                                  "pkill", "-f", target]),
                         capture_output=True)   # ignore exit code
 
         # --- 6. Collect remote results via rsync ----------------------------
