@@ -131,8 +131,20 @@ def bridge_run_metrics(run_dir: Path) -> dict:
                 recv_events[nid].append(ev)
 
     node_ids = sorted(start_ts)
-    n = len(node_ids)
-    total_pairs = n * (n - 1)  # ordered (receiver, sender) pairs
+    n_reporting = len(node_ids)  # nodes that actually wrote a JSONL file
+
+    # Load manifest early so n_nodes is available for the mesh denominator.
+    # The same object is reused at the return site to avoid a double read.
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    n_manifest = manifest.get("n_nodes", n_reporting)
+    # Use the manifest's n_nodes (not just the count of reporting files) as
+    # the total_pairs denominator.  A node that never spawned contributes 0
+    # heard-peers to connected_pairs (no one received from it; it received
+    # from no one), so the numerator is already correct.  Before this fix,
+    # missing nodes were silently excluded from the denominator, inflating
+    # mesh_completeness toward 1.0 for runs where spawns failed (observed:
+    # 6 missing JSONL files → mesh reported 1.0 when true value was ~0.87).
+    total_pairs = n_manifest * (n_manifest - 1)  # ordered (receiver, sender) pairs
 
     # discovery_time_s — per node: max first-recv-ts over peers − node's start_ts.
     # Peers with no recv at all are excluded from the max (they never formed a link)
@@ -207,7 +219,7 @@ def bridge_run_metrics(run_dir: Path) -> dict:
             f"{prefix}rss_peak_mb": max(rss_peaks) / 1e6,
         }
 
-    manifest = json.loads((run_dir / "manifest.json").read_text())
+    # manifest already loaded above for the n_nodes denominator; reuse here.
     exit_codes = manifest.get("agent_exit_codes", {})
 
     return {
@@ -219,6 +231,9 @@ def bridge_run_metrics(run_dir: Path) -> dict:
         **_proc_stats(node_rows, ""),
         **_proc_stats(router_rows, "router_"),
         "n_nodes": manifest.get("n_nodes"),
+        # nodes_reporting < n_nodes when some agents never started (the
+        # denominator fix ensures mesh_completeness accounts for the gap).
+        "nodes_reporting": n_reporting,
         "rmw": manifest.get("rmw"),
         # True only when every agent exited 0; None if no exit codes recorded
         "agents_exit_clean": (
