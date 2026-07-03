@@ -19,7 +19,7 @@ from .config import Scenario
 from .ew import Jammer
 from .metrics import PacketLog
 from .mobility import MobilityProvider, make_mobility
-from .netns import NetnsTopology
+from .netns import NetnsTopology, netem_args
 from .propagation import CompositePathloss
 from .terrain import FoliageRegion, Terrain
 
@@ -576,8 +576,14 @@ class ScenarioEngine:
         write-up tell 'RMW degraded' from 'rig saturated' at swarm scale (96
         nodes is the deliberate stress point). Metrics otherwise come from the
         workload JSONL; there is no packets.parquet."""
-        self.topo = NetnsTopology([n.id for n in self.scenario.nodes],
-                                  bridge=True)
+        # netem_args() translates the NetemConfig value object into the token
+        # list that netns.py can apply without importing config.py (keeps the
+        # dependency edge orchestrator→both, not config←netns).
+        self.topo = NetnsTopology(
+            [n.id for n in self.scenario.nodes],
+            bridge=True,
+            netem=(netem_args(**self.scenario.netem.model_dump())
+                   if self.scenario.netem else None))
         self.topo.setup()
         self._routers = {}
         agents: dict[str, subprocess.Popen] = {}
@@ -648,6 +654,9 @@ class ScenarioEngine:
             "peak_host_swap_used_bytes": peak_swap,
             "socket_buffer_bytes": self.scenario.ros2.socket_buffer_bytes,
             "fastdds_allocation_participants": self.scenario.ros2.fastdds_allocation_participants,
+            # netem knobs active in this run; None = ideal link (no qdisc)
+            "netem": (self.scenario.netem.model_dump()
+                      if self.scenario.netem else None),
             "agent_exit_codes": agent_exit,
         }, indent=2))
 

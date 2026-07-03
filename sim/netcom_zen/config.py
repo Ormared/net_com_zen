@@ -188,6 +188,17 @@ class MobilityConfig(BaseModel):
     physics_hz: float = Field(gt=0, default=60.0)  # PhysX frames per sim second
 
 
+class NetemConfig(BaseModel):
+    """Per-link tc netem emulation on the bridge substrate (P5,
+    docs/dds-topology-plan.md). Applied to each node's egress (the veth inside
+    its netns), so a one-way path costs delay_ms once and pair RTT is
+    2*delay_ms. 0 disables that knob."""
+    delay_ms: float = Field(ge=0, default=0.0)
+    jitter_ms: float = Field(ge=0, default=0.0)   # requires delay_ms > 0
+    loss_pct: float = Field(ge=0, le=100, default=0.0)
+    rate_mbit: float = Field(ge=0, default=0.0)   # 0 = unlimited
+
+
 class LanHostConfig(BaseModel):
     """One physical machine participating in a substrate=lan run.
 
@@ -243,6 +254,10 @@ class Scenario(BaseModel):
     agent: AgentConfig = AgentConfig()
     ros2: Ros2WorkloadConfig = Ros2WorkloadConfig()
     satellite: SatelliteConfig = SatelliteConfig()
+    # Per-link tc netem emulation (P5, docs/dds-topology-plan.md). None = no
+    # qdisc, ideal-link baseline. Only valid on substrate=bridge — enforced by
+    # _netem_requires_bridge below.
+    netem: NetemConfig | None = None
 
     @model_validator(mode="after")
     def _unique_ids(self):
@@ -347,6 +362,30 @@ class Scenario(BaseModel):
                         f"node {node.id!r} has host={node.host!r} but "
                         f"substrate={self.substrate!r} only supports "
                         "host='local' (remote spawning requires substrate=lan)")
+        return self
+
+    @model_validator(mode="after")
+    def _netem_requires_bridge(self):
+        """netem lives on the bridge substrate only: channel has its own
+        RF/pathloss model that already controls link quality; lan runs on real
+        NICs where tc is not managed by the orchestrator (no root on remote
+        hosts). Also enforce tc's own constraint: jitter is a perturbation on
+        top of a base delay, so delay_ms must be > 0 when jitter_ms > 0.
+        Putting this cross-field check here (not in NetemConfig) keeps
+        NetemConfig a plain value object and groups all Scenario-level cross-
+        field rules in the same place."""
+        if self.netem is None:
+            return self
+        if self.substrate != "bridge":
+            raise ValueError(
+                f"netem requires substrate='bridge' "
+                f"(channel has its own RF model; lan is real hardware); "
+                f"got substrate={self.substrate!r}")
+        if self.netem.jitter_ms > 0 and self.netem.delay_ms == 0:
+            raise ValueError(
+                "netem.jitter_ms requires netem.delay_ms > 0 "
+                "(tc netem: jitter is a perturbation on top of a base delay; "
+                "setting jitter without delay is a tc error)")
         return self
 
     @property

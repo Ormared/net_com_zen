@@ -12,6 +12,41 @@ def _run(*args: str) -> str:
     return subprocess.run(args, check=True, capture_output=True, text=True).stdout
 
 
+def netem_args(delay_ms: float = 0.0, jitter_ms: float = 0.0,
+               loss_pct: float = 0.0, rate_mbit: float = 0.0) -> list[str]:
+    """Build the tc-netem parameter token list for use after
+    ``tc qdisc add dev <if> root netem``.
+
+    Each knob is only emitted when non-zero, so the list is empty when all
+    knobs are 0 (the no-op / ideal-link case, which skips the qdisc entirely).
+    Decoupled from NetemConfig (receives plain floats, not a model) so that
+    netns.py stays importable without config.py — the orchestrator owns the
+    config-to-tokens translation step, keeping the dependency direction
+    orchestrator→both (config and netns) without a config→netns edge.
+
+    Token layout mirrors the tc-netem(8) synopsis:
+      delay  <delay_ms>ms [<jitter_ms>ms]   -- jitter only when delay_ms > 0
+      loss   <loss_pct>%
+      rate   <rate_mbit>mbit
+
+    When delay_ms==0 the jitter token is silently dropped (tc treats jitter as
+    a perturbation on a base delay; without the delay token it would error).
+    The Scenario validator already rejects jitter_ms>0 with delay_ms==0, so
+    this path is defence in depth, not the primary enforcement point.
+    """
+    tokens: list[str] = []
+    if delay_ms > 0:
+        tokens += ["delay", f"{delay_ms}ms"]
+        if jitter_ms > 0:
+            # jitter token follows the base delay value immediately (no keyword)
+            tokens.append(f"{jitter_ms}ms")
+    if loss_pct > 0:
+        tokens += ["loss", f"{loss_pct}%"]
+    if rate_mbit > 0:
+        tokens += ["rate", f"{rate_mbit}mbit"]
+    return tokens
+
+
 class NetnsTopology:
     """One netns + veth pair per node.
 
@@ -23,7 +58,8 @@ class NetnsTopology:
       ports (snooping off) so each RMW's native discovery (SPDP/scouting)
       reaches every node. No userspace forwarder, no RF model."""
 
-    def __init__(self, node_ids: list[str], bridge: bool = False):
+    def __init__(self, node_ids: list[str], bridge: bool = False,
+                 netem: list[str] | None = None):
         self.run_id = secrets.token_hex(2)
         self.nodes = list(node_ids)
         self.ns_names = {n: f"{PREFIX}-{self.run_id}-{i}" for i, n in enumerate(self.nodes)}
@@ -33,6 +69,10 @@ class NetnsTopology:
         # bridge mode: one shared L2 segment instead of an AF_PACKET relay
         self.bridge = bridge
         self.br_name = f"{PREFIX}{self.run_id}br" if bridge else None
+        # netem token list (from netem_args()); applied per inner-veth in
+        # bridge mode only. None = no qdisc, ideal link (the default for every
+        # run that does not request link degradation).
+        self.netem = netem
 
     def setup(self) -> None:
         sweep_stale()
@@ -67,6 +107,15 @@ class NetnsTopology:
                 _run(*args, "tx", "off", "gso", "off", "tso", "off", "gro", "off")
             info = json.loads(_run("ip", "-n", ns, "-j", "link", "show", inner))
             self.macs[n] = bytes.fromhex(info[0]["address"].replace(":", ""))
+            if self.bridge and self.netem:
+                # tc netem on the inner veth (egress of the node's netns).
+                # Applied per-node so every sender's outbound traffic sees the
+                # emulated delay / jitter / loss / rate knobs (P5). Root qdisc
+                # replaces the kernel default pfifo; one-way per-direction, so
+                # pair RTT ≈ 2 * delay_ms.
+                _run("ip", "netns", "exec", ns,
+                     "tc", "qdisc", "add", "dev", inner,
+                     "root", "netem", *self.netem)
 
     def teardown(self) -> None:
         for ns in self.ns_names.values():
