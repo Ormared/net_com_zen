@@ -81,13 +81,30 @@ Levers tested against it, all negative or near-negative:
   nudge. So it is *not* primarily a simultaneous-startup race either.
 
 The signature (a fixed-size mutually-discovered clique, immovable by discovery
-brokering, time, or QoS) points at a **default resource/allocation limit on
-matched remote participants or readers** in the Fast DDS participant — the
-remaining untested lever is raising those allocation limits explicitly
-(`ResourceLimitsQosPolicy` / participant allocation config). The practical
-takeaway today: **Fast DDS on a flat segment tops out near ~33 mutually-connected
-participants regardless of tuning; to go higher you must reduce the
-participant/endpoint count (aggregate, partition) — not touch QoS.**
+brokering, time, or QoS) pointed at a **default resource/allocation limit on
+matched remote participants or readers** — the last untested config lever.
+
+**Tested 2026-07-03 (`alloc` phase, P1 of `dds-topology-plan.md`): falsified
+too.** Preallocating the participant's `<allocation>` resource limits
+(`total_participants`/`total_readers`/`total_writers`, initial=maximum=A,
+increment=0) plus `maxInitialPeersRange` at A ∈ {64, 128, 256}, N=96, 60 s,
+2 reps each:
+
+| cell | mesh | pairs | discovery |
+|---|---|---|---|
+| stock ×2 | 0.112 | 1022 | 1.1–2.0 s |
+| alloc 64/128/256 ×2 each | 0.112 | 1020–1022 | 12–60 s |
+
+The XML demonstrably took effect — discovery *time* ballooned ~30× (the
+enlarged `maxInitialPeersRange` multiplies initial-announcement unicast
+traffic) — yet the ceiling did not move by a single pair: **1020–1022 pairs
+in all 8 cells**, the same number as every stock run at N=48/96/128/192.
+Every configuration hypothesis is now falsified: QoS, buffers, Discovery
+Server, time, stagger, and allocation limits. The ~33-participant clique cap
+is **architectural** for this workload shape (all-to-all reliable pub/sub over
+multicast SPDP on a flat segment). The practical takeaway stands, now with the
+full plane swept: **to go higher you must change the topology — reduce the
+participant/endpoint count (aggregate, hub, partition) — not the config.**
 
 ## Cyclone DDS — a self-poisoning retransmit storm that staggering defuses
 
@@ -184,10 +201,11 @@ router fan-out, independent of the DDS pair's discovery problems.
 
 ## Practical guidance — reaching high participant counts
 
-1. **Fast DDS:** QoS/buffer/time won't help — it caps near ~33 mutually-connected
-   participants on a flat segment. Reduce participant/endpoint count (aggregation
-   topic, partitions, fewer-larger nodes), or investigate raising the
-   participant/reader allocation resource limits. Within its clique it is the most
+1. **Fast DDS:** no configuration helps — QoS, buffers, Discovery Server,
+   time, stagger, and (2026-07-03) allocation preallocation are ALL falsified;
+   it caps near ~33 mutually-connected participants on a flat segment,
+   architecturally. Reduce participant/endpoint count (aggregation topic,
+   partitions, fewer-larger nodes). Within its clique it is the most
    *predictable* stack (CV 0 %, tight latency).
 2. **Cyclone:** **stagger participant joins** and give it settling time; keep QoS
    minimal (volatile, KEEP_LAST small, reliable is fine); never KEEP_ALL. Raise
