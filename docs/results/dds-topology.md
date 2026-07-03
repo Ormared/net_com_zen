@@ -1,5 +1,13 @@
 # DDS topology study — Part 1: single-host (bridge substrate)
 
+> **⚠ CORRECTION (2026-07-03, hours after writing):** the "SPDP participant
+> cap" conclusion below is wrong — the conserved 1022-pair sum across
+> independent DDS domains (finding #1) was the clue that unmasked the real
+> cause: the kernel neighbor table ([dds-neighbor-table.md](dds-neighbor-table.md)).
+> Still valid: zenoh's star results (94/94 at N=48) and the star/shared
+> harness itself. Fast DDS/Cyclone topology numbers must be re-measured on
+> the fixed rig.
+
 **Date:** 2026-07-03 · **Branch:** `dds-rmw-benchmark` · **Plan:** [dds-topology-plan.md](../dds-topology-plan.md) (P4/P5)
 **Raw:** `results/dds/topo/*` (gitignored). 32 cells: {shared, star} × {fastrtps, cyclonedds, zenoh} × N ∈ {48, 96}, 60 s, reps 2 (fastrtps, CV≈0) / 3 (cyclone, zenoh).
 Part 2 (cross-host archetypes over real Wi-Fi) pending the firewall openings.

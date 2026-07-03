@@ -1,5 +1,14 @@
 # DDS / RMW scaling: Fast DDS vs Cyclone vs Zenoh on a swarm bridge
 
+> **⚠ CORRECTION (2026-07-03) — the scaling collapse described below was a
+> test-rig artifact, not middleware behavior.** The kernel ARP neighbor table
+> (`gc_thresh3` = 1024, accounted across ALL netns) silently capped connected
+> pairs at ~1022; N(N−1) crosses that exactly between N=24 (healthy) and N=48
+> (the "knee"). With the table sized correctly, Fast DDS reaches mesh 0.99
+> and Cyclone 1.00 at N=96. The methodology and rig sections remain valid;
+> the per-RMW curves and comparative conclusions do not. See
+> [dds-neighbor-table.md](dds-neighbor-table.md).
+
 Motivation: every prior result here is a *resilience-under-jamming* study on the
 AF_PACKET channel substrate. This one is different — a pure **middleware
 performance** study with **no EW vector**. The question is purely: how do the

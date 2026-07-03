@@ -1,5 +1,16 @@
 # The QoS plane: how Fast DDS, Cyclone & Zenoh actually scale to many participants
 
+> **⚠ CORRECTION (2026-07-03):** the "three walls" this study characterizes
+> were one wall, and it wasn't in the middleware: the kernel ARP neighbor
+> table (`gc_thresh3`=1024, accounted across netns) capped connected pairs at
+> ~1022 host-wide — which is why the Fast DDS "clique cap" survived every
+> lever tested here (that invariance was the tell). With the table sized,
+> Fast DDS hits mesh 0.99 and Cyclone 1.00 at N=96; Zenoh's variance was
+> partly the same artifact sheltering its router mesh from its real overload.
+> The enduring contributions of this doc are methodological: replicate
+> everything, distrust single runs, and distrust invariant round numbers.
+> See [dds-neighbor-table.md](dds-neighbor-table.md).
+
 Third in the DDS/RMW series, and the one that gets to the bottom of it.
 [`dds-rmw-scaling.md`](dds-rmw-scaling.md) found the *what* (a knee at N=48, no
 mesh at N=96). [`dds-rmw-tuning.md`](dds-rmw-tuning.md) found that the obvious fix

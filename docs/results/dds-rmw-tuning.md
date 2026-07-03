@@ -1,5 +1,11 @@
 # Why each RMW collapses, and what we can tune to fix it
 
+> **⚠ CORRECTION (2026-07-03):** the collapse this document diagnoses was the
+> kernel neighbor-table artifact (`gc_thresh3`=1024 across netns), not the
+> RMWs — see [dds-neighbor-table.md](dds-neighbor-table.md). The Discovery
+> Server analysis (§8: a metadata broker can't fix a data-plane problem)
+> remains conceptually sound; every quantitative claim at N≥48 is void.
+
 Companion to [`dds-rmw-scaling.md`](dds-rmw-scaling.md). That document established
 *what* happens: all three RMWs are healthy through N = 24, hit a sharp knee at
 N = 48, and form no usable mesh at N = 96 within a 30 s window — while the host
