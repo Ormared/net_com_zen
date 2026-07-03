@@ -1,6 +1,9 @@
 # DDS Deployment Archetypes & Multi-Host Plan
 
-**Status:** scoped 2026-07-03. Follows the QoS-plane study
+**Status:** scoped 2026-07-03; **P1–P4 complete 2026-07-04** — results in
+[results/dds-lan.md](results/dds-lan.md) (P3), [results/dds-star.md](results/dds-star.md)
+(P4), and the final [recommendation table](results/dds-recommendations.md).
+P5's netem/topology re-measures remain optional. Follows the QoS-plane study
 ([results/dds-rmw-qos-plane.md](results/dds-rmw-qos-plane.md)).
 **Branch:** `dds-rmw-benchmark` (continues).
 **Execution model:** architect (Claude, this doc + reviews) + implementer
