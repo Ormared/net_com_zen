@@ -163,6 +163,18 @@ class Ros2WorkloadConfig(BaseModel):
     # need for runtime reallocation during discovery bursts. Fast DDS ONLY:
     # cyclonedds and zenoh have no equivalent attribute.
     fastdds_allocation_participants: int = Field(ge=0, default=0)
+    # Endpoint topology (docs/dds-topology-plan.md P4/D4). mesh = current
+    # all-to-all (O(N²) SEDP endpoint matrix, the proven scaling wall at N≥48);
+    # shared = one aggregation topic /swarm/telemetry that collapses the SEDP
+    # matrix to O(N); star = one hub node + N-1 spokes with 2(N-1) directed
+    # links, also O(N).  Validated against hub_id at the Scenario level below.
+    topology: Literal["mesh", "shared", "star"] = "mesh"
+    # Hub node id for topology=star.  The hub subscribes to /swarm/telemetry
+    # (spoke→hub direction) and publishes /swarm/command (hub→spoke direction).
+    # Must equal one of the Scenario node ids when topology='star'; must be
+    # empty for topology='mesh'/'shared' (a stray hub_id silently means nothing
+    # and almost certainly indicates a misconfigured scenario).
+    hub_id: str = ""
 
     @model_validator(mode="after")
     def _discovery_server_is_fastrtps_only(self):
@@ -386,6 +398,35 @@ class Scenario(BaseModel):
                 "netem.jitter_ms requires netem.delay_ms > 0 "
                 "(tc netem: jitter is a perturbation on top of a base delay; "
                 "setting jitter without delay is a tc error)")
+        return self
+
+    @model_validator(mode="after")
+    def _topology_hub_id_valid(self):
+        """For topology=star, hub_id must name a real scenario node (the hub
+        subscribes to /swarm/telemetry and fans out on /swarm/command).  For
+        any other topology, hub_id must be empty — a non-empty hub_id when
+        topology≠star is almost certainly a misconfigured scenario and would
+        silently mean nothing at runtime.  Skipped for workload!='ros2'
+        (hub_id is a ros2-workload concept with no meaning in the agent track).
+        """
+        if self.workload != "ros2":
+            return self
+        topo = self.ros2.topology
+        hub = self.ros2.hub_id
+        ids = {n.id for n in self.nodes}
+        if topo == "star":
+            if not hub:
+                raise ValueError(
+                    "ros2.topology='star' requires ros2.hub_id (the hub node id); "
+                    "set hub_id to one of the scenario node ids")
+            if hub not in ids:
+                raise ValueError(
+                    f"ros2.hub_id={hub!r} is not a scenario node id "
+                    f"(valid ids: {sorted(ids)})")
+        elif hub:
+            raise ValueError(
+                f"ros2.hub_id={hub!r} requires ros2.topology='star' "
+                f"(got topology={topo!r}); clear hub_id or set topology='star'")
         return self
 
     @property

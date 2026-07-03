@@ -68,14 +68,57 @@ class TelemetryNode(Node):
         self.metrics = open(args.metrics, "a", buffering=1)
         qos = build_qos(args)
         self._manual_liveliness = args.liveliness == "manual_by_topic"
-        self.pub = self.create_publisher(
-            String, f"/swarm/{args.id}/telemetry", qos)
-        for peer in args.peers.split(","):
+
+        # ---- topology-dependent pub / sub wiring (docs/dds-topology-plan.md P4/D4) ----
+        # mesh (unchanged, default): O(N²) endpoint matrix — each node keeps one
+        # per-id publisher and N-1 per-peer subscriptions (the proven scaling wall
+        # at N≥48 in the DDS benchmark).
+        # shared: one aggregation topic (/swarm/telemetry) collapses SEDP to O(N)
+        # endpoints; self-drop in _on_msg prevents logging own delivery as recv.
+        # star: O(N) directed links — spokes publish up on /swarm/telemetry, the
+        # hub fans commands back down on /swarm/command (2(N-1) endpoint pairs).
+        topo = args.topology
+        if topo == "mesh":
+            # Fail loudly on an empty peer list — an empty string looks like a
+            # valid value but means the node would run with zero subscriptions,
+            # which is indistinguishable from successful discovery to the user.
+            if not args.peers:
+                raise ValueError(
+                    "--topology mesh requires --peers (non-empty comma-separated "
+                    "peer ids); shared/star topologies leave --peers unused")
+            self.pub = self.create_publisher(
+                String, f"/swarm/{args.id}/telemetry", qos)
+            for peer in args.peers.split(","):
+                self.create_subscription(
+                    String, f"/swarm/{peer}/telemetry", self._on_msg, qos)
+        elif topo == "shared":
+            # One shared topic per swarm: every node publishes and subscribes to
+            # the same /swarm/telemetry topic.  ROS 2 delivers a node's own
+            # publications to its own subscription; _on_msg drops them before the
+            # recv log line so self-messages never appear in analytics.
+            self.pub = self.create_publisher(String, "/swarm/telemetry", qos)
             self.create_subscription(
-                String, f"/swarm/{peer}/telemetry", self._on_msg, qos)
+                String, "/swarm/telemetry", self._on_msg, qos)
+        elif topo == "star":
+            if args.role == "spoke":
+                # Spoke: publishes telemetry up to the hub; listens for hub
+                # command fan-out (the return path of the star).
+                self.pub = self.create_publisher(
+                    String, "/swarm/telemetry", qos)
+                self.create_subscription(
+                    String, "/swarm/command", self._on_msg, qos)
+            else:  # hub
+                # Hub: collects telemetry from all spokes; its _tick publishes
+                # command messages back down on /swarm/command.
+                self.pub = self.create_publisher(
+                    String, "/swarm/command", qos)
+                self.create_subscription(
+                    String, "/swarm/telemetry", self._on_msg, qos)
+
         self.create_timer(args.period_ms / 1e3, self._tick)
-        # record the effective QoS so each run's metrics are self-describing
+        # record the effective QoS + topology so each run's metrics are self-describing
         self._log({"type": "start", "id": args.id, "ts_us": now_us(),
+                   "topology": args.topology, "role": args.role,
                    "qos": {"reliability": args.reliability,
                            "durability": args.durability,
                            "history": args.history, "depth": args.depth,
@@ -103,6 +146,13 @@ class TelemetryNode(Node):
     def _on_msg(self, msg: String) -> None:
         recv_us = now_us()
         peer, seq, ts_us = unpack(msg.data)
+        # shared topic: ROS 2 delivers a node's own publications to its own
+        # matching subscription (unlike per-peer mesh topics where you never
+        # subscribe to your own topic).  Drop before logging — a self-message
+        # is not a connected pair and must not inflate recv counts or appear
+        # in latency distributions.
+        if self.args.topology == "shared" and peer == self.args.id:
+            return
         self._log({"type": "recv", "id": self.args.id, "from": peer,
                    "kind": "snap", "peer_seq": seq, "peer_ts_us": ts_us,
                    "ts_us": recv_us, "bytes": len(msg.data)})
@@ -111,7 +161,14 @@ class TelemetryNode(Node):
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--id", required=True)
-    ap.add_argument("--peers", required=True, help="comma-separated peer ids")
+    ap.add_argument("--peers", required=False, default="",
+                    help="comma-separated peer ids (mesh only; unused for shared/star)")
+    ap.add_argument("--topology", choices=["mesh", "shared", "star"], default="mesh",
+                    help="endpoint topology: mesh=O(N²) all-to-all (default); "
+                         "shared=one aggregation topic O(N); star=hub+spokes O(N)")
+    ap.add_argument("--role", choices=["spoke", "hub"], default="spoke",
+                    help="star role: spoke publishes telemetry up, hub fans commands "
+                         "down (ignored for mesh/shared)")
     ap.add_argument("--period-ms", type=int, default=500)
     ap.add_argument("--payload-bytes", type=int, default=255)
     ap.add_argument("--reliability", choices=["reliable", "best_effort"],

@@ -284,10 +284,18 @@ class ScenarioEngine:
 
     def _workload_cmd(self, nid: str) -> list[str]:
         cfg = self.scenario.ros2
+        # For shared/star topologies --peers is unused (O(N) endpoint wiring
+        # has no per-peer subscriptions); pass empty string so node.py fails
+        # loudly if it accidentally enters mesh mode with an empty peer list.
+        peers = (",".join(p for p in self.topo.nodes if p != nid)
+                 if cfg.topology == "mesh" else "")
+        role = "hub" if nid == cfg.hub_id else "spoke"
         return ["ip", "netns", "exec", self.topo.ns_names[nid],
                 sys.executable, "-m", "netcom_zen.ros2_workload",
                 "--id", nid,
-                "--peers", ",".join(p for p in self.topo.nodes if p != nid),
+                "--peers", peers,
+                "--topology", cfg.topology,
+                "--role", role,
                 "--period-ms", str(cfg.period_ms),
                 "--payload-bytes", str(cfg.payload_bytes),
                 "--reliability", cfg.reliability,
@@ -648,6 +656,9 @@ class ScenarioEngine:
             "substrate": "bridge",
             "rmw": self.scenario.ros2.rmw,
             "n_nodes": len(self.scenario.nodes),
+            # topology determines the pair-count denominator for report.py:
+            # mesh N(N-1); star 2(N-1); shared N(N-1) logical but O(N) SEDP endpoints
+            "topology": self.scenario.ros2.topology,
             "resource_samples": len(samples),
             "peak_host_mem_used_bytes": peak_mem,
             "min_host_mem_avail_bytes": min_avail,
@@ -787,7 +798,12 @@ class ScenarioEngine:
         cfg = self.scenario.ros2
         h = self.scenario.hosts[host_name]
         all_ids = [n.id for n in self.scenario.nodes]
-        peers = ",".join(p for p in all_ids if p != nid)
+        # For shared/star topologies --peers is unused (O(N) endpoint wiring
+        # has no per-peer subscriptions); pass empty string so node.py fails
+        # loudly if it accidentally enters mesh mode with an empty peer list.
+        peers = (",".join(p for p in all_ids if p != nid)
+                 if cfg.topology == "mesh" else "")
+        role = "hub" if nid == cfg.hub_id else "spoke"
 
         # Workload arguments are identical across local and remote; only the
         # interpreter prefix, --metrics path, and env-injection method differ.
@@ -795,6 +811,8 @@ class ScenarioEngine:
             "-m", "netcom_zen.ros2_workload",
             "--id", nid,
             "--peers", peers,
+            "--topology", cfg.topology,
+            "--role", role,
             "--period-ms", str(cfg.period_ms),
             "--payload-bytes", str(cfg.payload_bytes),
             "--reliability", cfg.reliability,
@@ -1144,6 +1162,9 @@ class ScenarioEngine:
             "substrate": "lan",
             "rmw": rmw,
             "n_nodes": len(all_nodes),
+            # topology determines the pair-count denominator for report.py:
+            # mesh N(N-1); star 2(N-1); shared N(N-1) logical but O(N) SEDP endpoints
+            "topology": cfg.topology,
             "resource_samples": len(samples),
             "peak_host_mem_used_bytes": peak_mem,
             "min_host_mem_avail_bytes": min_avail,
