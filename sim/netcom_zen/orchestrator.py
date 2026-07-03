@@ -32,6 +32,11 @@ from .terrain import FoliageRegion, Terrain
 # binary isn't on the NOPASSWD list. These are global (not netns-scoped).
 _KERNEL_BUF_SYSCTLS = ("rmem_max", "wmem_max", "rmem_default", "wmem_default")
 
+# ARP neighbor-table GC ceilings raised for bridge swarms large enough to
+# exhaust the host-wide default (128/512/1024). See _apply_neigh_thresholds
+# for the root-cause discovery note (2026-07-03).
+_NEIGH_BASE = "/proc/sys/net/ipv4/neigh/default"
+
 
 def _cluster_of(idx: int, n: int, k: int) -> int:
     """Contiguous-block cluster index for a node at position idx (0-based, in
@@ -642,6 +647,21 @@ class ScenarioEngine:
             bridge=True,
             netem=(netem_args(**self.scenario.netem.model_dump())
                    if self.scenario.netem else None))
+        # Size the ARP neighbor table BEFORE netns are created: namespaces
+        # inherit the host's gc_thresh limits at creation time, so the raise
+        # must precede topo.setup().  No-op when the current ceiling already
+        # covers n*(n-1)*2 entries (never lowers an already-higher host).
+        n_nodes = len(self.scenario.nodes)
+        neigh_orig = self._apply_neigh_thresholds(n_nodes)
+        # Capture the live kernel value right after the optional raise for the
+        # manifest; records the true ceiling even when the write was a no-op
+        # (host limit already sufficient) or blocked by PermissionError (CI).
+        try:
+            neigh_gc3_eff = int(
+                Path(f"{_NEIGH_BASE}/gc_thresh3").read_text().strip())
+        except OSError:
+            # /proc unreadable (unusual sandbox): fall back to desired value.
+            neigh_gc3_eff = self._neigh_thresholds_for(n_nodes)["gc_thresh3"]
         self.topo.setup()
         self._routers = {}
         agents: dict[str, subprocess.Popen] = {}
@@ -694,6 +714,7 @@ class ScenarioEngine:
                     p.kill()
             self.topo.teardown()
             self._restore_kernel_buffers(kbuf_orig)
+            self._restore_neigh_thresholds(neigh_orig)
         self._write_resources(samples)
         # peak host pressure = the "was the rig saturated?" evidence
         peak_mem = max((s["host_mem_used"] for s in samples), default=0)
@@ -718,6 +739,10 @@ class ScenarioEngine:
             # netem knobs active in this run; None = ideal link (no qdisc)
             "netem": (self.scenario.netem.model_dump()
                       if self.scenario.netem else None),
+            # effective ARP neighbor-table ceiling after _apply_neigh_thresholds;
+            # the root-cause artifact (swarm pairs silently capped at ~1022 when
+            # N>=48) is absent when this value >= n*(n-1)*2.
+            "neigh_gc_thresh3": neigh_gc3_eff,
             # cluster_of is non-empty only when cluster_domains>0, so existing
             # report.py scripts reading v0 manifests see an empty dict and are
             # unaffected; new scripts can split intra- vs cross-cluster pairs.
@@ -757,6 +782,80 @@ class ScenarioEngine:
 
     @staticmethod
     def _restore_kernel_buffers(orig: dict[str, str]) -> None:
+        for path, val in orig.items():
+            try:
+                Path(path).write_text(val)
+            except (PermissionError, OSError):
+                pass
+
+    @staticmethod
+    def _neigh_thresholds_for(n_nodes: int) -> dict[str, int]:
+        """Pure computation: desired gc_thresh{1,2,3} for an n_nodes bridge
+        swarm, returned as {filename: value}.
+
+        needed = n*(n-1)*2 — the 2× factor gives slack for transient duplicate
+        ARP entries produced by background discovery/router processes during
+        the initial multicast burst.  gc_thresh2 = needed//2 (soft GC trigger),
+        gc_thresh1 = needed//4 (free-slot floor below which GC always runs).
+
+        LAN substrate is exempt: each physical host's neighbor table only holds
+        its own N-1 peers; the cross-namespace accumulation artifact that fills
+        the global table cannot arise there, so _run_lan does not call this."""
+        needed = n_nodes * (n_nodes - 1) * 2
+        return {
+            "gc_thresh3": needed,
+            "gc_thresh2": needed // 2,
+            "gc_thresh1": needed // 4,
+        }
+
+    @staticmethod
+    def _apply_neigh_thresholds(n_nodes: int) -> dict[str, str]:
+        """Raise net.ipv4.neigh.default.gc_thresh{1,2,3} so the ARP table can
+        hold all N*(N-1)*2 bridge-swarm entries without silent eviction.
+
+        ROOT CAUSE (2026-07-03): the Linux ARP neighbor table's GC limits
+        (defaults 128/512/1024) are accounted across ALL network namespaces.
+        A bridge-substrate run with N nodes needs ~N*(N-1) entries host-wide
+        (every node resolves every peer); at N>=48 the 1024 ceiling binds and
+        silently caps connected pairs at ~1022 — this artifact masqueraded as
+        "the Fast DDS ~33-participant clique cap" and "Cyclone's retransmit
+        storm" through the entire benchmark track.  Empirical proof: raising to
+        16384 took fastrtps N=96 from mesh 0.112 → 0.9945 and cyclonedds from
+        0.057 → 1.000 (delivery 0.965).  This fix makes the rig correct BY
+        DEFAULT for every bridge run.
+
+        Modeled on _apply_kernel_buffers: no-op (returns {}) if the current
+        gc_thresh3 already covers the swarm — never lower an already-higher
+        host.  Root writes /proc/sys directly (sysctl not on NOPASSWD list).
+        Returns original values keyed by /proc path for restore.
+
+        Note: _run_lan does NOT call this.  On real NICs each host resolves
+        only N-1 peers (its own broadcast domain); the cross-namespace global
+        accumulation cannot occur there."""
+        desired = ScenarioEngine._neigh_thresholds_for(n_nodes)
+        thresh3_path = f"{_NEIGH_BASE}/gc_thresh3"
+        orig: dict[str, str] = {}
+        try:
+            current3 = int(Path(thresh3_path).read_text().strip())
+            if desired["gc_thresh3"] <= current3:
+                return {}  # current ceiling sufficient; never lower
+            # Save originals then raise all three in ascending order so the
+            # kernel invariant thresh1 <= thresh2 <= thresh3 is never violated
+            # even momentarily (thresh3 last → always the new maximum).
+            for key in ("gc_thresh1", "gc_thresh2", "gc_thresh3"):
+                path = f"{_NEIGH_BASE}/{key}"
+                orig[path] = Path(path).read_text().strip()
+            for key in ("gc_thresh1", "gc_thresh2", "gc_thresh3"):
+                Path(f"{_NEIGH_BASE}/{key}").write_text(str(desired[key]))
+        except (PermissionError, OSError):
+            # not root / locked-down: leave whatever we managed to set, restore
+            # only those.  The neigh eviction will surface at swarm scale if
+            # it matters (same pattern as _apply_kernel_buffers).
+            pass
+        return orig
+
+    @staticmethod
+    def _restore_neigh_thresholds(orig: dict[str, str]) -> None:
         for path, val in orig.items():
             try:
                 Path(path).write_text(val)

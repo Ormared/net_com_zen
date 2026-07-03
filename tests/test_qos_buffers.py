@@ -107,3 +107,26 @@ def test_allocation_field_is_fastrtps_only():
     # zenoh at 0 (default) must be fine — the validator only fires when >0
     c0 = Ros2WorkloadConfig(rmw="zenoh")
     assert c0.fastdds_allocation_participants == 0
+
+
+def test_neigh_threshold_noop_for_small_swarm():
+    # 4*3*2=24 entries << default gc_thresh3 of 1024; _apply_neigh_thresholds
+    # reads the current value, sees it is already sufficient, and returns {}
+    # without writing /proc.  In CI (non-root) the same path is taken for any
+    # n where n*(n-1)*2 <= current_gc_thresh3 — no root needed for the no-op.
+    assert ScenarioEngine._apply_neigh_thresholds(4) == {}
+    # restore with an empty dict must be a silent no-op (matching the contract
+    # of _restore_kernel_buffers for callers that never raised anything).
+    ScenarioEngine._restore_neigh_thresholds({})  # must not raise
+
+
+def test_neigh_threshold_pure_math():
+    # _neigh_thresholds_for is a pure helper (no /proc I/O) so it runs in CI
+    # without root.  n=96: needed = 96*95*2 = 18240.
+    wanted = ScenarioEngine._neigh_thresholds_for(96)
+    assert wanted["gc_thresh3"] == 18240          # hard ceiling
+    assert wanted["gc_thresh2"] == 9120           # 18240//2: soft GC trigger
+    assert wanted["gc_thresh1"] == 4560           # 18240//4: free-slot floor
+    # Invariant: the three thresholds must be in strictly ascending order so
+    # the kernel never sees a violation during the write sequence.
+    assert wanted["gc_thresh1"] < wanted["gc_thresh2"] < wanted["gc_thresh3"]
