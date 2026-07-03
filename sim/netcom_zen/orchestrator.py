@@ -32,16 +32,29 @@ from .terrain import FoliageRegion, Terrain
 _KERNEL_BUF_SYSCTLS = ("rmem_max", "wmem_max", "rmem_default", "wmem_default")
 
 
-def _cyclonedds_xml(socket_buffer_bytes: int = 0) -> str:
-    """Cyclone DDS config for the bridge substrate: SHM/Iceoryx off (force real
-    UDP over the veth, no same-host shortcut) and multicast on so native
-    discovery floods across the bridge. autodetermine picks the single non-lo
-    veth in each netns. Domain id="any" applies under any ROS_DOMAIN_ID.
+def _cyclonedds_xml(socket_buffer_bytes: int = 0, iface_name: str = "") -> str:
+    """Cyclone DDS config for the bridge or lan substrate: SHM/Iceoryx off
+    (force real UDP, no same-host shortcut) and multicast on so native
+    discovery floods across the bridge. Domain id="any" applies under any
+    ROS_DOMAIN_ID.
 
     socket_buffer_bytes>0 adds Internal/SocketReceiveBufferSize (the buffer
-    lever); the host rmem_max must already be >= it or Cyclone fails to start."""
+    lever); the host rmem_max must already be >= it or Cyclone fails to start.
+
+    iface_name (lan substrate): when set, replaces autodetermine=true with an
+    explicit NIC name.  Mandatory on hosts with noise interfaces (zerotier,
+    tailscale, docker bridges) because Cyclone announces locators on every
+    interface it discovers; an unreachable locator causes silent discovery
+    failure at swarm scale.  When empty, autodetermine picks the single non-lo
+    interface in each netns (bridge substrate behaviour, unchanged)."""
     buf = (f'    <Internal><SocketReceiveBufferSize min="{socket_buffer_bytes} B"/>'
            f'</Internal>\n' if socket_buffer_bytes > 0 else "")
+    # Interface element: explicit NIC name when pinning is requested, otherwise
+    # autodetermine (safe in netns where the only non-lo interface is the veth).
+    if iface_name:
+        iface_elem = f'        <NetworkInterface name="{iface_name}" multicast="true"/>\n'
+    else:
+        iface_elem = '        <NetworkInterface autodetermine="true" multicast="true"/>\n'
     return ('<?xml version="1.0" encoding="UTF-8" ?>\n'
             '<CycloneDDS xmlns="https://cdds.io/config"\n'
             '    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"\n'
@@ -51,7 +64,7 @@ def _cyclonedds_xml(socket_buffer_bytes: int = 0) -> str:
             '  <Domain id="any">\n'
             '    <General>\n'
             '      <Interfaces>\n'
-            '        <NetworkInterface autodetermine="true" multicast="true"/>\n'
+            f'{iface_elem}'
             '      </Interfaces>\n'
             '      <AllowMulticast>true</AllowMulticast>\n'
             '    </General>\n'
@@ -64,7 +77,8 @@ def _cyclonedds_xml(socket_buffer_bytes: int = 0) -> str:
 
 
 def _fastdds_profiles_xml(socket_buffer_bytes: int = 0,
-                          allocation_participants: int = 0) -> str:
+                          allocation_participants: int = 0,
+                          whitelist_addr: str = "") -> str:
     """Fast DDS XML profiles defining a single UDPv4 transport, set as the
     default participant profile. useBuiltinTransports false means ONLY this
     transport is active — which also keeps SHM off (same isolation as the
@@ -82,14 +96,26 @@ def _fastdds_profiles_xml(socket_buffer_bytes: int = 0,
     <maxInitialPeersRange>A inside the transport_descriptor. This is the P1 lever
     for the ~33-participant Fast DDS clique cap (docs/dds-topology-plan.md).
 
+    whitelist_addr (lan substrate): when set, emit <interfaceWhiteList> pinning
+    Fast DDS to one NIC IP.  Mandatory on hosts with noise interfaces (zerotier,
+    tailscale, docker bridges) because Fast DDS announces locators on every
+    interface it binds to; an unreachable locator causes silent discovery failure.
+
     XSD element order matters to Fast DDS 8.x: within <rtps>, the sequence must
     be <userTransports>, <useBuiltinTransports>, <allocation>; within
-    <transport_descriptor>, buffer sizes precede <maxInitialPeersRange>."""
-    # transport descriptor: buffer sizes (optional) then peer range (optional)
+    <transport_descriptor>, buffer sizes precede <interfaceWhiteList> which
+    precedes <maxInitialPeersRange>."""
+    # transport descriptor: buffer sizes (optional) then whitelist (optional)
+    # then peer range (optional) — XSD order is send/receive, whitelist, peers.
     buf_elems = (
         f'        <receiveBufferSize>{socket_buffer_bytes}</receiveBufferSize>\n'
         f'        <sendBufferSize>{socket_buffer_bytes}</sendBufferSize>\n'
         if socket_buffer_bytes > 0 else '')
+    whitelist_elem = (
+        f'        <interfaceWhiteList>'
+        f'<address>{whitelist_addr}</address>'
+        f'</interfaceWhiteList>\n'
+        if whitelist_addr else '')
     peers_elem = (
         f'        <maxInitialPeersRange>{allocation_participants}'
         f'</maxInitialPeersRange>\n'
@@ -127,6 +153,7 @@ def _fastdds_profiles_xml(socket_buffer_bytes: int = 0,
             '        <transport_id>udp_big</transport_id>\n'
             '        <type>UDPv4</type>\n'
             f'{buf_elems}'
+            f'{whitelist_elem}'
             f'{peers_elem}'
             '      </transport_descriptor>\n'
             '    </transport_descriptors>\n'
@@ -413,6 +440,8 @@ class ScenarioEngine:
         self.out_dir.mkdir(parents=True, exist_ok=True)
         if self.scenario.substrate == "bridge":
             await self._run_bridge()
+        elif self.scenario.substrate == "lan":
+            await self._run_lan()
         else:
             await self._run_channel()
 
@@ -673,3 +702,423 @@ class ScenarioEngine:
                 cols["host_mem_avail"].append(s["host_mem_avail"])
                 cols["host_swap_used"].append(s["host_swap_used"])
         pq.write_table(pa.table(cols), self.out_dir / "resources.parquet")
+
+    # ------------------------------------------------------------------
+    # LAN substrate helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _ping_rtt(addr: str) -> float | None:
+        """Probe one-way RTT to addr using `ping -c 3 -q`; returns the average
+        ms from the summary line or None on any failure (host unreachable,
+        tool not installed, etc.).  Informational only — written to the manifest
+        so the report can flag runs where Wi-Fi was particularly jittery."""
+        try:
+            out = subprocess.run(
+                ["ping", "-c", "3", "-q", addr],
+                capture_output=True, text=True, timeout=15)
+            # Linux ping summary: "rtt min/avg/max/mdev = 0.1/0.2/0.3/0.05 ms"
+            for line in out.stdout.splitlines():
+                if "rtt" in line and "/" in line:
+                    # split on "=" then on "/" to reach the avg field (index 1)
+                    return float(line.split("=")[1].strip().split("/")[1])
+        except Exception:
+            pass
+        return None
+
+    def _lan_node_cmd(self, nid: str, host_name: str) -> list[str]:
+        """Pure command-list builder for a single workload node in a lan run.
+
+        Returns the argv for `subprocess.Popen` WITHOUT environment variables —
+        those are injected by the caller (_run_lan) either via Popen's env=
+        keyword (local) or as `docker exec -e KEY=VAL` flags (remote).
+
+        Local host (ssh=""): python -m netcom_zen.ros2_workload <args>
+        Remote host: ssh -o BatchMode=yes <target> docker exec <container>
+                     .pixi/envs/ros2/bin/python -m netcom_zen.ros2_workload <args>
+
+        Remote nodes write their metrics inside the container at
+        <workdir>/results/lan/<run_name>/agent_<nid>.jsonl; the bind mount
+        (~/net_com_zen:/work) makes this visible to rsync via the HOST path.
+        Local nodes write to out_dir as in the bridge and channel paths.
+
+        Unit-testable: no subprocess is started, no filesystem access, no
+        network I/O — just string manipulation of self.scenario and self.out_dir.
+        """
+        cfg = self.scenario.ros2
+        h = self.scenario.hosts[host_name]
+        all_ids = [n.id for n in self.scenario.nodes]
+        peers = ",".join(p for p in all_ids if p != nid)
+
+        # Workload arguments are identical across local and remote; only the
+        # interpreter prefix and --metrics path differ.
+        workload_args = [
+            "-m", "netcom_zen.ros2_workload",
+            "--id", nid,
+            "--peers", peers,
+            "--period-ms", str(cfg.period_ms),
+            "--payload-bytes", str(cfg.payload_bytes),
+            "--reliability", cfg.reliability,
+            "--durability", cfg.durability,
+            "--history", cfg.history,
+            "--depth", str(cfg.depth),
+            "--deadline-ms", str(cfg.deadline_ms),
+            "--lifespan-ms", str(cfg.lifespan_ms),
+            "--liveliness", cfg.liveliness,
+            "--liveliness-lease-ms", str(cfg.liveliness_lease_ms),
+            "--duration-s", str(self.scenario.duration_s),
+        ]
+
+        if h.ssh == "":
+            # Local: use the same interpreter that is running the orchestrator.
+            # env= is set by the caller, not embedded in the argv.
+            metrics = str(self.out_dir / f"agent_{nid}.jsonl")
+            return [sys.executable, *workload_args, "--metrics", metrics]
+
+        # Remote: argv passes through ssh → docker exec → container python.
+        # docker exec -e flags (added by the caller after "exec") carry the RMW
+        # env.  The container python is the ros2 pixi env interpreter; its path
+        # is fixed regardless of the container entrypoint.
+        run_name = self.out_dir.name
+        remote_metrics = (f"{h.workdir}/results/lan/{run_name}/agent_{nid}.jsonl")
+        return [
+            "ssh", "-o", "BatchMode=yes", h.ssh,
+            "docker", "exec",
+            h.container,
+            ".pixi/envs/ros2/bin/python",
+            *workload_args,
+            "--metrics", remote_metrics,
+        ]
+
+    async def _run_lan(self) -> None:
+        """Real-NIC multi-host substrate (substrate=lan).
+
+        No netns, no veth, no kernel bridge, no root required.  Local nodes are
+        plain subprocesses on this machine's real NIC; remote nodes run inside
+        the long-lived dds-lab container over SSH.
+
+        Structure mirrors _run_bridge: same deadline-paced sampling loop, same
+        manifest keys, same _write_resources call.  Key differences:
+          - No NetnsTopology, no _apply_kernel_buffers.
+          - psutil meters LOCAL processes only (ssh Popen objects don't expose
+            the remote PID tree).
+          - Interface pinning is mandatory: every XML config includes either an
+            explicit NIC name (Cyclone) or an interfaceWhiteList IP (Fast DDS)
+            to avoid DDS announcing locators on noise interfaces.
+          - zenoh uses ONE router per HOST (host-level lower-index TCP mesh),
+            not one per node — cross-host router wiring happens at this level.
+          - Remote results are rsync'd back after the run.
+        """
+        cfg = self.scenario.ros2
+        rmw = cfg.rmw
+        hosts = self.scenario.hosts          # dict[str, LanHostConfig]
+        all_nodes = self.scenario.nodes
+        node_ids = [n.id for n in all_nodes]
+        host_of: dict[str, str] = {n.id: n.host for n in all_nodes}
+
+        out_dir = self.out_dir
+        out_dir.mkdir(parents=True, exist_ok=True)
+        log_dir = out_dir / "ros_logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        # out_dir.name is the run identifier used in remote metrics paths and rsync.
+        run_name = out_dir.name
+
+        remote_hosts = {name: h for name, h in hosts.items() if h.ssh}
+
+        self._routers: dict[str, subprocess.Popen] = {}
+        agents: dict[str, subprocess.Popen] = {}
+        agent_exit: dict[str, int | None] = {}
+        samples: list[dict] = []
+        sample_dt = 1.0  # resource sampling cadence (s) — same as bridge
+
+        # Probe RTTs before spawning so any latency is captured before the run
+        # perturbs the link.  Wi-Fi RTTs are informational only (cross-host
+        # clocks are not synced; per-node latency is meaningless cross-host).
+        rtt_ms: dict[str, float | None] = {}
+        for name, h in remote_hosts.items():
+            rtt_ms[name] = self._ping_rtt(h.addr)
+
+        # Container path for the ros2 pixi env (fixed by the deploy script).
+        remote_ament = "/work/.pixi/envs/ros2"
+        # RMW impl string used for AMENT_PREFIX_PATH derivation on local nodes
+        # and RMW_IMPLEMENTATION env var for remote nodes.
+        rmw_impl = {
+            "zenoh": "rmw_zenoh_cpp",
+            "fastrtps": "rmw_fastrtps_cpp",
+            "cyclonedds": "rmw_cyclonedds_cpp",
+        }[rmw]
+        local_base = self._ros2_base_env(rmw_impl, log_dir)
+
+        # xml_env[host_name] = {ENV_KEY: "value"} that activates the per-host
+        # pinned config on both local (Popen env=) and remote (docker exec -e).
+        xml_env: dict[str, dict] = {}
+
+        try:
+            # --- 1. Create remote result directories -------------------------
+            # Must exist before any node tries to write its metrics JSONL.
+            for name, h in remote_hosts.items():
+                remote_res = f"{h.workdir}/results/lan/{run_name}"
+                subprocess.run(
+                    ["ssh", "-o", "BatchMode=yes", h.ssh,
+                     "docker", "exec", h.container,
+                     "mkdir", "-p", remote_res],
+                    check=True)
+
+            # --- 2. Generate and distribute per-host XML configs -------------
+            # Interface pinning is done per-host (each host has one NIC / one
+            # LAN IP).  Local files land in out_dir; remote files are streamed
+            # into the container via stdin to avoid a separate scp step (the
+            # bind mount makes them immediately visible to the container).
+            if rmw == "fastrtps":
+                for name, h in hosts.items():
+                    xml_content = _fastdds_profiles_xml(
+                        0, 0, whitelist_addr=h.addr)
+                    if h.ssh == "":
+                        xml_path = out_dir / f"fastdds_profiles_{name}.xml"
+                        xml_path.write_text(xml_content)
+                        xml_env[name] = {
+                            "FASTDDS_DEFAULT_PROFILES_FILE": str(xml_path)}
+                    else:
+                        remote_xml = (
+                            f"{h.workdir}/results/lan/{run_name}/"
+                            f"fastdds_profiles_{name}.xml")
+                        # Pipe XML into the container — `cat > path` is the
+                        # simplest approach that avoids scp and works with the
+                        # existing bind-mount path mapping.
+                        subprocess.run(
+                            ["ssh", "-o", "BatchMode=yes", h.ssh,
+                             "docker", "exec", "-i", h.container,
+                             "sh", "-c", f"cat > {remote_xml}"],
+                            input=xml_content.encode(), check=True)
+                        xml_env[name] = {
+                            "FASTDDS_DEFAULT_PROFILES_FILE": remote_xml}
+
+            elif rmw == "cyclonedds":
+                for name, h in hosts.items():
+                    # iface_name pins Cyclone to the correct NIC; without it,
+                    # Cyclone announces locators on every interface (including
+                    # zerotier and tailscale) which breaks cross-host discovery.
+                    xml_content = _cyclonedds_xml(0, iface_name=h.iface)
+                    if h.ssh == "":
+                        xml_path = out_dir / f"cyclonedds_{name}.xml"
+                        xml_path.write_text(xml_content)
+                        xml_env[name] = {
+                            "CYCLONEDDS_URI": f"file://{xml_path}"}
+                    else:
+                        remote_xml = (
+                            f"{h.workdir}/results/lan/{run_name}/"
+                            f"cyclonedds_{name}.xml")
+                        subprocess.run(
+                            ["ssh", "-o", "BatchMode=yes", h.ssh,
+                             "docker", "exec", "-i", h.container,
+                             "sh", "-c", f"cat > {remote_xml}"],
+                            input=xml_content.encode(), check=True)
+                        xml_env[name] = {
+                            "CYCLONEDDS_URI": f"file://{remote_xml}"}
+
+            # --- 3. Spawn zenoh routers (ONE per host, not per node) ---------
+            # The host-level lower-index mesh mirrors _spawn_zenoh's node-level
+            # mesh: host i connects to all hosts[0..i-1].  Every workload node
+            # then connects to tcp/127.0.0.1:<port> on its own host's router
+            # (the container uses --network host so loopback is shared).
+            if rmw == "zenoh":
+                host_list = list(hosts.items())   # insertion order = mesh order
+                prefix = Path(sys.executable).resolve().parents[1]
+                zenohd_local = (
+                    prefix / "lib" / "rmw_zenoh_cpp" / "rmw_zenohd")
+                if not zenohd_local.exists():
+                    raise RuntimeError(
+                        f"{zenohd_local} not found: substrate=lan with "
+                        "rmw=zenoh needs the ros2 pixi env")
+                zenohd_remote = (
+                    f"{remote_ament}/lib/rmw_zenoh_cpp/rmw_zenohd")
+                for i, (host_name, h) in enumerate(host_list):
+                    listen = (
+                        f'listen/endpoints=['
+                        f'"tcp/{h.addr}:{cfg.port}",'
+                        f'"tcp/127.0.0.1:{cfg.port}"]')
+                    lower = [
+                        f'"tcp/{host_list[j][1].addr}:{cfg.port}"'
+                        for j in range(i)]
+                    override = listen + (
+                        f';connect/endpoints=[{",".join(lower)}]'
+                        if lower else '')
+                    router_log = (out_dir / f"router_{host_name}.log").open("w")
+                    if h.ssh == "":
+                        self._routers[host_name] = subprocess.Popen(
+                            [str(zenohd_local)],
+                            env={**local_base,
+                                 "ZENOH_CONFIG_OVERRIDE": override},
+                            stdout=router_log, stderr=subprocess.STDOUT)
+                    else:
+                        # Remote router: env travels as docker exec -e flags;
+                        # no profiles file needed for the router itself.
+                        self._routers[host_name] = subprocess.Popen(
+                            ["ssh", "-o", "BatchMode=yes", h.ssh,
+                             "docker", "exec",
+                             "-e", f"ZENOH_CONFIG_OVERRIDE={override}",
+                             "-e", f"AMENT_PREFIX_PATH={remote_ament}",
+                             "-e", "PYTHONNOUSERSITE=1",
+                             h.container, zenohd_remote],
+                            stdout=router_log, stderr=subprocess.STDOUT)
+                # Give all routers time to bind and accept before sessions
+                # connect (same 1-second grace as _spawn_zenoh).
+                time.sleep(1.0)
+
+            # --- 4. Spawn workload nodes (global stagger, interleaved hosts) -
+            stagger_s = cfg.spawn_stagger_ms / 1e3
+            for i, nid in enumerate(node_ids):
+                host_name = host_of[nid]
+                h = hosts[host_name]
+                base_cmd = self._lan_node_cmd(nid, host_name)
+
+                if rmw == "zenoh":
+                    # All nodes (local and remote) connect to loopback; the
+                    # router on each host exposes loopback + its LAN IP so the
+                    # host-level mesh carries cross-host traffic transparently.
+                    zenoh_connect = (
+                        f'connect/endpoints=["tcp/127.0.0.1:{cfg.port}"]')
+                    node_extra = {"ZENOH_CONFIG_OVERRIDE": zenoh_connect}
+                else:
+                    node_extra = xml_env.get(host_name, {})
+
+                if h.ssh == "":
+                    # Local: set env via Popen env= (no -e flag needed).
+                    agents[nid] = subprocess.Popen(
+                        base_cmd, env={**local_base, **node_extra})
+                else:
+                    # Remote: env must travel through ssh → docker exec.
+                    # Build the complete docker exec env: base remote vars
+                    # (AMENT, RMW_IMPL, log dir, no user site) plus node-
+                    # specific extras (xml path or zenoh connect string).
+                    remote_log_dir = f"{h.workdir}/results/lan/{run_name}"
+                    remote_env = {
+                        "RMW_IMPLEMENTATION": rmw_impl,
+                        "PYTHONNOUSERSITE": "1",
+                        "ROS_LOG_DIR": remote_log_dir,
+                        "AMENT_PREFIX_PATH": remote_ament,
+                        **node_extra,
+                    }
+                    # Insert -e KEY=VAL flags between "exec" and the container
+                    # name in the base_cmd produced by _lan_node_cmd.
+                    exec_idx = base_cmd.index("exec")
+                    e_flags: list[str] = []
+                    for k, v in remote_env.items():
+                        e_flags += ["-e", f"{k}={v}"]
+                    full_cmd = (base_cmd[:exec_idx + 1]
+                                + e_flags
+                                + base_cmd[exec_idx + 1:])
+                    agents[nid] = subprocess.Popen(full_cmd)
+
+                # Global stagger paces ALL nodes (local + remote) from the
+                # orchestrator's clock — interleaved across hosts.
+                if stagger_s and i < len(node_ids) - 1:
+                    time.sleep(stagger_s)
+
+            self.ready.set()
+
+            # --- 5. Sampling loop (local processes only) ---------------------
+            # Remote nodes are spawned as ssh Popen objects; their PIDs are on
+            # the remote host and are not accessible to psutil here.  We still
+            # sample host CPU / mem to detect local saturation and track local
+            # workload + router processes.
+            local_pids: dict[str, subprocess.Popen] = {
+                nid: agents[nid]
+                for nid in node_ids if hosts[host_of[nid]].ssh == ""}
+            local_pids.update({
+                f"router:{name}": p
+                for name, p in self._routers.items()
+                if hosts[name].ssh == ""})
+            meters = {
+                name: psutil.Process(p.pid)
+                for name, p in local_pids.items()
+                if p.poll() is None}
+            for m in meters.values():
+                m.cpu_percent(None)   # prime per-PID CPU deltas
+            psutil.cpu_percent(None)  # prime host CPU delta
+
+            wall0 = time.monotonic()
+            duration = self.scenario.duration_s
+            grace = duration + 10.0
+            tick = 0
+            # Run until duration elapsed AND all agents exited, or grace expired.
+            # Remote nodes exit on --duration-s; the ssh Popen exits with them.
+            while True:
+                elapsed = time.monotonic() - wall0
+                alive = any(p.poll() is None for p in agents.values())
+                if (elapsed >= duration and not alive) or elapsed >= grace:
+                    break
+                samples.append(
+                    self._sample_resources(round(elapsed, 3), meters))
+                tick += 1
+                # Deadline-paced (per orchestrator-tick-pacing): per-sample work
+                # does not accumulate as drift.
+                await asyncio.sleep(
+                    max(0.0, wall0 + tick * sample_dt - time.monotonic()))
+
+            for nid, p in agents.items():
+                if p.poll() is None:
+                    p.kill()
+                agent_exit[nid] = p.wait(timeout=10)
+
+        finally:
+            # Kill local processes (agents + local routers).
+            for p in list(agents.values()) + list(self._routers.values()):
+                if p.poll() is None:
+                    p.kill()
+            # Kill remote workload processes and routers: pkill inside the
+            # container is the only reliable way since killing the local ssh
+            # Popen does not SIGKILL the remote child.  Ignore failures (the
+            # process may have already exited normally).
+            for name, h in remote_hosts.items():
+                for target in ("netcom_zen.ros2_workload", "rmw_zenohd"):
+                    subprocess.run(
+                        ["ssh", "-o", "BatchMode=yes", h.ssh,
+                         "docker", "exec", h.container,
+                         "pkill", "-f", target],
+                        capture_output=True)   # ignore exit code
+
+        # --- 6. Collect remote results via rsync ----------------------------
+        # The bind mount (-v ~/net_com_zen:/work) makes the container's
+        # /work/results/... identical to the host's ~/net_com_zen/results/...;
+        # rsync uses the HOST path (ssh rsync works host-to-host, no docker).
+        for name, h in remote_hosts.items():
+            # Derive host path: container's /work == ~/net_com_zen on the host.
+            host_results = h.workdir.replace("/work", "~/net_com_zen", 1)
+            subprocess.run(
+                ["rsync", "-a",
+                 f"{h.ssh}:{host_results}/results/lan/{run_name}/",
+                 str(out_dir) + "/"],
+                check=True)
+
+        # --- 7. Write resource parquet and manifest -------------------------
+        self._write_resources(samples)
+        peak_mem = max((s["host_mem_used"] for s in samples), default=0)
+        min_avail = min((s["host_mem_avail"] for s in samples), default=0)
+        peak_swap = max((s["host_swap_used"] for s in samples), default=0)
+
+        (out_dir / "manifest.json").write_text(json.dumps({
+            "scenario": self.scenario.model_dump(mode="json"),
+            "seed": self.scenario.seed,
+            "git_hash": _git_hash(),
+            "substrate": "lan",
+            "rmw": rmw,
+            "n_nodes": len(all_nodes),
+            "resource_samples": len(samples),
+            "peak_host_mem_used_bytes": peak_mem,
+            "min_host_mem_avail_bytes": min_avail,
+            "peak_host_swap_used_bytes": peak_swap,
+            "socket_buffer_bytes": cfg.socket_buffer_bytes,
+            # per-node host placement — the report uses this to split
+            # same-host pairs (meaningful latency) from cross-host pairs
+            # (clocks not synced; one-way latency is meaningless).
+            "hosts": {n.id: n.host for n in all_nodes},
+            "host_addrs": {name: h.addr for name, h in hosts.items()},
+            # remote sampling not implemented in v1: a future iteration can
+            # add a remote metrics collector (e.g. push psutil over ssh).
+            "remote_sampled": False,
+            # Wi-Fi RTT at run-start (informational; cross-host clocks not
+            # synced so this is a link-quality indicator, not a latency datum).
+            "rtt_ms": rtt_ms,
+            "agent_exit_codes": agent_exit,
+        }, indent=2))

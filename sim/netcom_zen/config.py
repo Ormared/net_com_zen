@@ -30,6 +30,10 @@ class NodeConfig(BaseModel):
     waypoints: list[tuple[float, float]] = Field(min_length=1)
     speed_mps: float = Field(gt=0, default=5.0)
     role: Literal["vehicle", "command"] = "vehicle"  # M4: command = uplink sink
+    # Which host this node runs on (substrate=lan only; ignored otherwise).
+    # Must match a key in Scenario.hosts.  Default "local" keeps every
+    # non-lan node on the local machine without requiring YAML changes.
+    host: str = "local"
 
 
 class FoliageRect(BaseModel):
@@ -184,12 +188,35 @@ class MobilityConfig(BaseModel):
     physics_hz: float = Field(gt=0, default=60.0)  # PhysX frames per sim second
 
 
+class LanHostConfig(BaseModel):
+    """One physical machine participating in a substrate=lan run.
+
+    The "local" host (ssh="") is the machine running the orchestrator.
+    Remote hosts are reached via SSH and nodes are started inside the
+    long-lived dds-lab container (see docker/dds-lab/Dockerfile and
+    scripts/dds_lan_deploy.sh).
+
+    Interface pinning is MANDATORY on hosts that have noise interfaces
+    (zerotier, tailscale, docker bridges) because DDS announces locators
+    on every interface it finds; an unreachable locator causes silent
+    discovery failure at swarm scale.
+    """
+    ssh: str = ""            # SSH target ("user@host"); "" = the local machine
+    addr: str                # LAN IP on the shared segment (used for DDS pinning)
+    iface: str               # NIC name to pin DDS / zenoh to (e.g. wlp130s0f0)
+    container: str = "dds-lab"   # container name created by dds_lan_deploy.sh
+    workdir: str = "/work"       # bind-mount point inside the container
+    max_nodes: int = Field(gt=0, default=24)  # per-host node ceiling
+
+
 # Per-substrate node ceilings. channel = AF_PACKET forwarder (single-thread
 # asyncio, O(N^2) broadcast fan-out) genuinely tops out low — keep the historic
 # cap so the EW track's assumptions are untouched. bridge = kernel L2 forwarding,
 # pushed to swarm scale for the DDS benchmark (96 was the original stress point;
 # raised to 256 for the QoS-plane ceiling probe that pushes each RMW past 96).
-_SUBSTRATE_MAX_NODES = {"channel": 8, "bridge": 256}
+# lan = real NICs on two machines; 96 is the same stress ceiling as the original
+# bridge target, and cross-host means the bottleneck is the Wi-Fi link not the rig.
+_SUBSTRATE_MAX_NODES = {"channel": 8, "bridge": 256, "lan": 96}
 
 
 class Scenario(BaseModel):
@@ -199,11 +226,16 @@ class Scenario(BaseModel):
     seed: int = 0
     radio: RadioProfile
     # Dataplane: channel = netns + AF_PACKET RF forwarder (EW track); bridge =
-    # netns + veth into a Linux kernel bridge, no RF model (DDS benchmark track).
-    substrate: Literal["channel", "bridge"] = "channel"
+    # netns + veth into a Linux kernel bridge, no RF model (DDS benchmark track);
+    # lan = plain processes on real machines' NICs, no netns, no root required.
+    substrate: Literal["channel", "bridge", "lan"] = "channel"
     # Upper bound is the largest substrate ceiling; the exact cap is enforced
     # per-substrate in _nodes_fit_substrate below.
     nodes: list[NodeConfig] = Field(min_length=2, max_length=256)
+    # Host map for substrate=lan: keys are logical names (e.g. "local", "mini"),
+    # values are LanHostConfig.  Must contain "local" (ssh="").  Ignored when
+    # substrate != "lan".
+    hosts: dict[str, LanHostConfig] = {}
     environment: EnvironmentConfig = EnvironmentConfig()
     jammers: list[JammerConfig] = []
     workload: Literal["agent", "ros2"] = "agent"  # what crosses the channel
@@ -223,10 +255,12 @@ class Scenario(BaseModel):
     def _nodes_fit_substrate(self):
         cap = _SUBSTRATE_MAX_NODES[self.substrate]
         if len(self.nodes) > cap:
+            hint = ("; the channel forwarder can't model more, "
+                    "use substrate=bridge for swarm scale"
+                    if self.substrate == "channel" else "")
             raise ValueError(
                 f"substrate={self.substrate!r} supports at most {cap} nodes "
-                f"(got {len(self.nodes)}); the channel forwarder can't model "
-                f"more, use substrate=bridge for swarm scale")
+                f"(got {len(self.nodes)}){hint}")
         return self
 
     @model_validator(mode="after")
@@ -246,6 +280,73 @@ class Scenario(BaseModel):
             raise ValueError("at most one command node")
         if self.satellite.enabled and not commands:
             raise ValueError("satellite.enabled requires a command node")
+        return self
+
+    @model_validator(mode="after")
+    def _lan_config_valid(self):
+        """Validate lan-specific constraints and reject invalid host placements
+        on non-lan substrates.
+
+        For substrate=lan:
+          - hosts must be non-empty and contain a "local" key (ssh="").
+          - every node.host must resolve to a key in hosts.
+          - per-host node count must not exceed LanHostConfig.max_nodes.
+          - socket_buffer_bytes and discovery_server are rejected: v1 keeps
+            kernel buffer knobs and DDS broker knobs off the lan path to
+            avoid confounding the baseline cross-host measurement.
+
+        For other substrates:
+          - node.host != "local" is rejected (no remote spawning available).
+        """
+        if self.substrate == "lan":
+            if not self.hosts:
+                raise ValueError(
+                    "substrate=lan requires at least one host in hosts; "
+                    'add a "local" entry (ssh="") for the orchestrator machine')
+            if "local" not in self.hosts:
+                raise ValueError(
+                    'substrate=lan requires a "local" key in hosts (ssh=""); '
+                    "the orchestrator spawns local nodes without SSH")
+            # Validate per-node host references
+            for node in self.nodes:
+                if node.host not in self.hosts:
+                    raise ValueError(
+                        f"node {node.id!r} has host={node.host!r} which is not "
+                        f"a key in hosts (defined hosts: "
+                        f"{list(self.hosts.keys())})")
+            # Per-host ceiling: each host has its own max_nodes budget
+            from collections import Counter
+            counts: Counter = Counter(n.host for n in self.nodes)
+            for host_name, count in counts.items():
+                max_n = self.hosts[host_name].max_nodes
+                if count > max_n:
+                    raise ValueError(
+                        f"host {host_name!r} has {count} nodes assigned but "
+                        f"max_nodes={max_n}; raise LanHostConfig.max_nodes or "
+                        "redistribute nodes")
+            # v1 keeps kernel knobs off the lan path: socket_buffer_bytes>0
+            # would require sudo on the remote host (we never use sudo remotely)
+            # and cross-host buffer tuning is a separate study.
+            if self.ros2.socket_buffer_bytes > 0:
+                raise ValueError(
+                    "substrate=lan rejects ros2.socket_buffer_bytes > 0 (v1 "
+                    "keeps kernel buffer knobs off the lan path; remote sudo "
+                    "is not available)")
+            # discovery_server requires a local broker process that the lan path
+            # does not start; reject early with a clear message.
+            if self.ros2.discovery_server:
+                raise ValueError(
+                    "substrate=lan rejects ros2.discovery_server=True (v1 "
+                    "keeps the DDS broker knob off the lan path)")
+        else:
+            # Non-lan substrates: remote host placement makes no sense since
+            # _run_channel and _run_bridge only work locally.
+            for node in self.nodes:
+                if node.host != "local":
+                    raise ValueError(
+                        f"node {node.id!r} has host={node.host!r} but "
+                        f"substrate={self.substrate!r} only supports "
+                        "host='local' (remote spawning requires substrate=lan)")
         return self
 
     @property

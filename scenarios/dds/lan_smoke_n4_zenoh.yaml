@@ -1,0 +1,54 @@
+# Smoke test: N=4 across two real machines (substrate=lan), Zenoh RMW.
+# d1,d2 run on the local orchestrator host; d3,d4 run inside the dds-lab
+# container on the remote host (see scripts/dds_lan_deploy.sh).
+# zenoh substrate=lan uses ONE rmw_zenohd router per host (host-level lower-
+# index TCP mesh) so cross-host traffic flows through the LAN IP of each
+# router, not multicast. Every node connects to loopback on its own host.
+# Prerequisite: run `bash scripts/dds_lan_deploy.sh orm_small_nix@192.168.1.9`
+name: lan-smoke-n4-zenoh
+duration_s: 30.0
+seed: 0
+substrate: lan
+radio:
+  freq_hz: 433000000.0
+  bandwidth_hz: 250000.0
+  tx_power_dbm: 27.0
+  data_rate_bps: 250000.0
+  hop:
+    n_channels: 50
+    hop_rate_hz: 100.0
+hosts:
+  local:
+    addr: "192.168.1.6"
+    iface: "wlp130s0f0"
+  mini:
+    ssh: "orm_small_nix@192.168.1.9"
+    addr: "192.168.1.9"
+    iface: "wlp2s0"
+nodes:
+- id: d1
+  waypoints:
+  - - 0
+    - 0
+  host: local
+- id: d2
+  waypoints:
+  - - 0
+    - 0
+  host: local
+- id: d3
+  waypoints:
+  - - 0
+    - 0
+  host: mini
+- id: d4
+  waypoints:
+  - - 0
+    - 0
+  host: mini
+workload: ros2
+ros2:
+  rmw: zenoh
+  period_ms: 200
+  payload_bytes: 255
+  reliability: reliable
