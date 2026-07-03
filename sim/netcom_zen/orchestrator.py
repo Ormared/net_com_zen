@@ -33,6 +33,18 @@ from .terrain import FoliageRegion, Terrain
 _KERNEL_BUF_SYSCTLS = ("rmem_max", "wmem_max", "rmem_default", "wmem_default")
 
 
+def _cluster_of(idx: int, n: int, k: int) -> int:
+    """Contiguous-block cluster index for a node at position idx (0-based, in
+    scenario/spawn order) among n nodes split into k clusters.
+
+    Formula: idx * k // n.  Contiguous (not modulo) so cluster membership
+    matches spawn and stagger order: nodes 0..⌈n/k⌉-1 form cluster 0, the
+    next block forms cluster 1, …, and node n-1 belongs to cluster k-1.
+    Modulo assignment would interleave clusters and break the stagger-order
+    assumption used by the SPDP discovery-storm hypothesis experiments."""
+    return idx * k // n
+
+
 def _cyclonedds_xml(socket_buffer_bytes: int = 0, iface_name: str = "") -> str:
     """Cyclone DDS config for the bridge or lan substrate: SHM/Iceoryx off
     (force real UDP, no same-host shortcut) and multicast on so native
@@ -282,13 +294,39 @@ class ScenarioEngine:
             "PATH": os.environ.get("PATH", "/usr/sbin:/usr/bin:/sbin:/bin"),
         }
 
+    def _domain_of(self, nid: str) -> int:
+        """ROS_DOMAIN_ID (cluster index) for node nid.
+
+        Returns 0 when cluster_domains==0 (single domain, all existing
+        behaviour unchanged).  Otherwise looks up nid's position in scenario
+        node order — the canonical spawn/stagger order — and delegates to
+        the module-level _cluster_of for the contiguous-block assignment.
+        Unit-testable without root: no subprocess, no netns, no filesystem."""
+        k = self.scenario.ros2.cluster_domains
+        if k == 0:
+            return 0
+        nodes = [n.id for n in self.scenario.nodes]
+        return _cluster_of(nodes.index(nid), len(nodes), k)
+
     def _workload_cmd(self, nid: str) -> list[str]:
         cfg = self.scenario.ros2
         # For shared/star topologies --peers is unused (O(N) endpoint wiring
         # has no per-peer subscriptions); pass empty string so node.py fails
         # loudly if it accidentally enters mesh mode with an empty peer list.
-        peers = (",".join(p for p in self.topo.nodes if p != nid)
-                 if cfg.topology == "mesh" else "")
+        # When cluster partitioning is on, restrict mesh peers to the same
+        # ROS_DOMAIN_ID block only: cross-cluster pairs are on different domains
+        # and cannot discover each other, so including them in --peers would
+        # stall the workload's peer-wait loop indefinitely.
+        if cfg.topology != "mesh":
+            peers = ""
+        elif cfg.cluster_domains > 0:
+            my_domain = self._domain_of(nid)
+            peers = ",".join(
+                p for p in self.topo.nodes
+                if p != nid and self._domain_of(p) == my_domain
+            )
+        else:
+            peers = ",".join(p for p in self.topo.nodes if p != nid)
         role = "hub" if nid == cfg.hub_id else "spoke"
         return ["ip", "netns", "exec", self.topo.ns_names[nid],
                 sys.executable, "-m", "netcom_zen.ros2_workload",
@@ -362,8 +400,14 @@ class ScenarioEngine:
         stagger_s = self.scenario.ros2.spawn_stagger_ms / 1e3
         agents: dict[str, subprocess.Popen] = {}
         for i, nid in enumerate(self.topo.nodes):
-            agents[nid] = subprocess.Popen(self._workload_cmd(nid),
-                                           env={**base, **extra_env(nid)})
+            # Per-node cluster domain: when partitioning is on, each node must
+            # open the DDS domain matching its cluster so SPDP discovery stays
+            # within the block and does not cross into adjacent clusters.
+            domain_env = ({"ROS_DOMAIN_ID": str(self._domain_of(nid))}
+                          if self.scenario.ros2.cluster_domains > 0 else {})
+            agents[nid] = subprocess.Popen(
+                self._workload_cmd(nid),
+                env={**base, **extra_env(nid), **domain_env})
             # stagger participant joins to defuse the simultaneous-startup SPDP
             # storm (tests the Fast DDS discovery-ceiling hypothesis)
             if stagger_s and i < len(self.topo.nodes) - 1:
@@ -460,9 +504,15 @@ class ScenarioEngine:
         time.sleep(1.0)  # let routers accept before sessions dial in
         agents: dict[str, subprocess.Popen] = {}
         for nid in nodes:
-            env = {**base_env, "ZENOH_CONFIG_OVERRIDE":
-                   f'connect/endpoints=["tcp/127.0.0.1:{cfg.port}"]'}
-            agents[nid] = subprocess.Popen(self._workload_cmd(nid), env=env)
+            node_env = {**base_env, "ZENOH_CONFIG_OVERRIDE":
+                        f'connect/endpoints=["tcp/127.0.0.1:{cfg.port}"]'}
+            # zenoh routers are domain-agnostic (they mesh at the transport
+            # layer regardless of ROS_DOMAIN_ID); only the ROS node env needs
+            # the variable so the RMW opens the correct DDS participant domain.
+            if self.scenario.ros2.cluster_domains > 0:
+                node_env["ROS_DOMAIN_ID"] = str(self._domain_of(nid))
+            agents[nid] = subprocess.Popen(self._workload_cmd(nid),
+                                           env=node_env)
         return agents
 
     async def run(self) -> None:
@@ -668,6 +718,14 @@ class ScenarioEngine:
             # netem knobs active in this run; None = ideal link (no qdisc)
             "netem": (self.scenario.netem.model_dump()
                       if self.scenario.netem else None),
+            # cluster_of is non-empty only when cluster_domains>0, so existing
+            # report.py scripts reading v0 manifests see an empty dict and are
+            # unaffected; new scripts can split intra- vs cross-cluster pairs.
+            "cluster_domains": self.scenario.ros2.cluster_domains,
+            "cluster_of": (
+                {n.id: self._domain_of(n.id) for n in self.scenario.nodes}
+                if self.scenario.ros2.cluster_domains > 0 else {}
+            ),
             "agent_exit_codes": agent_exit,
         }, indent=2))
 

@@ -175,6 +175,17 @@ class Ros2WorkloadConfig(BaseModel):
     # empty for topology='mesh'/'shared' (a stray hub_id silently means nothing
     # and almost certainly indicates a misconfigured scenario).
     hub_id: str = ""
+    # ROS_DOMAIN_ID cluster partitioning (docs/dds-topology-plan.md P5,
+    # implication #1 from the DDS benchmark results). 0 = single domain
+    # (default; all existing behavior is unchanged).  K>0 = split the N nodes
+    # into K contiguous blocks; block j runs on ROS_DOMAIN_ID j.  The SPDP
+    # participant-discovery cap is per-domain (~33 for Fast DDS, storm-prone
+    # for Cyclone under all-to-all SPDP at N≥48); ~24 nodes per cluster keeps
+    # each block under the N=24-healthy / N=48-collapsed knee measured in the
+    # benchmark.  V1 has NO cross-cluster relay — cross-cluster pairs see 0
+    # discovered peers and the metric of interest is intra-cluster mesh
+    # completeness, not cross-cluster connectivity.
+    cluster_domains: int = Field(ge=0, le=32, default=0)
 
     @model_validator(mode="after")
     def _discovery_server_is_fastrtps_only(self):
@@ -427,6 +438,58 @@ class Scenario(BaseModel):
             raise ValueError(
                 f"ros2.hub_id={hub!r} requires ros2.topology='star' "
                 f"(got topology={topo!r}); clear hub_id or set topology='star'")
+        return self
+
+    @model_validator(mode="after")
+    def _cluster_domains_valid(self):
+        """cluster_domains > 0 requires a specific combination of substrate,
+        workload, and topology; validate every cross-field constraint here so
+        the error surfaces at parse time rather than at spawn time.
+
+        Substrate: lan uses real NICs with no orchestrator-managed netns env
+        injection; bridge is the only substrate where per-netns ROS_DOMAIN_ID
+        is controlled by the orchestrator.
+        Workload: only the ros2 track uses ROS_DOMAIN_ID; the agent track is
+        unaffected (it has no DDS discovery).
+        Topology: shared/star collapse the endpoint matrix by different means
+        (a future combination); mesh is the proven O(N²) SPDP wall this lever
+        targets.  Reject now rather than silently misbehave with shared/star.
+        Discovery Server: _spawn_fastdds_server does not inject ROS_DOMAIN_ID
+        (it is left untouched); combining DS + clusters would give every node
+        the same server address but different domain IDs, breaking client
+        registration silently.  Reject early with a clear message.
+        Node count: cluster_domains > len(nodes) leaves the last clusters empty
+        (the contiguous-block formula gives 0 members), which is nonsensical.
+        """
+        k = self.ros2.cluster_domains
+        if k == 0:
+            return self  # fast path: clustering off, nothing to validate
+        if self.workload != "ros2":
+            raise ValueError(
+                f"cluster_domains={k} requires workload='ros2' "
+                f"(got workload={self.workload!r}; only the ros2 track uses "
+                "ROS_DOMAIN_ID-based DDS domain partitioning)")
+        if self.substrate != "bridge":
+            raise ValueError(
+                f"cluster_domains={k} requires substrate='bridge' "
+                f"(got substrate={self.substrate!r}); the bridge substrate is "
+                "the only path where the orchestrator injects per-netns "
+                "ROS_DOMAIN_ID; lan runs plain processes with no env injection")
+        if self.ros2.topology != "mesh":
+            raise ValueError(
+                f"cluster_domains={k} requires ros2.topology='mesh' "
+                f"(got topology={self.ros2.topology!r}); shared/star + clusters "
+                "is a later combination — not implemented in v1")
+        if self.ros2.discovery_server:
+            raise ValueError(
+                f"cluster_domains={k} is incompatible with "
+                "ros2.discovery_server=True: the Discovery Server spawn path "
+                "does not inject ROS_DOMAIN_ID per node, so combining DS and "
+                "cluster partitioning would silently break client registration")
+        if k > len(self.nodes):
+            raise ValueError(
+                f"cluster_domains={k} > len(nodes)={len(self.nodes)}: some "
+                "clusters would be empty (reduce cluster_domains or add nodes)")
         return self
 
     @property
