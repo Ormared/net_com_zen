@@ -219,6 +219,13 @@ class TestCycloneXmlIfacePinning:
         assert "autodetermine" not in xml
         assert "SocketReceiveBufferSize" in xml
 
+    def test_max_auto_participant_index_above_lan_cap(self):
+        """Many same-IP participants need an index each; the ceiling must sit
+        above the lan substrate node cap or spokes 33+ die at rmw_create_node
+        (P4 star: 96 spokes on one host, exactly 32 survived the default)."""
+        xml = _cyclonedds_xml(0)
+        assert "<MaxAutoParticipantIndex>150</MaxAutoParticipantIndex>" in xml
+
 
 # ---------------------------------------------------------------------------
 # XML generator — Fast DDS interface whitelist

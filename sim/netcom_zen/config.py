@@ -248,9 +248,10 @@ class LanHostConfig(BaseModel):
 # cap so the EW track's assumptions are untouched. bridge = kernel L2 forwarding,
 # pushed to swarm scale for the DDS benchmark (96 was the original stress point;
 # raised to 256 for the QoS-plane ceiling probe that pushes each RMW past 96).
-# lan = real NICs on two machines; 96 is the same stress ceiling as the original
-# bridge target, and cross-host means the bottleneck is the Wi-Fi link not the rig.
-_SUBSTRATE_MAX_NODES = {"channel": 8, "bridge": 256, "lan": 96}
+# lan = real NICs on two machines; 96 was the original stress ceiling, raised to
+# 128 so the P4 star archetype fits 96 spokes + 1 hub (cross-host means the
+# bottleneck is the Wi-Fi link not the rig).
+_SUBSTRATE_MAX_NODES = {"channel": 8, "bridge": 256, "lan": 128}
 
 
 class Scenario(BaseModel):

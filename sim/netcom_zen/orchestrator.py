@@ -90,6 +90,15 @@ def _cyclonedds_xml(socket_buffer_bytes: int = 0, iface_name: str = "") -> str:
             '      <Enable>false</Enable>\n'
             '    </SharedMemory>\n'
             f'{buf}'
+            # Cyclone assigns each same-IP participant an index (its unicast
+            # port slot); past the default ceiling rmw_create_node dies with
+            # "failed to create domain".  On lan, many nodes share one host IP
+            # (P4 star: 96 spokes on one rig, spokes 33+ crashed), so size the
+            # ceiling above the substrate cap (128).  Netns substrates give
+            # every node its own IP (index 0) and never hit this.
+            '    <Discovery>\n'
+            '      <MaxAutoParticipantIndex>150</MaxAutoParticipantIndex>\n'
+            '    </Discovery>\n'
             '  </Domain>\n'
             '</CycloneDDS>\n')
 
