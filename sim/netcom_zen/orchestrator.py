@@ -63,13 +63,62 @@ def _cyclonedds_xml(socket_buffer_bytes: int = 0) -> str:
             '</CycloneDDS>\n')
 
 
-def _fastdds_profiles_xml(socket_buffer_bytes: int) -> str:
-    """Fast DDS XML profiles defining a single UDPv4 transport with enlarged
-    socket buffers, set as the default participant profile. useBuiltinTransports
-    false means ONLY this transport is used — which also keeps SHM off (the same
-    isolation FASTDDS_BUILTIN_TRANSPORTS=UDPv4 gives), so the buffer route is a
+def _fastdds_profiles_xml(socket_buffer_bytes: int = 0,
+                          allocation_participants: int = 0) -> str:
+    """Fast DDS XML profiles defining a single UDPv4 transport, set as the
+    default participant profile. useBuiltinTransports false means ONLY this
+    transport is active — which also keeps SHM off (same isolation as the
+    FASTDDS_BUILTIN_TRANSPORTS=UDPv4 env-var route), so the profiles route is a
     drop-in replacement for the env-var route. Needs the <profiles> wrapper
-    (Fast DDS 8.x) or the parser rejects transport_descriptors."""
+    (Fast DDS 8.x) or the parser rejects transport_descriptors.
+
+    socket_buffer_bytes > 0: emit <receiveBufferSize> / <sendBufferSize> in the
+    transport descriptor. 0: omit both (descriptor + useBuiltinTransports=false
+    stay, so SHM remains off — required isolation on this rig).
+
+    allocation_participants > 0 (A): emit an <allocation> block inside <rtps>
+    preallocating total_participants/readers/writers to A with increment=0 (fully
+    preallocated, no reallocation during discovery bursts), and also
+    <maxInitialPeersRange>A inside the transport_descriptor. This is the P1 lever
+    for the ~33-participant Fast DDS clique cap (docs/dds-topology-plan.md).
+
+    XSD element order matters to Fast DDS 8.x: within <rtps>, the sequence must
+    be <userTransports>, <useBuiltinTransports>, <allocation>; within
+    <transport_descriptor>, buffer sizes precede <maxInitialPeersRange>."""
+    # transport descriptor: buffer sizes (optional) then peer range (optional)
+    buf_elems = (
+        f'        <receiveBufferSize>{socket_buffer_bytes}</receiveBufferSize>\n'
+        f'        <sendBufferSize>{socket_buffer_bytes}</sendBufferSize>\n'
+        if socket_buffer_bytes > 0 else '')
+    peers_elem = (
+        f'        <maxInitialPeersRange>{allocation_participants}'
+        f'</maxInitialPeersRange>\n'
+        if allocation_participants > 0 else '')
+    # allocation block inside <rtps>: initial==maximum==A, increment 0 means fully
+    # preallocated — no runtime realloc when all A participants discover at once.
+    alloc_block = (
+        '        <allocation>\n'
+        '          <remote_locators>\n'
+        '            <max_unicast_locators>4</max_unicast_locators>\n'
+        '            <max_multicast_locators>1</max_multicast_locators>\n'
+        '          </remote_locators>\n'
+        f'          <total_participants>\n'
+        f'            <initial>{allocation_participants}</initial>\n'
+        f'            <maximum>{allocation_participants}</maximum>\n'
+        f'            <increment>0</increment>\n'
+        f'          </total_participants>\n'
+        f'          <total_readers>\n'
+        f'            <initial>{allocation_participants}</initial>\n'
+        f'            <maximum>{allocation_participants}</maximum>\n'
+        f'            <increment>0</increment>\n'
+        f'          </total_readers>\n'
+        f'          <total_writers>\n'
+        f'            <initial>{allocation_participants}</initial>\n'
+        f'            <maximum>{allocation_participants}</maximum>\n'
+        f'            <increment>0</increment>\n'
+        f'          </total_writers>\n'
+        '        </allocation>\n'
+        if allocation_participants > 0 else '')
     return ('<?xml version="1.0" encoding="UTF-8" ?>\n'
             '<dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">\n'
             '  <profiles>\n'
@@ -77,8 +126,8 @@ def _fastdds_profiles_xml(socket_buffer_bytes: int) -> str:
             '      <transport_descriptor>\n'
             '        <transport_id>udp_big</transport_id>\n'
             '        <type>UDPv4</type>\n'
-            f'        <receiveBufferSize>{socket_buffer_bytes}</receiveBufferSize>\n'
-            f'        <sendBufferSize>{socket_buffer_bytes}</sendBufferSize>\n'
+            f'{buf_elems}'
+            f'{peers_elem}'
             '      </transport_descriptor>\n'
             '    </transport_descriptors>\n'
             '    <participant profile_name="big" is_default_profile="true">\n'
@@ -86,6 +135,7 @@ def _fastdds_profiles_xml(socket_buffer_bytes: int) -> str:
             '        <userTransports><transport_id>udp_big</transport_id>'
             '</userTransports>\n'
             '        <useBuiltinTransports>false</useBuiltinTransports>\n'
+            f'{alloc_block}'
             '      </rtps>\n'
             '    </participant>\n'
             '  </profiles>\n'
@@ -221,14 +271,17 @@ class ScenarioEngine:
         if rmw == "zenoh":
             return self._spawn_zenoh(log_dir)
         buf = self.scenario.ros2.socket_buffer_bytes
+        alloc = self.scenario.ros2.fastdds_allocation_participants
         if rmw == "fastrtps":
             if self.scenario.ros2.discovery_server:
                 return self._spawn_fastdds_server(log_dir)
-            if buf > 0:
-                # profiles XML: a UDPv4-only transport with enlarged buffers.
-                # useBuiltinTransports=false keeps SHM off, same as the env route.
+            if buf > 0 or alloc > 0:
+                # profiles XML route: UDPv4-only transport (SHM off, same as the
+                # env route) + optional enlarged buffers + optional allocation
+                # preallocation. alloc>0 is the P1 hypothesis lever for the
+                # ~33-participant clique cap (docs/dds-topology-plan.md).
                 prof = self.out_dir / "fastdds_profiles.xml"
-                prof.write_text(_fastdds_profiles_xml(buf))
+                prof.write_text(_fastdds_profiles_xml(buf, alloc))
                 return self._spawn_routerless(
                     "rmw_fastrtps_cpp", log_dir,
                     lambda nid: {"FASTDDS_DEFAULT_PROFILES_FILE": str(prof)})
@@ -544,6 +597,7 @@ class ScenarioEngine:
             "min_host_mem_avail_bytes": min_avail,
             "peak_host_swap_used_bytes": peak_swap,
             "socket_buffer_bytes": self.scenario.ros2.socket_buffer_bytes,
+            "fastdds_allocation_participants": self.scenario.ros2.fastdds_allocation_participants,
             "agent_exit_codes": agent_exit,
         }, indent=2))
 

@@ -138,6 +138,13 @@ BESTSTACK: dict[str, dict] = {
 # ── Phase: ceiling — best config per RMW pushed past 96 ─────────────────────
 CEILING_N = [128, 192]
 
+# ── Phase: alloc — Fast DDS allocation-limit probe (docs/dds-topology-plan.md
+# P1). The ~33-participant clique cap is invariant to QoS/buffer/time/N; the
+# last config hypothesis is that discovery preallocation limits bind. fastrtps
+# only; Fast DDS is CV~0% so 2 reps suffice.
+ALLOC_SIZES = [0, 64, 128, 256]   # 0 = stock control (env route, no XML)
+ALLOC_REPS = 2
+
 
 async def _run_cell(n: int, rmw: str, label: str, overrides: dict,
                     out_root: Path, duration_s: float) -> dict:
@@ -239,6 +246,15 @@ async def run_phase(phase: str, out_root: Path, rmws: tuple[str, ...]) -> None:
                     label = f"n{n}__" + "_".join(
                         f"{k.split('_')[0]}={v}" for k, v in ov.items())
                     rows.append(await _run_cell(n, rmw, label, ov, out_root, 30.0))
+    elif phase == "alloc":
+        # allocation-limit probe: fastrtps only; a=0 is the stock control that
+        # takes the env-var route (no XML), a>0 preallocates discovery resources.
+        # 60s window (2× baseline) gives the rate law room to show a difference.
+        for a in ALLOC_SIZES:
+            ov = {} if a == 0 else {"fastdds_allocation_participants": a}
+            for r in range(1, ALLOC_REPS + 1):
+                rows.append(await _run_cell(
+                    96, "fastrtps", f"alloc{a}_r{r}", ov, out_root, 60.0))
     else:
         raise SystemExit(f"unknown phase {phase!r}")
     _write_summary(out_root, rows)
@@ -297,7 +313,7 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("phase", choices=["screen", "buffer", "window", "stagger",
                                       "replicate", "beststack", "ceiling",
-                                      "factorial", "report"])
+                                      "factorial", "alloc", "report"])
     ap.add_argument("path", nargs="?", help="for 'report': the phase dir to aggregate")
     ap.add_argument("--out", default="results/dds/qos",
                     help="root for phase output dirs")

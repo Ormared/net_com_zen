@@ -57,3 +57,53 @@ def test_kernel_buffer_apply_is_noop_when_zero():
     # restore), so a stock run never perturbs host kernel state.
     assert ScenarioEngine._apply_kernel_buffers(0) == {}
     ScenarioEngine._restore_kernel_buffers({})  # must not raise
+
+
+def test_fastdds_allocation_xml():
+    # allocation-only path (P1 lever): must carry the allocation block and
+    # maxInitialPeersRange, but NO buffer elements (the descriptor + builtin-
+    # transports=false still appear — SHM stays off even without buffer tuning).
+    xml_alloc = _fastdds_profiles_xml(0, 128)
+    assert "<allocation>" in xml_alloc
+    assert "<initial>128</initial>" in xml_alloc
+    assert "<maximum>128</maximum>" in xml_alloc
+    assert "<maxInitialPeersRange>128</maxInitialPeersRange>" in xml_alloc
+    assert "receiveBufferSize" not in xml_alloc
+    assert "<profiles>" in xml_alloc
+    assert "<useBuiltinTransports>false</useBuiltinTransports>" in xml_alloc
+
+    # buffer-only path (old call shape — positional args still work after the
+    # signature gained a default second param): must carry buffer elements, no
+    # allocation block.
+    xml_buf = _fastdds_profiles_xml(8 << 20, 0)
+    assert "<receiveBufferSize>8388608</receiveBufferSize>" in xml_buf
+    assert "<sendBufferSize>8388608</sendBufferSize>" in xml_buf
+    assert "<allocation>" not in xml_buf
+    assert "<profiles>" in xml_buf
+    assert "<useBuiltinTransports>false</useBuiltinTransports>" in xml_buf
+
+
+def test_fastdds_allocation_xml_order():
+    # Fast DDS 8.x XSD enforces element order inside <rtps> and
+    # <transport_descriptor>. Verify the generated string respects the required
+    # sequences: userTransports < useBuiltinTransports < allocation (in rtps),
+    # and maxInitialPeersRange appears before </transport_descriptor>.
+    xml = _fastdds_profiles_xml(4096, 64)
+    assert xml.index("userTransports") < xml.index("useBuiltinTransports")
+    assert xml.index("useBuiltinTransports") < xml.index("<allocation>")
+    assert xml.index("maxInitialPeersRange") < xml.index("</transport_descriptor>")
+
+
+def test_allocation_field_is_fastrtps_only():
+    # fastrtps accepts any non-negative value
+    c = Ros2WorkloadConfig(rmw="fastrtps", fastdds_allocation_participants=128)
+    assert c.fastdds_allocation_participants == 128
+    # cyclonedds must reject a non-zero value (no equivalent attribute)
+    with pytest.raises(ValidationError):
+        Ros2WorkloadConfig(rmw="cyclonedds", fastdds_allocation_participants=128)
+    # negative value must always fail regardless of rmw (ge=0 field constraint)
+    with pytest.raises(ValidationError):
+        Ros2WorkloadConfig(fastdds_allocation_participants=-1)
+    # zenoh at 0 (default) must be fine — the validator only fires when >0
+    c0 = Ros2WorkloadConfig(rmw="zenoh")
+    assert c0.fastdds_allocation_participants == 0

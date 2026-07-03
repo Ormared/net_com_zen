@@ -149,6 +149,16 @@ class Ros2WorkloadConfig(BaseModel):
     # Cyclone has no broker equivalent (its analog is unicast peers + buffers)
     # and zenoh is already router-brokered, so this flag is rejected for them.
     discovery_server: bool = False
+    # Fast DDS participant allocation preallocation (docs/dds-topology-plan.md
+    # P1). 0 = stock allocation defaults (Fast DDS chooses expansion-based limits
+    # at runtime); >0 preallocates the participant's discovery resource limits —
+    # total_participants, total_readers, total_writers, and maxInitialPeersRange
+    # — to this fixed capacity (initial=maximum=A, increment=0). The hypothesis
+    # is that the ~33-participant clique cap at N=96 is a default allocation
+    # ceiling binding under simultaneous-startup load; preallocating removes the
+    # need for runtime reallocation during discovery bursts. Fast DDS ONLY:
+    # cyclonedds and zenoh have no equivalent attribute.
+    fastdds_allocation_participants: int = Field(ge=0, default=0)
 
     @model_validator(mode="after")
     def _discovery_server_is_fastrtps_only(self):
@@ -156,6 +166,11 @@ class Ros2WorkloadConfig(BaseModel):
             raise ValueError(
                 f"discovery_server=True is Fast DDS only, not rmw={self.rmw!r} "
                 "(cyclonedds has no broker; zenoh is already router-brokered)")
+        if self.fastdds_allocation_participants > 0 and self.rmw != "fastrtps":
+            raise ValueError(
+                f"fastdds_allocation_participants={self.fastdds_allocation_participants}"
+                f" is Fast DDS only, not rmw={self.rmw!r} "
+                "(cyclonedds and zenoh have no equivalent allocation attribute)")
         return self
 
 
