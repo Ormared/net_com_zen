@@ -183,21 +183,32 @@ Two findings, one per N:
   ([dds-star.md](dds-star.md)): there the workload was O(N) too; here the
   star router carries an O(N²) workload.
 
-### 4. N=192: not re-run
+### 4. N=192: both zenoh graphs are dead — the funnel becomes a wall
 
-The zenoh N=192 cells stay unmeasured: the full-router-mesh outcome is a
-foregone conclusion (it collapses at 96 ×3 on this rig), and the previous
-N=192 attempt loaded the host to ~750 with RAM to 0.8 GB — that scale needs
-an explicit go-ahead per the standing rig constraint. The interesting
-outstanding cell if it's ever run is router-star/tree at 192, which probes
-how far the hub-funnel finding (#3) extends. Cyclone's N=192 mesh baseline
-(conn 0.47–0.62, deliv 0.2–0.3) stands from
-[dds-neighbor-table.md](dds-neighbor-table.md).
+Measured 2026-07-06 with a memory watchdog (`results/dds/heavy/`; the host
+never dropped below 22 GB available — the old ~750-load incident does not
+reproduce on the fixed engine):
+
+| graph | conn | delivery |
+|---|---|---|
+| full router mesh, r1 | **0.000** | 0.0 |
+| router star, r1/r2 | **0.003 / 0.001** | ~0.0 |
+
+The full mesh collapses exactly as at 96. The more interesting result is the
+star: at 96 it restored connectivity (0.95–0.99) and only throttled the data
+plane; at 192 the single hub router cannot even establish the graph (98 and
+24 of 36 672 pairs, p50 2–5 s for the trickle that exists). The hub-funnel
+finding (#3) extrapolates into a hard wall — **past ~96 all-to-all
+participants, a zenoh router tree is mandatory**, and a single-hub star is
+not a fallback. Cyclone's N=192 mesh baseline (conn 0.47–0.62, deliv
+0.2–0.3, [dds-neighbor-table.md](dds-neighbor-table.md)) remains the only
+configuration measured moving data at that scale on this host.
 
 ## Method notes (Part 1b)
 
-38 cells: {shared, star} × 3 RMWs × N ∈ {48, 96} (fastrtps ×2, others ×3)
-plus zenoh router-star × N ∈ {48, 96} ×3. 60 s window, 200 ms / 255 B
+41 cells: {shared, star} × 3 RMWs × N ∈ {48, 96} (fastrtps ×2, others ×3),
+zenoh router-star × N ∈ {48, 96} ×3, and zenoh N=192 (mesh ×1, router-star
+×2, memory-watchdogged). 60 s window, 200 ms / 255 B
 reliable telemetry, engine-managed neigh-table sizing, host ≥ 6 GB available
 throughout, load ≤ 110 (zenoh 48-router cells). Discovery here = max over
 nodes of (last first-recv from an audience peer − own start); a value of

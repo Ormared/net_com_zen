@@ -66,10 +66,10 @@ contract (≪ 1 s). Replicated ×3; single-run numbers are never trusted
 
 ## Residual gaps
 
-All P5 items are now measured except one:
-
-- **Zenoh at N=192** (full mesh confirmation + router-star/tree): heavy —
-  the previous attempt loaded the rig to ~750 with RAM at 0.8 GB, so it
-  stays behind an explicit user go-ahead. Low information value for the
-  full mesh (collapse at 96 ×3 makes 192 a foregone conclusion); the
-  router-tree question is the only genuinely open cell.
+None — every planned cell is measured. The zenoh N=192 close-out
+(2026-07-06, `results/dds/heavy/`): full router mesh collapses as at 96,
+and the single-hub router star ALSO fails to form a graph (conn ≤0.003) —
+the hub funnel becomes a hard wall past ~96 all-to-all participants. The
+one untested *design* (not cell) left on the table is a multi-router zenoh
+tree, which would need a new engine knob; nothing in the current scope
+requires it.
