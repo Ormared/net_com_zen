@@ -4,7 +4,15 @@
 //!
 //! M2 scope: group established once at startup, all state payloads encrypted
 //! as MLS application messages. Rekeys/committer failover come with M3/M4.
+//!
+//! Loss tolerance (EMANE spike follow-up, emane_spike/FINDINGS.md): every
+//! query carries a short explicit timeout — zenoh's session default is 10 s,
+//! so a single lost query or reply used to stall the handshake for that long
+//! and push weak-link nodes past the deadline. A failed attempt now costs at
+//! most QUERY_TIMEOUT plus a capped backoff gap, and the committer fetches all
+//! key packages concurrently so per-member losses overlap instead of adding up.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
@@ -15,7 +23,11 @@ use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
 use zenoh::Session;
 
 const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Per-query deadline: long enough for a TCP retransmit or two over a lossy
+/// emulated link, short enough that a dead attempt is cheap to abandon.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+const RETRY_GAP_MIN: Duration = Duration::from_millis(250);
+const RETRY_GAP_MAX: Duration = Duration::from_secs(1);
 
 pub struct MlsLayer {
     provider: OpenMlsRustCrypto,
@@ -67,21 +79,27 @@ fn new_identity(id: &str) -> Result<(OpenMlsRustCrypto, SignatureKeyPair, Creden
     Ok((provider, signer, cwk))
 }
 
-/// Poll a zenoh get() until a reply payload arrives or the deadline passes.
-async fn get_until(session: &Session, key: &str, deadline: tokio::time::Instant)
-                   -> Result<Vec<u8>> {
+/// Query `key` with short per-attempt timeouts until a reply payload arrives
+/// or the deadline passes. `queries` counts attempts (handshake diagnostics).
+async fn get_until(session: &Session, key: &str, deadline: tokio::time::Instant,
+                   queries: &AtomicU64) -> Result<Vec<u8>> {
+    let mut gap = RETRY_GAP_MIN;
     loop {
-        if tokio::time::Instant::now() >= deadline {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
             bail!("timeout querying {key}");
         }
-        if let Ok(replies) = session.get(key).await {
+        queries.fetch_add(1, Ordering::Relaxed);
+        if let Ok(replies) = session.get(key).timeout(QUERY_TIMEOUT.min(deadline - now)).await {
             while let Ok(reply) = replies.recv_async().await {
                 if let Ok(sample) = reply.result() {
                     return Ok(sample.payload().to_bytes().to_vec());
                 }
             }
         }
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        tokio::time::sleep(gap.min(remaining)).await;
+        gap = (gap * 2).min(RETRY_GAP_MAX);
     }
 }
 
@@ -100,16 +118,32 @@ async fn serve(session: &Session, key: String, bytes: Vec<u8>) -> Result<()> {
 }
 
 /// Establish the MLS group. Committer = lexicographically lowest member id.
-pub async fn setup(session: &Session, id: &str, members: &[String]) -> Result<MlsLayer> {
-    let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
+/// Returns the layer plus the number of zenoh queries issued (retries show up
+/// as counts > members-1, a direct read on how lossy the handshake was).
+pub async fn setup(session: &Session, id: &str, members: &[String],
+                   timeout: Duration) -> Result<(MlsLayer, u64)> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let queries = AtomicU64::new(0);
     let (provider, signer, cwk) = new_identity(id)?;
     let committer = members.iter().min().cloned().unwrap_or_default();
 
     if committer == id {
-        // collect everyone's key package, create group, serve the welcome
+        // collect everyone's key package (concurrently: weak-link members'
+        // retries overlap instead of serializing), create group, serve welcome
+        let fetched = futures::future::try_join_all(
+            members.iter().filter(|m| *m != id).map(|m| {
+                let key = format!("ncz/mls/kp/{m}");
+                let queries = &queries;
+                async move {
+                    get_until(session, &key, deadline, queries)
+                        .await
+                        .map(|bytes| (m, bytes))
+                }
+            }),
+        )
+        .await?;
         let mut key_packages = Vec::new();
-        for m in members.iter().filter(|m| *m != id) {
-            let bytes = get_until(session, &format!("ncz/mls/kp/{m}"), deadline).await?;
+        for (m, bytes) in fetched {
             let kp_in = KeyPackageIn::tls_deserialize_exact(&bytes)?;
             let kp = kp_in
                 .validate(provider.crypto(), ProtocolVersion::Mls10)
@@ -130,7 +164,7 @@ pub async fn setup(session: &Session, id: &str, members: &[String]) -> Result<Ml
             .map_err(|e| anyhow!("merge commit: {e}"))?;
         let welcome_bytes = welcome.tls_serialize_detached()?;
         serve(session, "ncz/mls/welcome".into(), welcome_bytes).await?;
-        Ok(MlsLayer { provider, signer, group })
+        Ok((MlsLayer { provider, signer, group }, queries.into_inner()))
     } else {
         // serve our key package, wait for the welcome, join
         let kp = KeyPackage::builder()
@@ -138,7 +172,7 @@ pub async fn setup(session: &Session, id: &str, members: &[String]) -> Result<Ml
             .map_err(|e| anyhow!("key package: {e}"))?;
         let kp_bytes = kp.key_package().tls_serialize_detached()?;
         serve(session, format!("ncz/mls/kp/{id}"), kp_bytes).await?;
-        let welcome_bytes = get_until(session, "ncz/mls/welcome", deadline).await?;
+        let welcome_bytes = get_until(session, "ncz/mls/welcome", deadline, &queries).await?;
         let msg = MlsMessageIn::tls_deserialize_exact(&welcome_bytes)?;
         let welcome = match msg.extract() {
             MlsMessageBodyIn::Welcome(w) => w,
@@ -152,6 +186,6 @@ pub async fn setup(session: &Session, id: &str, members: &[String]) -> Result<Ml
         let group = staged
             .into_group(&provider)
             .map_err(|e| anyhow!("join group: {e}"))?;
-        Ok(MlsLayer { provider, signer, group })
+        Ok((MlsLayer { provider, signer, group }, queries.into_inner()))
     }
 }

@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 automerge = "0.5"
+futures = "0.3"
 openmls = "0.7"
 openmls_basic_credential = "0.4"
 openmls_rust_crypto = "0.4"

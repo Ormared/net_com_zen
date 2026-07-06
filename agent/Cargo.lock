@@ -2045,6 +2045,7 @@ dependencies = [
  "anyhow",
  "automerge",
  "clap",
+ "futures",
  "openmls",
  "openmls_basic_credential",
  "openmls_rust_crypto",
