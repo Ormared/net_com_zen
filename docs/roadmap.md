@@ -1,3 +1,12 @@
+
+Candidates for the next item:
+1. Per-tick link-state logging — small engine addition that makes the new UI's map show the real jammer
+footprint/SINR (finishes the UI agent's request).
+2. Reactive jamming — a smarter adversary that senses transmissions and jams the active channel; tests the
+FHSS/FEC defenses against a harder threat.
+3. MLS handshake hardening — the EMANE-spike robustness finding; small, improves every run.
+
+
 # Roadmap
 
 | Milestone | Scope | Exit criteria |
@@ -13,6 +22,9 @@
 | **R1 — ROS 2 env** ✅ | ROS 2 Jazzy via RoboStack as opt-in pixi environment ([ADR-0006](adr/0006-ros2-isaac-integration.md), [plan](ros2-integration-plan.md)) | **DONE 2026-06-13:** pub/sub round-trip green on Fast DDS + rmw_zenoh in `pixi run -e ros2 ros2-smoke`; default env unaffected |
 | **R2 — RViz bridge** ✅ | Orchestrator publishes `/clock`, `/tf`, link/jammer markers; optional `--ros2-viz` | **DONE 2026-06-13:** live RViz view of `resilience_4node` on published sim time (links flip green→red at jammer start); root-free `viz-demo` task drives it without netns |
 | **R3 — ROS 2 in the loop** ✅ | ROS 2 nodes per netns; agent vs raw rmw_zenoh as A/B axis | **DONE 2026-06-13:** agent (udp+state, MLS on) beats stock ROS 2 (rmw_zenoh, default QoS) on update delivery (+20 % @45 dBm) and AoI (−22 %) at every power; ROS 2's higher frame PDR is TCP backing off — retransmission converts loss into staleness. See [results/ros2-vs-agent.md](results/ros2-vs-agent.md) |
+| **DDS / RMW scaling** ✅ | Fast DDS vs Cyclone vs Zenoh at swarm scale over a new kernel-`bridge` substrate, no EW vector ([plan](dds-benchmark-plan.md)) | **DONE 2026-06-27:** healthy through N=24, sharp knee at N=48, no usable mesh at N=96 — and host-pressure counters prove it's middleware discovery collapse, not rig saturation (29 GB free at N=96). Zenoh degrades most gracefully, Cyclone hardest. See [results/dds-rmw-scaling.md](results/dds-rmw-scaling.md) |
+| **DDS / RMW QoS plane** ✅ | Full QoS contract × transport buffer × startup timing sweep to find what reaches high participant counts; per-RMW characterization ([tuning](results/dds-rmw-tuning.md)) | **DONE 2026-06-28:** three different walls — Fast DDS hits a deterministic ~33-participant clique cap (CV 0 %, invariant to QoS/buffer/time/N across 48→192); Cyclone self-poisons (only **staggered joins** help, 2.5×); Zenoh has the highest mean reach but ±35 % run-to-run variance (router-mesh races, QoS effects are noise). Buffer/Discovery-Server/QoS-stacking all null. See [results/dds-rmw-qos-plane.md](results/dds-rmw-qos-plane.md) |
+| **DDS root cause + topology track** | Archetype plan ([dds-topology-plan.md](dds-topology-plan.md)): allocation probe, lan substrate, netem, shared/star/cluster topologies — and the rig root cause | **2026-07-03:** kernel `neigh.gc_thresh3=1024` (global across netns) was every prior "wall" — the ~33-clique cap, Cyclone's storm, the N=48 knee. Rig fixed in-engine; corrected baselines: all RMWs mesh 1.0 @48; Cyclone mesh 1.0 + 96 % delivery @96 (the real winner); Fast DDS data plane saturates @96; Zenoh full router mesh collapses (real wall — use star). See [results/dds-neighbor-table.md](results/dds-neighbor-table.md). Cross-host P3/P4 pending firewall openings |
 | **R4 — Isaac Sim 6 mobility** | `IsaacMobilityProvider`, lockstep stepping, orchestrator stays clock master | existing scenario end-to-end on Isaac mobility; comparison vs bicycle kinematics |
 | **M5+** | Reactive jamming, routing comparisons, frequency-band sweeps, Sionna RT pathloss backend | per-feature |
 
@@ -21,3 +33,4 @@ Testing discipline throughout: unit tests per module; the model validation suite
 results, rendered as a report — it is the artifact that makes benchmark results
 defensible. Integration smoke test runs in CI (requires CAP_NET_ADMIN; user-namespace
 or privileged runner).
+

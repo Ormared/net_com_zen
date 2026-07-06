@@ -12,6 +12,7 @@ pydantic = ">=2.7"
 pyyaml = ">=6"
 pytest = ">=8"
 pyarrow = ">=16"
+psutil = ">=5.9"  # per-PID + host CPU/mem sampling (bridge substrate, DDS benchmark)
 matplotlib = ">=3.8"
 pandas = ">=2.0"
 plotly = ">=5.20"
@@ -34,6 +35,9 @@ channels = ["robostack-jazzy"]
 python = "3.12.*"
 ros-jazzy-ros-base = "*"
 ros-jazzy-rmw-zenoh-cpp = "*"
+# DDS benchmark RMW axis (substrate=bridge): the two routerless DDS impls
+ros-jazzy-rmw-fastrtps-cpp = "*"
+ros-jazzy-rmw-cyclonedds-cpp = "*"
 ros-jazzy-demo-nodes-py = "*"
 ros-jazzy-rviz2 = "*"
 
