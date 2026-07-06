@@ -53,6 +53,11 @@ struct Args {
     /// Comma-separated ids of ALL group members (incl. self); required for MLS
     #[arg(long, value_delimiter = ',')]
     members: Vec<String>,
+    /// MLS handshake deadline in seconds. Raise for weak/lossy links: each
+    /// query attempt is cheap (short per-query timeout + backoff), so a bigger
+    /// budget buys more retries rather than longer stalls.
+    #[arg(long, default_value_t = 30.0)]
+    mls_timeout_s: f64,
     /// Disable MLS encryption (A/B benchmarking baseline)
     #[arg(long, default_value_t = false)]
     plaintext: bool,
@@ -180,11 +185,14 @@ async fn main() -> Result<()> {
             anyhow::bail!("--members required unless --plaintext");
         }
         let t0 = now_us();
-        let layer = mls::setup(&session, &args.id, &args.members).await?;
+        let (layer, queries) = mls::setup(
+            &session, &args.id, &args.members,
+            Duration::from_secs_f64(args.mls_timeout_s)).await?;
         metrics.log(serde_json::json!({
             "type": "mls_ready", "id": args.id, "ts_us": now_us(),
             "epoch": layer.epoch(), "handshake_ms": (now_us() - t0) / 1000,
-            "committer": args.members.iter().min() == Some(&args.id)
+            "committer": args.members.iter().min() == Some(&args.id),
+            "queries": queries
         }));
         Some(layer)
     };

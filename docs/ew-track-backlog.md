@@ -10,13 +10,18 @@ track** (the `substrate: channel` dataplane: `channel/forwarder.py`, `ew.py`,
 Spin these up only to keep the EW track warm while the DDS benchmark runs. Each
 touches a disjoint file set, so they merge cleanly alongside `dds-rmw-benchmark`.
 
-### MLS handshake hardening
+### MLS handshake hardening ✅
 - **Why:** EMANE spike found the OpenMLS queryable-based handshake is not
   loss-tolerant (~10× AoI inflation under EMANE loss; full fail on a weak
   foliage-edge link).
 - **Files:** `agent/src/` (Rust) only — fully isolated from the Python sim.
-- **Goal:** make group join/commit loss-tolerant (retry/timeout, or a
-  loss-tolerant handshake path). Re-run an EMANE cell to confirm.
+- **DONE (branch `mls-handshake-hardening`):** replaced zenoh's 10 s default
+  per-query timeout with an explicit 2 s timeout + exponential backoff (a lost
+  query now costs ~2 s, not 10 s), made the committer fetch all key packages
+  concurrently, and exposed a configurable `--mls-timeout-s` deadline (+ a
+  `queries` count in the `mls_ready` metric). The cheap-retry + generous-deadline
+  combination is what makes it loss-tolerant. See
+  [results/mls-handshake-hardening.md](results/mls-handshake-hardening.md).
 
 ### Weak-link propagation calibration
 - **Why:** EMANE was more pessimistic than the hand-rolled model on weak
