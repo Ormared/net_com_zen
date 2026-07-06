@@ -54,6 +54,35 @@ def test_build_table_directed_pairs():
     assert st.jam_inchannel_dbm is not None
 
 
+def test_build_table_reactive_hop_rate_lever():
+    # A reactive jammer between two close nodes lands dwells at a slow hop rate
+    # but not once the hop period drops below its sense+tune latency.
+    pl = CompositePathloss(Terrain(extent_m=(1000, 1000)))
+    jam = Jammer(JammerConfig(id="j", kind="reactive", position=(50, 0),
+                              tx_power_dbm=40, react_latency_s=0.002,
+                              detection_prob=1.0, sense_threshold_db=-10.0))
+    pos = {"a": (0, 0), "b": (100, 0)}
+    slow = RadioProfile(freq_hz=433e6, bandwidth_hz=250e3, tx_power_dbm=27,
+                        data_rate_bps=250e3, hop={"n_channels": 50, "hop_rate_hz": 100})
+    fast = RadioProfile(freq_hz=433e6, bandwidth_hz=250e3, tx_power_dbm=27,
+                        data_rate_bps=250e3, hop={"n_channels": 50, "hop_rate_hz": 500})
+    st_slow = build_table(pos, [jam], 0.0, slow, pl)[("a", "b")]
+    st_fast = build_table(pos, [jam], 0.0, fast, pl)[("a", "b")]
+    assert st_slow.rho == pytest.approx(0.8)   # catches 80% of a 10 ms dwell
+    assert st_fast.rho == pytest.approx(0.0)   # 2 ms dwell: tx hops away first
+
+
+def test_build_table_reactive_deaf_when_out_of_sensing_range():
+    # A follower that cannot hear the transmitter (source too far / weak) never
+    # locks on, even at a slow hop rate.
+    pl = CompositePathloss(Terrain(extent_m=(5000, 5000)))
+    jam = Jammer(JammerConfig(id="j", kind="reactive", position=(4000, 4000),
+                              tx_power_dbm=40, react_latency_s=0.001,
+                              detection_prob=1.0, sense_threshold_db=20.0))
+    table = build_table({"a": (0, 0), "b": (50, 0)}, [jam], 0.0, RADIO, pl)
+    assert table[("a", "b")].rho == 0.0
+
+
 def _empirical_delivery(st, n=4000):
     rng = link_rng(seed=7, src="a", dst="b")
     hits = sum(st.verdict(255, rng.random(), rng.random()) == "deliver"

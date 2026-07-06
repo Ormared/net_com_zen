@@ -102,7 +102,17 @@ def build_table(positions: dict[str, tuple[float, float]], jammers: list[Jammer]
             prx = radio.tx_power_dbm + 2 * radio.antenna_gain_dbi - bd.total_db
             rho, jam_dbm, impact = 0.0, None, 0.0
             for j in active:
-                r, frac = j.occupancy(radio.hop.n_channels, radio.bandwidth_hz)
+                r, frac = j.occupancy(radio.hop.n_channels, radio.bandwidth_hz,
+                                      hop_rate_hz=radio.hop.hop_rate_hz)
+                # a reactive follower must first hear the transmitter (src): if the
+                # source's signal at the jammer is below its sensing threshold it
+                # never locks on, so it cannot follow this link.
+                if j.cfg.kind == "reactive":
+                    sl = pathloss.loss(sp, j.position, radio.freq_hz)
+                    sense_sinr = (radio.tx_power_dbm + 2 * radio.antenna_gain_dbi
+                                  - sl.total_db) - n0
+                    if sense_sinr < j.cfg.sense_threshold_db:
+                        r = 0.0
                 jl = pathloss.loss(j.position, dp, radio.freq_hz)
                 p = j.tx_power_dbm - jl.total_db + 10 * math.log10(frac)
                 if r * dbm_to_mw(p) > impact:

@@ -58,13 +58,20 @@ class EnvironmentConfig(BaseModel):
 
 class JammerConfig(BaseModel):
     id: str
-    kind: Literal["barrage", "spot", "sweep"]
+    kind: Literal["barrage", "spot", "sweep", "reactive"]
     position: tuple[float, float]
     tx_power_dbm: float
     start_s: float = 0.0
     stop_s: float | None = None
     channels: list[int] = []          # spot: jammed hop-channel indices
     bandwidth_hz: float | None = None  # barrage: total jammed bandwidth
+    # reactive (follower) jammer: senses the active transmission and retunes to
+    # jam its channel. It only lands on a dwell if it can lock on before the
+    # transmitter hops away, so its effect is a per-dwell lock probability
+    # (models.md): detection_prob * max(0, (T_dwell - react_latency_s)/T_dwell).
+    react_latency_s: float | None = None  # sense + retune latency
+    detection_prob: float = Field(default=1.0, ge=0.0, le=1.0)  # sensing reliability
+    sense_threshold_db: float = 0.0       # min SINR at the jammer to detect a tx
 
     @model_validator(mode="after")
     def _kind_params(self):
@@ -72,6 +79,8 @@ class JammerConfig(BaseModel):
             raise ValueError("spot jammer requires channels")
         if self.kind == "barrage" and not self.bandwidth_hz:
             raise ValueError("barrage jammer requires bandwidth_hz")
+        if self.kind == "reactive" and self.react_latency_s is None:
+            raise ValueError("reactive jammer requires react_latency_s")
         return self
 
 

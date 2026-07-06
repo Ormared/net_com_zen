@@ -30,12 +30,14 @@ touches a disjoint file set, so they merge cleanly alongside `dds-rmw-benchmark`
 
 Resume only when returning to jamming-resilience experiments.
 
-### Reactive jamming
+### Reactive jamming ✅
 - **Why:** a smarter adversary that senses transmissions and jams the active
   channel — tests the FHSS/FEC defenses against a harder threat.
 - **Files:** `ew.py` (new `Jammer` kind) + `config.py` + a scenario.
-- **Sequencing:** after the channel-engine harness is current; benchmark the
-  resilient stack (and, if desired, the DDS stack) against it.
+- **DONE (branch `reactive-jamming`):** `kind: reactive` follower folded into the
+  per-dwell binomial model as a lock probability (no sub-tick stepping);
+  defence is a cliff at `T_dwell = τ`, FEC nearly irrelevant. Validated against a
+  time-domain dwell simulation. See [results/reactive-jamming.md](results/reactive-jamming.md).
 
 ### Per-tick link-state logging
 - **Why:** the viz agent's outstanding request — log per-tick link state so the

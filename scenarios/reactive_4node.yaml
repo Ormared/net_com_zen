@@ -1,0 +1,38 @@
+# Reactive-jamming scenario (M5): a follower jammer sits in the middle of the
+# swarm, senses the active transmission and retunes to jam its channel after a
+# sense+tune latency. Unlike the barrage/spot jammers, hop rate is a *direct*
+# defence here — hop faster than the jammer can lock on and it never lands a
+# dwell. Sweep axes: radio.hop.hop_rate_hz, jammers.0.react_latency_s,
+# radio.fec_fraction (see sweep_reactive_hoprate.yaml).
+name: reactive-4node
+duration_s: 40
+tick_hz: 10
+seed: 0  # overridden by the sweep
+radio:
+  freq_hz: 433.0e6
+  bandwidth_hz: 250.0e3
+  tx_power_dbm: 27.0
+  noise_figure_db: 7.0
+  data_rate_bps: 250.0e3
+  hop: {n_channels: 50, hop_rate_hz: 100.0}  # hop rate is the key sweep axis
+  fec_fraction: 0.0                           # sweep axis (0 = no FEC)
+nodes:
+  - {id: v1, waypoints: [[300, 400], [500, 400]], speed_mps: 3.0}
+  - {id: v2, waypoints: [[300, 500], [500, 500]], speed_mps: 3.0}
+  - {id: v3, waypoints: [[300, 600], [500, 600]], speed_mps: 3.0}
+  - {id: v4, waypoints: [[500, 500], [700, 500]], speed_mps: 3.0}
+environment:
+  extent_m: [1000, 1000]
+jammers:
+  - id: j1
+    kind: reactive
+    position: [500, 500]        # centre of the swarm: hears everyone, reaches everyone
+    tx_power_dbm: 40.0
+    react_latency_s: 0.002      # 2 ms sense + retune (sweep axis)
+    detection_prob: 0.95        # near-ideal sensing at close range
+    sense_threshold_db: -3.0    # min SINR at the jammer to detect a transmission
+    start_s: 15.0
+agent:
+  enabled: true
+  period_ms: 500
+  full_every: 10
