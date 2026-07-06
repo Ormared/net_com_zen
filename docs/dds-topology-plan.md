@@ -1,9 +1,11 @@
 # DDS Deployment Archetypes & Multi-Host Plan
 
-**Status:** scoped 2026-07-03; **P1–P4 complete 2026-07-04** — results in
+**Status:** scoped 2026-07-03; **P1–P5 complete 2026-07-06** — results in
 [results/dds-lan.md](results/dds-lan.md) (P3), [results/dds-star.md](results/dds-star.md)
-(P4), and the final [recommendation table](results/dds-recommendations.md).
-P5's netem/topology re-measures remain optional. Follows the QoS-plane study
+(P4), [results/dds-topology.md](results/dds-topology.md) Part 1b +
+[results/dds-netem.md](results/dds-netem.md) (P5), and the final
+[recommendation table](results/dds-recommendations.md). The only unmeasured
+cell is zenoh N=192 (heavy; user-gated). Follows the QoS-plane study
 ([results/dds-rmw-qos-plane.md](results/dds-rmw-qos-plane.md)).
 **Branch:** `dds-rmw-benchmark` (continues).
 **Execution model:** architect (Claude, this doc + reviews) + implementer

@@ -50,7 +50,8 @@ def _cluster_of(idx: int, n: int, k: int) -> int:
     return idx * k // n
 
 
-def _cyclonedds_xml(socket_buffer_bytes: int = 0, iface_name: str = "") -> str:
+def _cyclonedds_xml(socket_buffer_bytes: int = 0, iface_name: str = "",
+                    internal: dict[str, str] | None = None) -> str:
     """Cyclone DDS config for the bridge or lan substrate: SHM/Iceoryx off
     (force real UDP, no same-host shortcut) and multicast on so native
     discovery floods across the bridge. Domain id="any" applies under any
@@ -65,8 +66,18 @@ def _cyclonedds_xml(socket_buffer_bytes: int = 0, iface_name: str = "") -> str:
     interface it discovers; an unreachable locator causes silent discovery
     failure at swarm scale.  When empty, autodetermine picks the single non-lo
     interface in each netns (bridge substrate behaviour, unchanged)."""
-    buf = (f'    <Internal><SocketReceiveBufferSize min="{socket_buffer_bytes} B"/>'
-           f'</Internal>\n' if socket_buffer_bytes > 0 else "")
+    # One combined <Internal> block: the socket-buffer lever plus any extra
+    # tuning elements from ros2.cyclonedds_internal (P5 lossy-link knobs, e.g.
+    # NackDelay / RetransmitMerging). Keys are validated in config.py to be
+    # bare element names, so rendering them verbatim cannot break the XML.
+    internal_elems = ""
+    if socket_buffer_bytes > 0:
+        internal_elems += (f'      <SocketReceiveBufferSize '
+                           f'min="{socket_buffer_bytes} B"/>\n')
+    for key, value in (internal or {}).items():
+        internal_elems += f'      <{key}>{value}</{key}>\n'
+    buf = (f'    <Internal>\n{internal_elems}    </Internal>\n'
+           if internal_elems else "")
     # Interface element: explicit NIC name when pinning is requested, otherwise
     # autodetermine (safe in netns where the only non-lo interface is the veth).
     if iface_name:
@@ -400,7 +411,8 @@ class ScenarioEngine:
                 lambda nid: {"FASTDDS_BUILTIN_TRANSPORTS": "UDPv4"})
         if rmw == "cyclonedds":
             xml = self.out_dir / "cyclonedds.xml"
-            xml.write_text(_cyclonedds_xml(buf))
+            xml.write_text(_cyclonedds_xml(
+                buf, internal=self.scenario.ros2.cyclonedds_internal))
             return self._spawn_routerless(
                 "rmw_cyclonedds_cpp", log_dir,
                 lambda nid: {"CYCLONEDDS_URI": f"file://{xml}"})
@@ -505,9 +517,17 @@ class ScenarioEngine:
         for i, nid in enumerate(nodes):
             listen = (f'listen/endpoints=["tcp/{self.topo.addrs[nid]}:{cfg.port}",'
                       f'"tcp/127.0.0.1:{cfg.port}"]')
-            # lower-index mesh: exactly one router-router TCP link per pair
-            connect = [f'"tcp/{self.topo.addrs[p]}:{cfg.port}"'
-                       for p in nodes[:i]]
+            if cfg.zenoh_router_topology == "star":
+                # star: every router dials only the first node's router
+                # (N-1 links total). The full mesh's N(N-1)/2 links overload
+                # zenoh's own control plane at N>=96 (dds-neighbor-table.md);
+                # this is the P5 lever that collapses the router graph to O(N).
+                connect = ([f'"tcp/{self.topo.addrs[nodes[0]]}:{cfg.port}"']
+                           if i > 0 else [])
+            else:
+                # lower-index mesh: exactly one router-router TCP link per pair
+                connect = [f'"tcp/{self.topo.addrs[p]}:{cfg.port}"'
+                           for p in nodes[:i]]
             override = listen + (f';connect/endpoints=[{",".join(connect)}]'
                                  if connect else '')
             self._routers[nid] = subprocess.Popen(
@@ -739,6 +759,10 @@ class ScenarioEngine:
             # topology determines the pair-count denominator for report.py:
             # mesh N(N-1); star 2(N-1); shared N(N-1) logical but O(N) SEDP endpoints
             "topology": self.scenario.ros2.topology,
+            # zenoh router graph shape (mesh = full lower-index mesh); records
+            # the P5 lever so a star-router run can't be mistaken for a mesh one
+            "zenoh_router_topology": self.scenario.ros2.zenoh_router_topology,
+            "cyclonedds_internal": self.scenario.ros2.cyclonedds_internal,
             "resource_samples": len(samples),
             "peak_host_mem_used_bytes": peak_mem,
             "min_host_mem_avail_bytes": min_avail,
@@ -1246,7 +1270,9 @@ class ScenarioEngine:
                     # iface_name pins Cyclone to the correct NIC; without it,
                     # Cyclone announces locators on every interface (including
                     # zerotier and tailscale) which breaks cross-host discovery.
-                    xml_content = _cyclonedds_xml(0, iface_name=h.iface)
+                    xml_content = _cyclonedds_xml(
+                        0, iface_name=h.iface,
+                        internal=self.scenario.ros2.cyclonedds_internal)
                     if h.ssh == "":
                         xml_path = out_dir / f"cyclonedds_{name}.xml"
                         xml_path.write_text(xml_content)

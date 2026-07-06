@@ -7,6 +7,10 @@
 > Still valid: zenoh's star results (94/94 at N=48) and the star/shared
 > harness itself. Fast DDS/Cyclone topology numbers must be re-measured on
 > the fixed rig.
+>
+> **The re-measure (2026-07-06) is Part 1b at the bottom of this file** —
+> read that, not the tables below. Every conclusion drawn from the old
+> numbers is superseded there.
 
 **Date:** 2026-07-03 · **Branch:** `dds-rmw-benchmark` · **Plan:** [dds-topology-plan.md](../dds-topology-plan.md) (P4/P5)
 **Raw:** `results/dds/topo/*` (gitignored). 32 cells: {shared, star} × {fastrtps, cyclonedds, zenoh} × N ∈ {48, 96}, 60 s, reps 2 (fastrtps, CV≈0) / 3 (cyclone, zenoh).
@@ -100,3 +104,101 @@ Star probes at N=4 validated the harness (exactly 2(N−1)=6 pairs, self-drop on
 shared verified). All 32 cells exited clean; host never saturated (≥10 GB
 free). Windows: 60 s here vs 30 s in the baselines — irrelevant for Fast DDS
 (frozen ≤3 s), flattering for Cyclone, neutral for Zenoh (plateaus).
+
+---
+
+# Part 1b: the re-measure on the fixed rig (2026-07-06)
+
+**Supersedes every table above.** Same harness, same 60 s window, but with
+the kernel neighbor table sized to the swarm (in-engine since `862fa5e`).
+Raw: `results/dds/topo2/` (32 cells), `results/dds/rstar/`,
+`results/dds/heavy/` (gitignored). Metrics recomputed with one function over
+new cells AND the mesh baselines (`results/dds/rebaseline/`), so every number
+in this section is same-formula: **conn** = connected audience pairs / topology
+audience (mesh N(N−1), star 2(N−1)); **deliv** = received / published-to-audience.
+Reps: fastrtps ×2, cyclone/zenoh ×3 (ranges shown when they matter).
+
+## Results (conn / deliv)
+
+| topology | N | Fast DDS | Cyclone | Zenoh (full router mesh) |
+|---|---|---|---|---|
+| mesh (baseline) | 48 | 1.0 / 0.993 | 1.0 / 0.99 | 1.0 / 0.67 |
+| mesh (baseline) | 96 | 0.99 / **0.32** | 1.0 / 0.96 | **0.0 / 0.0** ×3 |
+| shared | 48 | 1.0 / 0.995 | 1.0 / 0.99 | 1.0 / 0.65–0.67 |
+| shared | 96 | 1.0 / **0.05** | 1.0 / 0.84–0.89 | **0.0 / 0.0** ×3 |
+| star | 48 | 1.0 / 0.99 | 1.0 / 0.99 | 1.0 / 0.62–0.73 |
+| star | 96 | **1.0 / 0.94–0.96** | **1.0 / 0.95–0.97** | **0.0 / 0.0** ×3 |
+
+### 1. Discovery is a solved problem on the fixed rig — topology moves the DATA plane
+
+Connectivity is 1.0 in every DDS cell at every N and every topology (the old
+"SPDP cap" and "discovery lottery" readings were pure neighbor-table
+artifact). What topology moves is delivery under fan-in:
+
+- **Star gives Fast DDS its N=96 back without touching a buffer**: stock
+  socket buffers, deliv 0.94–0.96 and p99 ~50 ms at 96 (vs mesh's 0.32 /
+  p50 0.7 s). The mesh problem was 95 reliable writers fanning into each
+  node's default-size UDP socket; the star's hub-and-spoke endpoint graph
+  caps fan-in at O(1) per spoke. Same fix as the 64 MB buffer
+  (dds-neighbor-table.md), achieved architecturally.
+- **Shared ONE topic is the anti-pattern for Fast DDS**: deliv 0.05 at N=96 —
+  *worse than mesh*. A single topic still builds the N×N writer↔reader matrix
+  but now every sample contends on one topic's history and heartbeat stream.
+- **Cyclone barely cares** (0.84–0.97 everywhere at 96, conn 1.0 ×3): its
+  internal pacing absorbs any of the three shapes. Star is its best shape
+  too (0.95–0.97, p50 0.5 ms).
+
+### 2. Zenoh's collapse at 96 is the ROUTER graph, not the endpoint graph
+
+Workload topology is irrelevant for zenoh: shared and star at N=96 collapse
+to zero exactly like mesh (all ×3, same "Closing transport" signature), while
+every N=48 variant sits at its usual deliv ~0.7 regardless of shape. The
+router full mesh (N(N−1)/2 TCP links + control state) is the wall.
+
+### 3. The zenoh router-STAR graph, measured (new `zenoh_router_topology` knob)
+
+The old "fix is star/tree routers" claim was inferred from N=48; now it's
+measured (`results/dds/rstar/`: all-to-all workload, every router connects
+only to d1's router — N−1 TCP links instead of N(N−1)/2):
+
+| N | full router mesh | router star |
+|---|---|---|
+| 48 | conn 1.0, deliv 0.67, p99 1.7 s | conn 1.0, **deliv 0.98**, p99 0.4–0.8 s |
+| 96 | **0.0 ×3 (collapse)** | conn 0.95–0.99, **deliv 0.08–0.13**, p50 8–26 s |
+
+Two findings, one per N:
+
+- **The router mesh was throttling zenoh everywhere, not just at the
+  collapse point.** At N=48 the star graph raises delivery 0.67 → 0.98 and
+  cuts p99 by 2–4× — zenoh's stable-but-mediocre delivery plateau was
+  control-plane overhead all along, and its "real" data plane is competitive
+  with the DDS impls once the graph is thin.
+- **Star un-collapses N=96 but trades the wall for a funnel.** No more
+  "Closing transport" (all 96 routers + agents exit clean, connectivity
+  0.95–0.99), but one hub router now carries all 9 120 all-to-all flows:
+  delivery ~0.1 with tens-of-seconds latency. The honest conclusion for
+  all-to-all zenoh at 96 on one host is a router **tree** (unmeasured) —
+  a single-hub star is not enough. Note the contrast with the cross-host
+  archetypes, where the star carried zenoh to 96 *spokes* easily
+  ([dds-star.md](dds-star.md)): there the workload was O(N) too; here the
+  star router carries an O(N²) workload.
+
+### 4. N=192: not re-run
+
+The zenoh N=192 cells stay unmeasured: the full-router-mesh outcome is a
+foregone conclusion (it collapses at 96 ×3 on this rig), and the previous
+N=192 attempt loaded the host to ~750 with RAM to 0.8 GB — that scale needs
+an explicit go-ahead per the standing rig constraint. The interesting
+outstanding cell if it's ever run is router-star/tree at 192, which probes
+how far the hub-funnel finding (#3) extends. Cyclone's N=192 mesh baseline
+(conn 0.47–0.62, deliv 0.2–0.3) stands from
+[dds-neighbor-table.md](dds-neighbor-table.md).
+
+## Method notes (Part 1b)
+
+38 cells: {shared, star} × 3 RMWs × N ∈ {48, 96} (fastrtps ×2, others ×3)
+plus zenoh router-star × N ∈ {48, 96} ×3. 60 s window, 200 ms / 255 B
+reliable telemetry, engine-managed neigh-table sizing, host ≥ 6 GB available
+throughout, load ≤ 110 (zenoh 48-router cells). Discovery here = max over
+nodes of (last first-recv from an audience peer − own start); a value of
+~60 s means some pair only completed at window end.

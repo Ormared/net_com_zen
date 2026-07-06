@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Literal
 
@@ -186,6 +187,22 @@ class Ros2WorkloadConfig(BaseModel):
     # discovered peers and the metric of interest is intra-cluster mesh
     # completeness, not cross-cluster connectivity.
     cluster_domains: int = Field(ge=0, le=32, default=0)
+    # Zenoh ROUTER graph topology (docs/dds-topology-plan.md P5). Distinct from
+    # `topology` above, which shapes the ROS endpoint graph: zenoh connectivity
+    # rides its router links, and the full lower-index router mesh (N(N-1)/2 TCP
+    # links) overloads zenoh's own control plane at N=96 on the bridge
+    # ("Unable to push non droppable network message ... Closing transport!",
+    # dds-neighbor-table.md). star = every router connects only to the first
+    # node's router (N-1 links) — the hypothesized fix, measured in P5.
+    # zenoh + bridge only: fastrtps/cyclonedds have no routers, and the lan
+    # substrate already runs one router per HOST (its graph is per-host).
+    zenoh_router_topology: Literal["mesh", "star"] = "mesh"
+    # Extra CycloneDDS <Internal> tuning elements (docs/dds-topology-plan.md
+    # P5: retransmit/pacing behaviour on lossy links — e.g. NackDelay,
+    # RetransmitMerging, MaxQueuedRexmitBytes). Rendered verbatim as
+    # <Key>value</Key> inside <Internal>; keys are restricted to bare element
+    # names so a config value can't inject XML structure. cyclonedds only.
+    cyclonedds_internal: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _discovery_server_is_fastrtps_only(self):
@@ -198,6 +215,19 @@ class Ros2WorkloadConfig(BaseModel):
                 f"fastdds_allocation_participants={self.fastdds_allocation_participants}"
                 f" is Fast DDS only, not rmw={self.rmw!r} "
                 "(cyclonedds and zenoh have no equivalent allocation attribute)")
+        if self.zenoh_router_topology != "mesh" and self.rmw != "zenoh":
+            raise ValueError(
+                f"zenoh_router_topology={self.zenoh_router_topology!r} is zenoh "
+                f"only, not rmw={self.rmw!r} (fastrtps/cyclonedds are routerless)")
+        if self.cyclonedds_internal and self.rmw != "cyclonedds":
+            raise ValueError(
+                f"cyclonedds_internal={sorted(self.cyclonedds_internal)} is "
+                f"CycloneDDS only, not rmw={self.rmw!r}")
+        for k in self.cyclonedds_internal:
+            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", k):
+                raise ValueError(
+                    f"cyclonedds_internal key {k!r} is not a bare XML element "
+                    "name ([A-Za-z][A-Za-z0-9]*)")
         return self
 
 
@@ -410,6 +440,21 @@ class Scenario(BaseModel):
                 "netem.jitter_ms requires netem.delay_ms > 0 "
                 "(tc netem: jitter is a perturbation on top of a base delay; "
                 "setting jitter without delay is a tc error)")
+        return self
+
+    @model_validator(mode="after")
+    def _zenoh_router_star_requires_bridge(self):
+        """zenoh_router_topology='star' rewires the per-netns router graph,
+        which only exists on the bridge substrate. channel pre-wires the same
+        per-netns mesh but its RF model is the object under test there; lan
+        runs ONE router per host (the graph is per-host, not per-node)."""
+        if (self.workload == "ros2"
+                and self.ros2.zenoh_router_topology != "mesh"
+                and self.substrate != "bridge"):
+            raise ValueError(
+                f"zenoh_router_topology="
+                f"{self.ros2.zenoh_router_topology!r} requires "
+                f"substrate='bridge'; got substrate={self.substrate!r}")
         return self
 
     @model_validator(mode="after")
