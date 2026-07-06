@@ -73,6 +73,31 @@ Friendly same-dwell collisions between own nodes are folded into the same model
 (uniform random hop sequences, ≤ 5 nodes ⇒ rare); contention-MAC effects are out of
 scope and documented as a known fidelity limit.
 
+**Reactive (follower) jammer.** A reactive jammer senses the active transmission
+and retunes onto its channel, so it is always on the *right* channel when it
+locks — but it only affects a dwell if it can lock on before the transmitter
+hops away. Rather than simulate sub-dwell timing tick-by-tick (the channel
+engine ticks far coarser than a 1 ms dwell), the timing race collapses to a
+per-dwell **lock probability** that plugs into the same `ρ_eff`:
+
+- `ρ_eff = detection_prob · f_overlap`, where the sensed exposure fraction of a
+  dwell after the jammer's sense+tune latency `τ` is
+  `f_overlap = max(0, (T_dwell − τ) / T_dwell)`, `T_dwell = 1 / hop_rate`.
+- When `T_dwell ≤ τ` the transmitter has hopped away before the jammer locks:
+  `f_overlap = 0`, so a fast enough hopper defeats the follower outright — no FEC
+  needed. This is the *opposite* lever from partial-band jamming, where hop rate
+  only helps once FEC is present.
+- The jammer must first hear the transmitter: `build_table` gates the lock on the
+  source's SINR at the jammer exceeding `sense_threshold_db` (position-aware on
+  both ends — must hear the source, must reach the destination). `detection_prob`
+  caps sensing reliability at that range; a full energy-detector PHY is future work.
+
+The lock probability then feeds the identical binomial-CDF survival model, so FEC
+and the reactive jammer compose the same way partial-band jamming does. Validated
+against a direct time-domain dwell simulation in
+[validation/test_reactive_jammer.py](../validation/test_reactive_jammer.py); see
+[results/reactive-jamming.md](results/reactive-jamming.md).
+
 Validated against closed-form binomial expectations and direct dwell-erasure
 Monte-Carlo (with and without FEC).
 

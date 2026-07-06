@@ -1,0 +1,15 @@
+# Does the FEC-flip fast-hop recommendation survive a *reactive* jammer?
+# Against partial-band jamming, fast hopping + FEC wins by spreading a fixed
+# jammed fraction across many dwells (see results/fec-flips-hop-rate.md). A
+# follower jammer is a harder threat: it chases the active channel. This sweep
+# asks whether hop rate is still the lever — and whether FEC is even needed once
+# the hop period drops below the jammer's sense+tune latency.
+#
+# 3 hop rates x 2 sense+tune latencies x 2 FEC settings x 2 seeds x 40 s
+# ~ 16 min.
+base: reactive_4node.yaml
+axes:
+  radio.hop.hop_rate_hz: [100.0, 500.0, 1000.0]
+  jammers.0.react_latency_s: [0.001, 0.005]
+  radio.fec_fraction: [0.0, 0.25]
+seeds: [1, 2]
