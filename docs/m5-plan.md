@@ -7,8 +7,8 @@ one leans on.
 
 | Phase | Feature | Layer | Effort | Why this order |
 |---|---|---|---|---|
-| **M5.1** | Frequency-band sweeps | harness + results | days | Cheapest; the model already scales with `freq_hz`. Settles "does carrier matter" — an input both routing (link ranges) and Sionna (band-dependent RT) build on. |
-| **M5.2** | Routing comparison layer | Python sim (`routing.py`) | 1–2 wk | Biggest resilience-story payoff (multi-hop is the classic anti-jam answer). Self-contained model-level comparison, no new infra. |
+| **M5.1** ✅ | Frequency-band sweeps | harness + results | days | **DONE 2026-07-07:** carrier trades foliage margin for spectral agility; 915 MHz is the sweet spot; at 2.4/5.8 GHz the MLS group never forms — the band choice is a security outage before it is packet loss. See [results/freq-band-sweep.md](results/freq-band-sweep.md) |
+| **M5.2** ✅ | Routing comparison layer | Python sim (`routing.py`) | 1–2 wk | **DONE 2026-07-07** (branch `m5-routing`): routing doubles quiet delivery on spread geometry and holds the physics ceiling under moderate jamming; linkstate ≈ flood at 14–19 % less cost, gossip dominated — worth a real agent implementation. See [results/routing-comparison.md](results/routing-comparison.md) |
 | **M5.3** | Sionna RT pathloss backend | heavy pixi env + precompute | 2 wk + GPU | Fidelity upgrade behind the existing `PathlossProvider` interface. Mirrors the Isaac pattern (heavy env, offline precompute, cheap runtime lookup). Do last — most infra, least new *science* per hour. |
 
 Guiding principle (same as the whole project): these are **model comparisons that
