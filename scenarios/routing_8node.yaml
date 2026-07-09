@@ -14,15 +14,19 @@ radio:
   noise_figure_db: 7.0
   data_rate_bps: 250.0e3
   hop: {n_channels: 50, hop_rate_hz: 100.0}
+# speed 0.01: a single-waypoint vehicle at the default 5 m/s limit-cycles
+# ~10 m around its point (turning circle); near-zero speed pins it truly static
+# speed 0.01: a single-waypoint vehicle at the default 5 m/s limit-cycles
+# ~10 m around its point (turning circle); near-zero speed pins it static
 nodes:
-  - {id: v1, waypoints: [[150, 300]]}
-  - {id: v2, waypoints: [[600, 300]]}
-  - {id: v3, waypoints: [[1050, 300]]}
-  - {id: v4, waypoints: [[1500, 300]]}
-  - {id: v5, waypoints: [[150, 750]]}
-  - {id: v6, waypoints: [[600, 750]]}
-  - {id: v7, waypoints: [[1050, 750]]}
-  - {id: v8, waypoints: [[1500, 750]]}
+  - {id: v1, waypoints: [[150, 300]], speed_mps: 0.01}
+  - {id: v2, waypoints: [[600, 300]], speed_mps: 0.01}
+  - {id: v3, waypoints: [[1050, 300]], speed_mps: 0.01}
+  - {id: v4, waypoints: [[1500, 300]], speed_mps: 0.01}
+  - {id: v5, waypoints: [[150, 750]], speed_mps: 0.01}
+  - {id: v6, waypoints: [[600, 750]], speed_mps: 0.01}
+  - {id: v7, waypoints: [[1050, 750]], speed_mps: 0.01}
+  - {id: v8, waypoints: [[1500, 750]], speed_mps: 0.01}
 environment:
   extent_m: [2000, 1200]
 jammers:
