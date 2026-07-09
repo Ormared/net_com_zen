@@ -41,7 +41,14 @@ class Jammer:
             in_band = {ch for ch in c.channels if 0 <= ch < n_channels}
             return len(in_band) / n_channels, 1.0 / max(len(c.channels), 1)
         if c.kind == "barrage":
-            return 1.0, min(1.0, channel_bw_hz / c.bandwidth_hz)
+            # geometric overlap with the hop span: a jammer narrower than the
+            # span only covers bandwidth_hz / span of the dwells (M5.1 — at a
+            # fixed fractional bandwidth the span grows with the carrier, so a
+            # fixed-width barrage covers ever less of it). Every existing
+            # scenario had bandwidth_hz == span, where this reduces to 1.0.
+            span_hz = n_channels * channel_bw_hz
+            rho = min(1.0, c.bandwidth_hz / span_hz)
+            return rho, min(1.0, channel_bw_hz / c.bandwidth_hz)
         if c.kind == "reactive":
             if hop_rate_hz is None:
                 raise ValueError("reactive occupancy needs hop_rate_hz")

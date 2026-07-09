@@ -1,0 +1,10 @@
+# M5.1 V1 — isolate PROPAGATION: sweep the carrier holding channelization
+# absolutely fixed (50 x 250 kHz = 12.5 MHz span at every band). The 12.5 MHz
+# barrage always covers the whole span (rho = 1), so postjam differences are
+# pure link-budget asymmetry: signal vs jammer, both foliage-attenuated more
+# at higher carriers (Weissberger ~ f^0.284), two-ray flattening the rest.
+# 5 bands x 3 seeds x 60 s ~ 20 min.
+base: freq_band_4node.yaml
+axes:
+  radio.freq_hz: [150.0e+6, 433.0e+6, 915.0e+6, 2.4e+9, 5.8e+9]
+seeds: [1, 2, 3]

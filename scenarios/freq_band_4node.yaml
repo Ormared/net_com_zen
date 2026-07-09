@@ -1,0 +1,40 @@
+# M5.1 base: resilience_4node geometry with a fixed-width barrage jammer whose
+# 12.5 MHz no longer necessarily covers the hop span — the point of the band
+# sweep. Carrier (and, in V2, n_channels) are overridden by the sweep files.
+#
+# Held fixed across bands (stated caveat, m5-plan.md): antenna GAIN (dBi), tx
+# power (EIRP), noise figure, per-channel bandwidth + data rate. We compare
+# propagation + channelization at equal link budget, not front-end physics.
+name: freq-band-4node
+duration_s: 60
+tick_hz: 10
+seed: 0  # overridden by the sweep
+radio:
+  freq_hz: 433.0e6       # sweep axis (V1) / zip axis (V2)
+  bandwidth_hz: 250.0e3
+  tx_power_dbm: 27.0
+  noise_figure_db: 7.0
+  data_rate_bps: 250.0e3
+  hop: {n_channels: 50, hop_rate_hz: 100.0}  # n_channels zip axis in V2
+nodes:
+  - {id: v1, waypoints: [[150, 300], [400, 300]], speed_mps: 3.0}
+  - {id: v2, waypoints: [[150, 500], [400, 500]], speed_mps: 3.0}
+  - {id: v3, waypoints: [[150, 700], [400, 700]], speed_mps: 3.0}
+  - {id: v4, waypoints: [[600, 500], [850, 500]], speed_mps: 3.0}  # beyond the forest
+environment:
+  extent_m: [1000, 1000]
+  foliage:
+    - {x_min: 450, x_max: 550, y_min: 0, y_max: 1000}  # 100 m forest strip
+jammers:
+  - id: j1
+    kind: barrage
+    position: [500, 900]     # inside the forest strip: its emissions are
+                             # foliage-attenuated more at higher carriers
+    tx_power_dbm: 50.0
+    bandwidth_hz: 12.5e6     # fixed width: covers the whole 433 MHz span,
+                             # ~7.5% of the 5.8 GHz V2 span
+    start_s: 20.0            # prejam/postjam split = quiet vs jammed regime
+agent:
+  enabled: true
+  period_ms: 500
+  full_every: 10

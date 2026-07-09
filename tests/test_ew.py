@@ -34,6 +34,22 @@ def test_barrage_occupancy():
     assert frac == pytest.approx(250e3 / 12.5e6)  # in-channel share of psd
 
 
+def test_barrage_partial_span_overlap():
+    # M5.1: hop span wider than the jammer -> geometric-overlap rho < 1.
+    # 670 x 250 kHz = 167.5 MHz span vs a 12.5 MHz barrage.
+    j = mk("barrage", bandwidth_hz=12.5e6)
+    rho, frac = j.occupancy(n_channels=670, channel_bw_hz=250e3)
+    assert rho == pytest.approx(12.5e6 / 167.5e6)
+    assert frac == pytest.approx(250e3 / 12.5e6)  # psd share unchanged
+
+
+def test_barrage_wider_than_span_clamps():
+    # jammer wider than the whole span still hits every dwell (rho = 1)
+    j = mk("barrage", bandwidth_hz=12.5e6)
+    rho, _ = j.occupancy(n_channels=17, channel_bw_hz=250e3)  # 4.25 MHz span
+    assert rho == 1.0
+
+
 def test_sweep_occupancy():
     j = mk("sweep")
     rho, frac = j.occupancy(n_channels=50, channel_bw_hz=250e3)
