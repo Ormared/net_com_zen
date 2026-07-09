@@ -44,8 +44,14 @@ Hopping is modeled statistically per packet rather than by simulating individual
 dwells (a packet may span one dwell at slow hop rates or many at fast ones — the
 model covers both):
 
-- N hop channels, jammer covers a subset J (spot/sweep) or all with reduced spectral
-  density (barrage). Overlap fraction `ρ = |J ∩ hopset| / N`.
+- N hop channels, jammer covers a subset J (spot/sweep) or a contiguous band with
+  reduced spectral density (barrage). Overlap fraction `ρ = |J ∩ hopset| / N`; for
+  a barrage of bandwidth `B_j` over a hop span `N·B_ch` this is the geometric
+  overlap `ρ = min(1, B_j / (N·B_ch))` — a jammer narrower than the span misses
+  the dwells outside its band (M5.1: at fixed fractional bandwidth the span grows
+  with the carrier, so a fixed-width barrage covers ever less of it). In-channel
+  power is unchanged (`B_ch / B_j` of the jammer's power): widening the hop span
+  dilutes *coverage*, not the power density inside covered channels.
 - A packet of duration `T_pkt` spans `k = ceil(T_pkt / T_dwell)` dwells.
 - A dwell is "hit" if the jammer's in-channel power drives SINR below the waterfall
   threshold for that dwell.
