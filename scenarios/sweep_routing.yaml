@@ -1,0 +1,16 @@
+# M5.2 — routing policies vs jammer power on the 8-node grid.
+# The jammer sits near the bottom row: as power rises it first deafens the
+# bottom-middle relays (top-row detours still work — routing's regime), then
+# the top row too (a physically cut network — nothing helps). Policies are
+# evaluated on paired channel realizations per cell (netcom_zen.routing).
+# Root-free:
+#   pixi run python -m netcom_zen.routing scenarios/sweep_routing.yaml -o results/routing
+base: routing_8node.yaml
+axes:
+  jammers.0.tx_power_dbm: [0.0, 10.0, 15.0, 20.0, 25.0, 35.0]
+  # link margin = effective swarm spread: at 15 dBm the grid is densely
+  # connected (routing has little to add); at 5 dBm even neighbours are the
+  # only links and every far pair needs relays
+  radio.tx_power_dbm: [5.0, 10.0, 15.0]
+seeds: [1, 2, 3]
+routing: {period_ticks: 5, forward_p: 0.6, ttl: 4}
