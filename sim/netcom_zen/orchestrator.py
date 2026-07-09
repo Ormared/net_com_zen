@@ -14,7 +14,7 @@ import numpy as np
 import psutil
 
 from .channel.forwarder import ChannelForwarder
-from .channel.linkstate import build_table
+from .channel.linkstate import LOG_REF_LENGTH_BYTES, build_table, table_rows
 from .config import Scenario
 from .ew import Jammer
 from .metrics import PacketLog
@@ -572,6 +572,8 @@ class ScenarioEngine:
         agent_exit: dict[str, int | None] = {}
         self._routers: dict[str, subprocess.Popen] = {}
         track: list[tuple] = []  # per-tick (t, id, x, y, heading) for visualization
+        ls_cfg = self.scenario.linkstate_log
+        ls_rows: list[dict] = []  # ground-truth link-state log (opt-in)
         bridge = None
         if self.ros2_viz:
             # lazy: rclpy exists only in the ros2 pixi env (ADR-0006)
@@ -608,6 +610,8 @@ class ScenarioEngine:
                     command_id=self.scenario.command_id,
                     satellite=self.scenario.satellite)
                 fwd.update_links(table)
+                if ls_cfg.enabled and n_ticks % ls_cfg.every_n_ticks == 0:
+                    ls_rows.extend(table_rows(table, round(t, 3)))
                 if bridge:
                     bridge.publish_tick(t, poses, table, self.jammers)
                 t += dt
@@ -643,6 +647,12 @@ class ScenarioEngine:
             pq.write_table(pa.table({
                 "t": cols[0], "id": cols[1], "x": cols[2], "y": cols[3],
                 "heading": cols[4]}), self.out_dir / "positions.parquet")
+        if ls_rows:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+            pq.write_table(pa.table(
+                {k: [r[k] for r in ls_rows] for k in ls_rows[0]}),
+                self.out_dir / "linkstate.parquet")
         (self.out_dir / "manifest.json").write_text(json.dumps({
             "scenario": self.scenario.model_dump(mode="json"),
             "seed": self.scenario.seed,
@@ -658,6 +668,9 @@ class ScenarioEngine:
             "timing_ok": late_ticks / max(n_ticks, 1) < 0.01
                          and max_tick_lag < 5 * dt,
             "agent_exit_codes": agent_exit,
+            # delivery_prob in linkstate.parquet is computed at this payload
+            **({"linkstate_ref_length_bytes": LOG_REF_LENGTH_BYTES}
+               if ls_rows else {}),
         }, indent=2))
 
     async def _run_bridge(self) -> None:

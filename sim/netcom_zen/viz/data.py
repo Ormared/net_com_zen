@@ -28,6 +28,10 @@ class RunData:
     packets: pd.DataFrame            # t, src, dst, length, verdict, delay_s
     agent_events: dict[str, list]    # id -> [event dicts]
     config: dict = field(default_factory=dict)
+    # ground-truth per-tick link state (linkstate.parquet, opt-in): t, src,
+    # dst, prx_dbm, noise_dbm, rho, jam_inchannel_dbm, delivery_prob,
+    # foliage_db, terrain_db, medium. Empty for runs without the log.
+    linkstate: pd.DataFrame = field(default_factory=pd.DataFrame)
 
     # --- scenario geometry (from manifest) ---
     @property
@@ -100,10 +104,13 @@ def load_run(run_dir: str | Path) -> RunData:
         nid = f.stem.removeprefix("agent_")
         agent_events[nid] = [json.loads(line) for line in
                              f.read_text().splitlines() if line.strip()]
+    linkstate = (pd.read_parquet(run_dir / "linkstate.parquet")
+                 if (run_dir / "linkstate.parquet").exists()
+                 else pd.DataFrame())
     return RunData(
         name=run_dir.name, path=run_dir, manifest=manifest, positions=positions,
         packets=packets, agent_events=agent_events,
-        config=_config_summary(manifest["scenario"]))
+        config=_config_summary(manifest["scenario"]), linkstate=linkstate)
 
 
 def list_runs(results_root: str | Path) -> list[dict]:
@@ -137,6 +144,34 @@ def link_quality(run: RunData, window_s: float = 1.0) -> pd.DataFrame:
         attempts=("ok", "size"), delivered=("ok", "sum")).reset_index()
     g["pdr"] = g["delivered"] / g["attempts"]
     return g
+
+
+def link_state_truth(run: RunData, window_s: float = 1.0) -> pd.DataFrame:
+    """Ground-truth link quality from linkstate.parquet, binned like
+    link_quality(). pdr = mean model delivery_prob over the window — defined
+    on EVERY link every tick, including idle ones (the whole point of the
+    truth log). delivered is synthesized as pdr*attempts so downstream
+    weighted aggregations (sum delivered / sum attempts) stay correct.
+    Extra columns carry the jamming truth for footprint layers."""
+    ls = run.linkstate
+    if ls.empty:
+        return pd.DataFrame(columns=["bin", "src", "dst", "pdr", "attempts",
+                                     "delivered", "rho", "prx_dbm"])
+    g = ls.copy()
+    g["bin"] = (g["t"] // window_s) * window_s
+    out = g.groupby(["bin", "src", "dst"]).agg(
+        pdr=("delivery_prob", "mean"), attempts=("delivery_prob", "size"),
+        rho=("rho", "mean"), prx_dbm=("prx_dbm", "mean")).reset_index()
+    out["delivered"] = out["pdr"] * out["attempts"]
+    return out
+
+
+def link_quality_best(run: RunData, window_s: float = 1.0) -> pd.DataFrame:
+    """Truth-based link quality when the run logged linkstate.parquet,
+    packet-reconstructed link_quality() otherwise (old runs keep working)."""
+    if not run.linkstate.empty:
+        return link_state_truth(run, window_s=window_s)
+    return link_quality(run, window_s=window_s)
 
 
 def aoi_series(run: RunData, observer: str) -> pd.DataFrame:

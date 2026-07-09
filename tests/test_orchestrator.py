@@ -12,6 +12,7 @@ from netcom_zen.orchestrator import ScenarioEngine
 @pytest.mark.sudo
 def test_smoke_run_produces_artifacts(tmp_path):
     scenario = load_scenario("scenarios/smoke_2node.yaml")
+    scenario.linkstate_log.enabled = True  # exercise the truth log end to end
     engine = ScenarioEngine(scenario, out_dir=tmp_path)
 
     async def go():
@@ -34,3 +35,10 @@ def test_smoke_run_produces_artifacts(tmp_path):
     assert manifest["scenario"]["name"] == "smoke-2node"
     assert manifest["seed"] == 42 and "git_hash" in manifest
     assert manifest["timing_ok"] is True  # tick loop kept up with wall clock
+    # ground-truth link-state log: every directed pair rated every tick
+    ls = pq.read_table(tmp_path / "linkstate.parquet")
+    assert ls.num_rows > 0 and ls.num_rows % 2 == 0  # 2 directed pairs
+    assert set(ls.column("medium").to_pylist()) == {"rf"}
+    probs = ls.column("delivery_prob").to_pylist()
+    assert all(0.0 <= p <= 1.0 for p in probs) and max(probs) > 0.9
+    assert manifest["linkstate_ref_length_bytes"] == 200
