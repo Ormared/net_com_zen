@@ -21,6 +21,7 @@ from .metrics import PacketLog
 from .mobility import MobilityProvider, make_mobility
 from .netns import NetnsTopology, netem_args
 from .propagation import CompositePathloss
+from .propagation.sionna_grid import SionnaGrid, SionnaGridPathloss
 from .terrain import FoliageRegion, Terrain
 
 
@@ -240,7 +241,7 @@ class World:
     """Scenario-derived simulation state, buildable without root (the netns
     dataplane is separate). Shared by the engine and the ROS 2 viz demo."""
     terrain: Terrain
-    pathloss: CompositePathloss
+    pathloss: CompositePathloss | SionnaGridPathloss
     mobility: MobilityProvider
     jammers: list[Jammer]
 
@@ -250,9 +251,13 @@ def build_world(scenario: Scenario) -> World:
     hm = np.load(env.heightmap) if env.heightmap else None
     terrain = Terrain(env.extent_m, hm,
                       [FoliageRegion(**f.model_dump()) for f in env.foliage])
+    if env.pathloss == "sionna":
+        pathloss = SionnaGridPathloss(SionnaGrid.load(env.sionna_grid), terrain)
+    else:
+        pathloss = CompositePathloss(terrain)
     return World(
         terrain=terrain,
-        pathloss=CompositePathloss(terrain),
+        pathloss=pathloss,
         mobility=make_mobility(scenario),
         jammers=[Jammer(j) for j in scenario.jammers])
 

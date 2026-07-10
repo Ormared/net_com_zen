@@ -54,6 +54,19 @@ class EnvironmentConfig(BaseModel):
     heightmap: Path | None = None  # .npy of heights (m), row=y, col=x
     extent_m: tuple[float, float] = (1000.0, 1000.0)
     foliage: list[FoliageRect] = []
+    # Pathloss backend (M5.3): composite = analytical Friis/two-ray +
+    # knife-edge + Weissberger; sionna = ray-traced grid, precomputed offline
+    # with `pixi run -e sionna sionna-precompute` (foliage stays Weissberger).
+    pathloss: Literal["composite", "sionna"] = "composite"
+    sionna_grid: Path | None = None  # .npz written by sionna_precompute
+
+    @model_validator(mode="after")
+    def _sionna_needs_grid(self):
+        if self.pathloss == "sionna" and self.sionna_grid is None:
+            raise ValueError(
+                "environment.pathloss=sionna requires environment.sionna_grid "
+                "(run `pixi run -e sionna sionna-precompute <scenario> -o <grid>`)")
+        return self
 
 
 class JammerConfig(BaseModel):
