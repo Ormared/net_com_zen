@@ -250,6 +250,17 @@ class MobilityConfig(BaseModel):
     physics_hz: float = Field(gt=0, default=60.0)  # PhysX frames per sim second
 
 
+class LinkstateLogConfig(BaseModel):
+    """Per-tick ground-truth link-state logging (EW backlog): persist the
+    build_table() output to linkstate.parquet so the dashboard can show the
+    true jammer footprint / link quality even on idle links (the packet-based
+    reconstruction only colours links that carried traffic). Off by default —
+    the table is O(N^2) rows per logged tick; every_n_ticks decimates (link
+    state changes slowly relative to the tick rate)."""
+    enabled: bool = False
+    every_n_ticks: int = Field(ge=1, default=1)
+
+
 class NetemConfig(BaseModel):
     """Per-link tc netem emulation on the bridge substrate (P5,
     docs/dds-topology-plan.md). Applied to each node's egress (the veth inside
@@ -321,6 +332,9 @@ class Scenario(BaseModel):
     # qdisc, ideal-link baseline. Only valid on substrate=bridge — enforced by
     # _netem_requires_bridge below.
     netem: NetemConfig | None = None
+    # Ground-truth per-tick link-state logging -> linkstate.parquet (EW
+    # backlog). channel substrate only: the other substrates have no RF model.
+    linkstate_log: LinkstateLogConfig = LinkstateLogConfig()
 
     @model_validator(mode="after")
     def _unique_ids(self):
@@ -449,6 +463,15 @@ class Scenario(BaseModel):
                 "netem.jitter_ms requires netem.delay_ms > 0 "
                 "(tc netem: jitter is a perturbation on top of a base delay; "
                 "setting jitter without delay is a tc error)")
+        return self
+
+    @model_validator(mode="after")
+    def _linkstate_log_requires_channel(self):
+        # the link-state table exists only where the RF model runs
+        if self.linkstate_log.enabled and self.substrate != "channel":
+            raise ValueError(
+                f"linkstate_log requires substrate='channel' (bridge/lan have "
+                f"no RF link-state table); got substrate={self.substrate!r}")
         return self
 
     @model_validator(mode="after")

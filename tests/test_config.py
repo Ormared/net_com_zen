@@ -63,3 +63,13 @@ def test_jammer_kind_params():
     with pytest.raises(ValidationError):
         JammerConfig(**base, kind="barrage")  # missing bandwidth_hz
     JammerConfig(**base, kind="sweep")
+
+
+def test_linkstate_log_requires_channel(tmp_path):
+    p = tmp_path / "s.yaml"
+    p.write_text(MINIMAL + "linkstate_log: {enabled: true}\n")
+    s = load_scenario(p)  # channel substrate: fine
+    assert s.linkstate_log.enabled and s.linkstate_log.every_n_ticks == 1
+    p.write_text(MINIMAL + "substrate: bridge\nlinkstate_log: {enabled: true}\n")
+    with pytest.raises(ValidationError, match="substrate='channel'"):
+        load_scenario(p)

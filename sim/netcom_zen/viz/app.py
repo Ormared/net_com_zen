@@ -38,7 +38,7 @@ def map_figure(run: D.RunData, height: int = 520) -> go.Figure:
                                           showarrow=False)
     times = np.sort(pos["t"].unique())[::FRAME_STRIDE]
     roles = run.roles
-    lq = D.link_quality(run, window_s=1.0)
+    lq = D.link_quality_best(run, window_s=1.0)
 
     def frame_traces(t):
         snap = pos[np.isclose(pos["t"], t)]
@@ -133,7 +133,7 @@ def aoi_figure(run: D.RunData, observer: str) -> go.Figure:
 
 
 def pdr_figure(run: D.RunData) -> go.Figure:
-    lq = D.link_quality(run, window_s=1.0)
+    lq = D.link_quality_best(run, window_s=1.0)
     fig = go.Figure()
     if not lq.empty:
         agg = lq.groupby("bin").apply(

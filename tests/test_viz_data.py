@@ -155,3 +155,41 @@ def test_export_run_is_json_serialisable(tmp_path):
     assert {n["id"] for n in f0["nodes"]} == {"v1", "cmd"}
     assert f0["jammers"][0]["active"] is True
     assert bundle["drop_attribution"] == {"delivered": 1}
+
+
+def _write_linkstate(tmp_path, rows):
+    cols = list(zip(*rows))
+    pq.write_table(pa.table({
+        "t": cols[0], "src": cols[1], "dst": cols[2], "prx_dbm": cols[3],
+        "noise_dbm": cols[4], "rho": cols[5], "jam_inchannel_dbm": cols[6],
+        "delivery_prob": cols[7], "foliage_db": cols[8], "terrain_db": cols[9],
+        "medium": cols[10]}), tmp_path / "linkstate.parquet")
+
+
+def test_link_state_truth_bins_and_covers_idle_links(tmp_path):
+    run = _make_run(tmp_path, positions=[], packets=[], agents={})
+    # v1->cmd carries no packets at all, but the truth log still rates it
+    _write_linkstate(tmp_path, [
+        (0.1, "v1", "cmd", -80.0, -113.0, 0.0, float("nan"), 1.0, 0.0, 0.0, "rf"),
+        (0.2, "v1", "cmd", -80.0, -113.0, 1.0, -60.0, 0.5, 0.0, 0.0, "rf"),
+        (1.1, "v1", "cmd", -80.0, -113.0, 1.0, -60.0, 0.0, 0.0, 0.0, "rf"),
+    ])
+    run = D.load_run(tmp_path)
+    truth = D.link_state_truth(run, window_s=1.0)
+    b0 = truth[truth["bin"] == 0.0].iloc[0]
+    assert b0["pdr"] == 0.75 and b0["attempts"] == 2  # mean over the window
+    assert b0["delivered"] == 1.5  # pdr*attempts: weighted aggs stay correct
+    assert truth[truth["bin"] == 1.0].iloc[0]["pdr"] == 0.0
+    assert b0["rho"] == 0.5
+
+
+def test_link_quality_best_prefers_truth_falls_back(tmp_path):
+    # no linkstate.parquet -> packet reconstruction
+    run = _make_run(tmp_path, positions=[], agents={}, packets=[
+        (0.1, "v1", "cmd", 64, "delivered", 0.01)])
+    assert D.link_quality_best(run).iloc[0]["pdr"] == 1.0
+    # truth log present -> it wins even where packets disagree
+    _write_linkstate(tmp_path, [
+        (0.1, "v1", "cmd", -80.0, -113.0, 0.0, float("nan"), 0.25, 0.0, 0.0, "rf")])
+    run = D.load_run(tmp_path)
+    assert D.link_quality_best(run).iloc[0]["pdr"] == 0.25

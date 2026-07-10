@@ -68,6 +68,28 @@ class LinkState:
         return p
 
 
+# Reference payload for the logged delivery_prob column: the truth layer needs
+# ONE representative number per link per tick, and the agent's CRDT updates are
+# a few hundred bytes (recorded in the run manifest for interpretation).
+LOG_REF_LENGTH_BYTES = 200
+
+
+def table_rows(table: dict[tuple[str, str], LinkState], t: float,
+               length_bytes: int = LOG_REF_LENGTH_BYTES) -> list[dict]:
+    """Flatten a per-tick link-state table into linkstate.parquet rows —
+    the ground-truth log the dashboard prefers over packet reconstruction
+    (EW backlog: per-tick link-state logging)."""
+    return [{
+        "t": t, "src": ls.src, "dst": ls.dst,
+        "prx_dbm": ls.prx_dbm, "noise_dbm": ls.noise_dbm, "rho": ls.rho,
+        "jam_inchannel_dbm": (math.nan if ls.jam_inchannel_dbm is None
+                              else ls.jam_inchannel_dbm),
+        "delivery_prob": ls.delivery_prob(length_bytes),
+        "foliage_db": ls.foliage_db, "terrain_db": ls.terrain_db,
+        "medium": ls.medium,
+    } for ls in table.values()]
+
+
 def _sat_link(src: str, dst: str, sat) -> LinkState:
     """A satellite (bent-pipe) link overriding the RF model on this pair."""
     return LinkState(

@@ -117,3 +117,21 @@ def test_replay_determinism():
         return [st.verdict(64, rng.random(), rng.random()) for _ in range(500)]
 
     assert run() == run()
+
+
+def test_table_rows_flatten():
+    import math
+
+    from netcom_zen.channel.linkstate import table_rows
+    clean = make_state()
+    jammed = make_state(src="b", dst="a", rho=0.5, jam_inchannel_dbm=-60.0)
+    rows = table_rows({("a", "b"): clean, ("b", "a"): jammed}, t=1.5)
+    assert len(rows) == 2
+    by_pair = {(r["src"], r["dst"]): r for r in rows}
+    r = by_pair[("a", "b")]
+    assert r["t"] == 1.5 and math.isnan(r["jam_inchannel_dbm"])
+    assert r["delivery_prob"] == pytest.approx(clean.delivery_prob(200))
+    r = by_pair[("b", "a")]
+    assert r["rho"] == 0.5 and r["jam_inchannel_dbm"] == -60.0
+    assert r["delivery_prob"] == pytest.approx(jammed.delivery_prob(200))
+    assert r["medium"] == "rf"
