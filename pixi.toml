@@ -99,9 +99,41 @@ isaac-preview = "python -m netcom_zen.isaac_stepper.preview"
 # run in the default env via `pixi run test`
 isaac-smoke = "pytest tests/test_isaac_real.py -v"
 
+# Sionna RT ray-traced pathloss (plan M5.3), opt-in: `pixi run -e sionna ...`.
+# Standalone like isaac: the drjit/mitsuba wheel stack never joins the default
+# env. Only the offline precompute step needs this env — the runtime provider
+# (SionnaGridPathloss) is pure numpy and lives in the default env.
+[feature.sionna]
+
+[feature.sionna.system-requirements]
+libc = { family = "glibc", version = "2.35" }
+
+[feature.sionna.dependencies]
+python = "3.12.*"
+
+[feature.sionna.activation.env]
+# standalone env does not inherit the workspace [activation.env]; without this
+# user-site packages leak in (same failure mode as isaac)
+PYTHONNOUSERSITE = "1"
+
+[feature.sionna.pypi-dependencies]
+netcom-zen = { path = ".", editable = true }
+pytest = ">=8"
+numpy = "*"
+pydantic = ">=2.7"
+pyyaml = ">=6"
+matplotlib = ">=3.8"
+# sionna-rt 1.x is the standalone ray tracer (drjit/mitsuba, no tensorflow)
+sionna-rt = ">=1.0"
+
+[feature.sionna.tasks]
+sionna-precompute = "python -m netcom_zen.propagation.sionna_precompute"
+sionna-smoke = "pytest tests/test_sionna_real.py -v"
+
 [environments]
 ros2 = ["ros2"]
 isaac = { features = ["isaac"], no-default-feature = true }
+sionna = { features = ["sionna"], no-default-feature = true }
 
 [tasks]
 test = "pytest tests -v"
