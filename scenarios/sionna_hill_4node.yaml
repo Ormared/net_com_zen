@@ -1,0 +1,25 @@
+# M5.3 terrain-divergence case: a 45 m Gaussian ridge (scripts/
+# make_hill_heightmap.py) splits two node pairs. The analytical model sees the
+# ridge as single knife-edge diffraction; the ray-traced grid sees the actual
+# heightfield. Static nodes (speed_mps 0.01 pins WaypointVehicle in place).
+name: sionna-hill-4node
+duration_s: 30
+tick_hz: 10
+seed: 0
+radio:
+  freq_hz: 433.0e+6
+  bandwidth_hz: 250.0e+3
+  tx_power_dbm: 27.0
+  noise_figure_db: 7.0
+  data_rate_bps: 250.0e+3
+  hop: {n_channels: 50, hop_rate_hz: 100.0}
+nodes:
+  - {id: w1, waypoints: [[300, 400]], speed_mps: 0.01}  # west of the ridge
+  - {id: w2, waypoints: [[350, 600]], speed_mps: 0.01}
+  - {id: e1, waypoints: [[700, 400]], speed_mps: 0.01}  # east of the ridge
+  - {id: e2, waypoints: [[650, 600]], speed_mps: 0.01}
+environment:
+  extent_m: [1000, 1000]
+  heightmap: scenarios/data/hill_ridge_128.npy
+agent:
+  enabled: false

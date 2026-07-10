@@ -22,6 +22,25 @@ jamming resistance — the project's core SWaP trade-off).
 **Radio defaults:** UHF 433 MHz and ISM 2.4 GHz profiles; TX power ≤ 1 W
 (SWaP-bounded); omni antennas, 0 dBi; noise figure 7 dB.
 
+### Ray-traced backend (`environment.pathloss: sionna`, M5.3)
+
+An alternative to the analytical composite: pathloss is served from a grid
+precomputed offline by Sionna RT (`pixi run -e sionna sionna-precompute`, see
+`propagation/sionna_precompute.py`). The scenario's terrain is meshed with a
+lossy ground (εr 15, σ 0.005 S/m); the deterministic `PathSolver` coherently
+sums LoS + specular reflections + wedge diffraction per (coarse tx-grid node,
+rx cell), and the runtime provider (`SionnaGridPathloss`, pure numpy, default
+env) interpolates the grid. Foliage stays analytical Weissberger — the RT
+scene has no vegetation. Breakdown convention: `fspl_db` = analytical
+baseline, `terrain_db` = ray-traced excess over it (negative = constructive
+multipath). Fidelity envelope, validated in
+`validation/test_sionna_vs_analytical.py` and quantified in
+[results/sionna-vs-analytical.md](results/sionna-vs-analytical.md): on flat
+scenes RT matches two-ray to ~2 dB; on terrain it adds real multipath (slope
+echoes fill two-ray nulls) but casts *hard* shadows behind smooth crests —
+sionna-rt only diffracts around sharp wedges, so keep the analytical
+knife-edge model for terrain-dominated scenarios.
+
 ## Link budget → SINR
 
 For directed link (i → j) at frequency f:
