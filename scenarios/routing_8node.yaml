@@ -1,0 +1,42 @@
+# M5.2 base: 8 static vehicles in a 2x4 grid (450 m spacing) at 2.4 GHz with
+# modest tx power, so neighbours are solid but corner-to-corner direct links
+# are beyond range — the regime where multi-hop routing can matter. A central
+# barrage jammer (power = sweep axis) degrades the middle of the mesh; the
+# grid's two rows give routing something a chain doesn't: parallel paths.
+name: routing-8node
+duration_s: 60
+tick_hz: 10
+seed: 0  # overridden by the sweep
+radio:
+  freq_hz: 2.4e+9
+  bandwidth_hz: 250.0e3
+  tx_power_dbm: 10.0     # sweep axis: link margin = effective swarm spread
+  noise_figure_db: 7.0
+  data_rate_bps: 250.0e3
+  hop: {n_channels: 50, hop_rate_hz: 100.0}
+# speed 0.01: a single-waypoint vehicle at the default 5 m/s limit-cycles
+# ~10 m around its point (turning circle); near-zero speed pins it truly static
+# speed 0.01: a single-waypoint vehicle at the default 5 m/s limit-cycles
+# ~10 m around its point (turning circle); near-zero speed pins it static
+nodes:
+  - {id: v1, waypoints: [[150, 300]], speed_mps: 0.01}
+  - {id: v2, waypoints: [[600, 300]], speed_mps: 0.01}
+  - {id: v3, waypoints: [[1050, 300]], speed_mps: 0.01}
+  - {id: v4, waypoints: [[1500, 300]], speed_mps: 0.01}
+  - {id: v5, waypoints: [[150, 750]], speed_mps: 0.01}
+  - {id: v6, waypoints: [[600, 750]], speed_mps: 0.01}
+  - {id: v7, waypoints: [[1050, 750]], speed_mps: 0.01}
+  - {id: v8, waypoints: [[1500, 750]], speed_mps: 0.01}
+environment:
+  extent_m: [2000, 1200]
+jammers:
+  - id: j1
+    kind: barrage
+    position: [825, 150]   # near the BOTTOM row: kills its middle links first
+                           # while the top row survives as a detour — the
+                           # regime where routing can actually route *around*
+    tx_power_dbm: 0.0      # sweep axis; 0 dBm is negligible here (= off)
+    bandwidth_hz: 12.5e6   # covers the whole 50 x 250 kHz hop span
+    start_s: 0.0
+agent:
+  enabled: false           # never engine-run: routing evaluates analytically
