@@ -1,14 +1,10 @@
 
-All ✅ milestones through R4 and the EW-vector items (FEC, reactive jamming, MLS
-hardening) are done. Remaining work is planned, not open-ended:
+All ✅ milestones through R4, the EW-vector items (FEC, reactive jamming, MLS
+hardening), and the full M5 track (M5.1–M5.3) are done. Remaining work:
 
-- **M5+** — routing comparisons, frequency-band sweeps, Sionna RT pathloss backend:
-  see [`m5-plan.md`](m5-plan.md) (ordered M5.1 → M5.3 by value-per-effort).
-- **EW backlog** — weak-link propagation calibration + per-tick link-state logging:
-  see [`ew-track-backlog.md`](ew-track-backlog.md) (both now have actionable plans).
-
-Suggested next item: **M5.1 frequency-band sweeps** — cheapest, harness-only, and it
-settles the "does carrier matter" input that M5.2/M5.3 both build on.
+- **EW backlog** — weak-link propagation calibration (needs EMANE comparison
+  cells): see [`ew-track-backlog.md`](ew-track-backlog.md). Per-tick
+  link-state logging shipped 2026-07-10 (PR #15).
 
 
 # Roadmap
@@ -31,7 +27,7 @@ settles the "does carrier matter" input that M5.2/M5.3 both build on.
 | **DDS root cause + topology track** | Archetype plan ([dds-topology-plan.md](dds-topology-plan.md)): allocation probe, lan substrate, netem, shared/star/cluster topologies — and the rig root cause | **2026-07-03:** kernel `neigh.gc_thresh3=1024` (global across netns) was every prior "wall" — the ~33-clique cap, Cyclone's storm, the N=48 knee. Rig fixed in-engine; corrected baselines: all RMWs mesh 1.0 @48; Cyclone mesh 1.0 + 96 % delivery @96 (the real winner); Fast DDS data plane saturates @96; Zenoh full router mesh collapses (real wall — use star). See [results/dds-neighbor-table.md](results/dds-neighbor-table.md). Cross-host P3/P4 pending firewall openings |
 | **R4 — Isaac Sim 6 mobility** ✅ | `IsaacMobilityProvider`, lockstep stepping, orchestrator stays clock master ([plan](ros2-integration-plan.md#r4--isaac-sim-6-as-mobilityprovider)) | **DONE 2026-06-13 (PR #10):** long-lived user-owned `isaac_stepper` process embeds headless `SimulationApp` and serves newline-JSON poses over a unix socket; stdlib-only `IsaacMobilityProvider` drives it in lockstep (`physics_hz/tick_hz` PhysX frames/tick), `--backend kinematic` fakes the wire protocol for CI. Vehicles are PhysX cuboids under the same unicycle law as `WaypointVehicle` (`trajectories_seed_exact: false`; channel RNG still seeded). Measured on RTX 5090 (4 vehicles, 6 frames/step): **median 5.8 ms / p95 6.4 ms per 100 ms tick** — step-latency risk settled. Two timing fixes made the monitor trustworthy (absolute-deadline tick sleep; warp kernels warmed during scene build). See the as-built note in the plan. |
 | **Reactive jamming** ✅ | Follower jammer that senses the active transmission and retunes onto its channel ([backlog](ew-track-backlog.md)) | **DONE 2026-07-06:** modelled as a per-dwell lock probability `ρ = detection_prob·max(0,(T_dwell−τ)/T_dwell)` folded into the binomial-CDF survival model — no sub-tick stepping. Defence is a **cliff at `T_dwell = τ`**, not the gradual FEC climb: engine sweep shows hop 500/s crippled by a τ=1 ms follower (postjam PDR 0.23) but immune to τ=5 ms (1.00), hop 1000/s immune to both; FEC nearly irrelevant. See [results/reactive-jamming.md](results/reactive-jamming.md) |
-| **M5+** | Routing comparisons ✅, frequency-band sweeps ✅, Sionna RT pathloss backend ([plan](m5-plan.md)) | **M5.1 + M5.2 DONE 2026-07-07:** 915 MHz sweet spot, band choice is a security outage before packet loss ([freq-band-sweep](results/freq-band-sweep.md)); routing recovers exactly what physics allows, linkstate ≈ flood at −14–19 % cost ([routing-comparison](results/routing-comparison.md)). M5.3 Sionna remains |
+| **M5+** ✅ | Routing comparisons ✅, frequency-band sweeps ✅, Sionna RT pathloss backend ✅ ([plan](m5-plan.md)) | **M5.1 + M5.2 DONE 2026-07-07:** 915 MHz sweet spot, band choice is a security outage before packet loss ([freq-band-sweep](results/freq-band-sweep.md)); routing recovers exactly what physics allows, linkstate ≈ flood at −14–19 % cost ([routing-comparison](results/routing-comparison.md)). **M5.3 DONE 2026-07-10 (PR #17):** offline PathSolver precompute → numpy grid provider (`environment.pathloss: sionna`); flat matches two-ray to 1.7 dB, but sionna-rt casts hard shadows behind smooth terrain (diffracts only around sharp wedges) — keep the analytical knife-edge for terrain scenarios. See [sionna-vs-analytical](results/sionna-vs-analytical.md) |
 
 Testing discipline throughout: unit tests per module; the model validation suite
 (`validation/`) reproduces published propagation curves and closed-form FHSS/SINR
