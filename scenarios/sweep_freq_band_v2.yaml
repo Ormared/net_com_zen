@@ -1,0 +1,13 @@
+# M5.1 V2 — isolate spectral AGILITY: sweep the carrier holding FRACTIONAL
+# bandwidth fixed at the 433 MHz baseline (12.5 MHz / 433 MHz = 2.89%), so
+# n_channels scales with the carrier: span = 4.25 MHz @150 MHz ... 167.5 MHz
+# @5.8 GHz. The fixed 12.5 MHz barrage covers 100% of the span at <= 433 MHz
+# but only 7.5% at 5.8 GHz — hopping dilutes a fixed-width jammer at high
+# carriers. V2 minus V1 at the same band = what channelization alone buys.
+# n_channels = round(0.02887 * f / 250 kHz), zipped with freq_hz.
+# 5 bands x 3 seeds x 60 s ~ 20 min.
+base: freq_band_4node.yaml
+zip_axes:
+  radio.freq_hz: [150.0e+6, 433.0e+6, 915.0e+6, 2.4e+9, 5.8e+9]
+  radio.hop.n_channels: [17, 50, 106, 277, 670]
+seeds: [1, 2, 3]

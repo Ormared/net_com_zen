@@ -22,6 +22,22 @@ def test_expand_cartesian():
     assert "a=1__b=10__seed=7" in names
 
 
+def test_expand_zip_axes():
+    # zipped params move together (no cartesian product between them),
+    # then cross with the cartesian axes and seeds
+    cells = expand({"zip_axes": {"f": [1, 2, 3], "n": [10, 20, 30]},
+                    "axes": {"p": [40, 60]}, "seeds": [7]})
+    assert len(cells) == 6
+    assert ({"f": 1, "n": 10, "p": 40}, 7) in cells
+    assert ({"f": 3, "n": 30, "p": 60}, 7) in cells
+    assert not any(o["f"] == 1 and o["n"] == 30 for o, _ in cells)
+
+
+def test_expand_zip_axes_length_mismatch():
+    with pytest.raises(ValueError, match="equal lengths"):
+        expand({"zip_axes": {"f": [1, 2], "n": [10]}})
+
+
 def test_base_scenarios_validate():
     for path in ("scenarios/resilience_4node.yaml", "scenarios/smoke_4node.yaml"):
         Scenario.model_validate(yaml.safe_load(open(path)))

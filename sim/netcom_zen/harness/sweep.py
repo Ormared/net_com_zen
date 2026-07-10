@@ -39,13 +39,30 @@ def cell_name(overrides: dict[str, object], seed: int) -> str:
 
 
 def expand(sweep: dict) -> list[tuple[dict[str, object], int]]:
+    """Cells = zip_axes (element-wise) x axes (cartesian) x seeds.
+
+    zip_axes groups parameters that must move together — e.g. M5.1's V2 pairs
+    radio.freq_hz with a matched radio.hop.n_channels so fractional bandwidth
+    stays constant; a cartesian product over those would create nonsense cells.
+    """
     axes: dict[str, list] = sweep.get("axes", {})
+    zip_axes: dict[str, list] = sweep.get("zip_axes", {})
     seeds: list[int] = sweep.get("seeds", [0])
+    if zip_axes:
+        lengths = {len(v) for v in zip_axes.values()}
+        if len(lengths) != 1:
+            raise ValueError(f"zip_axes lists must have equal lengths, got "
+                             f"{ {k: len(v) for k, v in zip_axes.items()} }")
+        zipped = [dict(zip(zip_axes.keys(), vals))
+                  for vals in zip(*zip_axes.values())]
+    else:
+        zipped = [{}]
     cells = []
-    for combo in itertools.product(*axes.values()) if axes else [()]:
-        overrides = dict(zip(axes.keys(), combo))
-        for seed in seeds:
-            cells.append((overrides, seed))
+    for z in zipped:
+        for combo in itertools.product(*axes.values()) if axes else [()]:
+            overrides = {**z, **dict(zip(axes.keys(), combo))}
+            for seed in seeds:
+                cells.append((overrides, seed))
     return cells
 
 
