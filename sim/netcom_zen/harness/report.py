@@ -104,6 +104,239 @@ def run_metrics(run_dir: Path) -> dict:
 # bridge substrate
 # ---------------------------------------------------------------------------
 
+def centralized_run_metrics(run_dir: Path) -> dict:
+    """Metrics for the mixed centralized telemetry/command/RPC workload.
+
+    Every latency/gap calculation uses timestamps produced by one process.
+    This keeps LAN results valid even when host clocks are not synchronized.
+    """
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    scenario = manifest["scenario"]
+    central = scenario["ros2"]["centralized"]
+    server_ids = set(central["server_ids"])
+    client_order = [
+        n["id"] for n in scenario["nodes"] if n["id"] not in server_ids]
+    client_ids = set(client_order)
+    if central["mode"] == "sharded":
+        expected_clients_by_server = {
+            sid: {
+                nid for i, nid in enumerate(client_order)
+                if central["server_ids"][i % len(server_ids)] == sid}
+            for sid in server_ids}
+    else:
+        expected_clients_by_server = {
+            sid: client_ids for sid in server_ids}
+    events: dict[str, list[dict]] = {}
+    for path in sorted(run_dir.glob("agent_*.jsonl")):
+        nid = path.stem.removeprefix("agent_")
+        events[nid] = [
+            json.loads(line) for line in path.read_text().splitlines()
+            if line.strip()
+        ]
+
+    telemetry_pubs = collections.Counter()
+    telemetry_pub_times: dict[str, list[int]] = collections.defaultdict(list)
+    telemetry_recv = collections.Counter()
+    command_pubs = collections.Counter()
+    command_recv = collections.Counter()
+    command_duplicates = 0
+    command_times: dict[str, list[int]] = collections.defaultdict(list)
+    starts: dict[str, int] = {}
+    rpc_counts = collections.Counter()
+    rpc_rtt_ms: list[float] = []
+    rpc_success_times: dict[str, list[int]] = collections.defaultdict(list)
+    rpc_servers = collections.Counter()
+    telemetry_first: dict[tuple[str, str], int] = {}
+
+    for nid, rows in events.items():
+        for ev in rows:
+            kind = ev.get("type")
+            if kind == "start":
+                starts[nid] = ev["ts_us"]
+            elif kind == "telemetry_pub":
+                telemetry_pubs[nid] += 1
+                telemetry_pub_times[nid].append(ev["ts_us"])
+            elif kind == "telemetry_recv":
+                telemetry_recv[(nid, ev["from"])] += 1
+                pair = (nid, ev["from"])
+                telemetry_first[pair] = min(
+                    telemetry_first.get(pair, ev["ts_us"]), ev["ts_us"])
+            elif kind == "command_pub":
+                command_pubs[nid] += 1
+            elif kind in {"command_recv", "command_duplicate"}:
+                command_recv[(nid, ev["from"])] += 1
+                command_times[nid].append(ev["ts_us"])
+                command_duplicates += kind == "command_duplicate"
+            elif kind and kind.startswith("rpc_"):
+                rpc_counts[kind] += 1
+                if kind == "rpc_success":
+                    rpc_rtt_ms.append(
+                        (ev["ts_us"] - ev["started_us"]) / 1e3)
+                    rpc_success_times[nid].append(ev["ts_us"])
+                    rpc_servers[str(ev.get("server", "")).split(":")[0]] += 1
+
+    if central["mode"] == "sharded":
+        expected_telemetry = sum(telemetry_pubs.values())
+    elif (central["mode"] in {"active_active", "active_passive"}
+          and central.get("failure_at_s") is not None):
+        # Both servers receive before the injected primary failure; only the
+        # surviving/warm standby can receive afterward.  Counting the dead
+        # server for the rest of the run would label successful failover as
+        # artificial packet loss.
+        expected_telemetry = 0
+        for nid, times in telemetry_pub_times.items():
+            target = starts.get(nid, 0) + int(central["failure_at_s"] * 1e6)
+            expected_telemetry += sum(2 if t < target else 1 for t in times)
+    else:
+        expected_telemetry = (
+            sum(telemetry_pubs.values()) * len(server_ids))
+    delivered_telemetry = sum(telemetry_recv.values())
+
+    expected_commands = sum(
+        count * len(client_ids) for sid, count in command_pubs.items()
+        if sid in server_ids)
+    delivered_commands = sum(command_recv.values())
+    command_gaps_ms = sorted(
+        (b - a) / 1e3
+        for times in command_times.values()
+        for a, b in zip(sorted(times), sorted(times)[1:])
+    )
+
+    attempts = sum(rpc_counts[k] for k in (
+        "rpc_success", "rpc_error", "rpc_timeout", "rpc_unavailable"))
+    duration_s = float(scenario["duration_s"])
+
+    def outage_gap(times_by_node: dict[str, list[int]]) -> float | None:
+        failure = central.get("failure_at_s")
+        if failure is None:
+            return None
+        gaps = []
+        for nid in client_ids:
+            target = starts.get(nid, 0) + int(failure * 1e6)
+            before = [t for t in times_by_node.get(nid, []) if t < target]
+            after = [t for t in times_by_node.get(nid, []) if t >= target]
+            if before and after:
+                gaps.append((min(after) - max(before)) / 1e6)
+        return max(gaps) if gaps else None
+
+    client_ready = []
+    for nid in client_ids:
+        commands = sorted(command_times.get(nid, []))
+        rpc = sorted(rpc_success_times.get(nid, []))
+        if commands and rpc and nid in starts:
+            client_ready.append(
+                (max(commands[0], rpc[0]) - starts[nid]) / 1e6)
+    telemetry_ready = []
+    for sid in server_ids:
+        firsts = [
+            t for (server, client), t in telemetry_first.items()
+            if server == sid and client in expected_clients_by_server[sid]]
+        if (len(firsts) == len(expected_clients_by_server[sid])
+                and sid in starts):
+            telemetry_ready.append((max(firsts) - starts[sid]) / 1e6)
+    ready_time_s = (
+        max(client_ready + telemetry_ready)
+        if len(client_ready) == len(client_ids) and telemetry_ready else None)
+
+    telemetry_ratio = (
+        delivered_telemetry / expected_telemetry
+        if expected_telemetry else None)
+    command_ratio = (
+        delivered_commands / expected_commands
+        if expected_commands else None)
+    rpc_ratio = (
+        rpc_counts["rpc_success"] / attempts if attempts else None)
+    rpc_p99 = _percentile(sorted(rpc_rtt_ms), 0.99)
+    command_gap_p99 = _percentile(command_gaps_ms, 0.99)
+    expected_command_gap = central["command_period_ms"]
+
+    resource_stats = {}
+    resource_path = run_dir / "resources.parquet"
+    if resource_path.exists():
+        resource_rows = pq.read_table(resource_path).to_pylist()
+
+        def role_resources(names: set[str], prefix: str) -> None:
+            rows = [r for r in resource_rows if str(r["proc"]) in names]
+            cpus = [r["cpu_pct"] for r in rows
+                    if r["cpu_pct"] == r["cpu_pct"]]
+            rss = [r["rss_bytes"] for r in rows]
+            resource_stats[f"{prefix}_cpu_peak_pct"] = (
+                max(cpus) if cpus else None)
+            resource_stats[f"{prefix}_rss_peak_mb"] = (
+                max(rss) / 1e6 if rss else None)
+
+        role_resources(server_ids, "server")
+        role_resources(client_ids, "client")
+        infra_names = {
+            str(r["proc"]) for r in resource_rows
+            if str(r["proc"]).startswith("router:")}
+        role_resources(infra_names, "infrastructure")
+
+    result = {
+        "telemetry_delivery_ratio": (
+            telemetry_ratio),
+        "telemetry_received": delivered_telemetry,
+        "telemetry_received_per_s": delivered_telemetry / duration_s,
+        "telemetry_server_distribution": {
+            sid: sum(n for (receiver, _), n in telemetry_recv.items()
+                     if receiver == sid)
+            for sid in server_ids},
+        "command_delivery_ratio": command_ratio,
+        "command_received_per_s": delivered_commands / duration_s,
+        "command_client_coverage": (
+            sum(bool(command_times.get(n)) for n in client_ids)
+            / len(client_ids) if client_ids else None),
+        "command_duplicate_ratio": (
+            command_duplicates / delivered_commands
+            if delivered_commands else None),
+        "command_gap_p50_ms": _percentile(command_gaps_ms, 0.50),
+        "command_gap_p99_ms": _percentile(command_gaps_ms, 0.99),
+        "command_gap_max_ms": max(command_gaps_ms, default=None),
+        "rpc_success_ratio": rpc_ratio,
+        "rpc_success": rpc_counts["rpc_success"],
+        "rpc_success_per_s": rpc_counts["rpc_success"] / duration_s,
+        "rpc_timeout": rpc_counts["rpc_timeout"],
+        "rpc_unavailable": rpc_counts["rpc_unavailable"],
+        "rpc_rtt_p50_ms": _percentile(sorted(rpc_rtt_ms), 0.50),
+        "rpc_rtt_p99_ms": rpc_p99,
+        "rpc_server_distribution": dict(rpc_servers),
+        "command_failover_gap_s": outage_gap(command_times),
+        "rpc_failover_gap_s": outage_gap(rpc_success_times),
+        "n_clients": len(client_ids),
+        "n_servers": len(server_ids),
+        "server_mode": central["mode"],
+        "profile_label": central.get("profile_label", "stock"),
+        "discovery_mode": central.get("discovery_mode"),
+        "telemetry_reliability": central.get("telemetry_reliability"),
+        "socket_buffer_bytes": scenario["ros2"].get(
+            "socket_buffer_bytes", 0),
+        "rmw": manifest.get("rmw"),
+        "ready_time_s": ready_time_s,
+        # SLO views are overlays, never a replacement for the raw curves.
+        "slo_relaxed": bool(
+            telemetry_ratio is not None and telemetry_ratio >= 0.90
+            and rpc_ratio is not None and rpc_ratio >= 0.90
+            and rpc_p99 is not None and rpc_p99 <= 1000
+            and command_gap_p99 is not None
+            and command_gap_p99 <= 2 * expected_command_gap),
+        "slo_tight_control": bool(
+            telemetry_ratio is not None and telemetry_ratio >= 0.99
+            and command_ratio is not None and command_ratio >= 0.99
+            and rpc_ratio is not None and rpc_ratio >= 0.99
+            and rpc_p99 is not None and rpc_p99 <= 200
+            and command_gap_p99 is not None
+            and command_gap_p99 <= 1.2 * expected_command_gap),
+        **resource_stats,
+        # Compatibility aliases let the generic curve plotter render central
+        # cells while purpose-built reports use the names above.
+        "delivery_ratio": telemetry_ratio,
+        "latency_p50_ms": _percentile(sorted(rpc_rtt_ms), 0.50),
+        "latency_p99_ms": _percentile(sorted(rpc_rtt_ms), 0.99),
+        "discovery_time_s": None,
+    }
+    return result
+
+
 def bridge_run_metrics(run_dir: Path) -> dict:
     """Metrics for one bridge-substrate run directory.
 
@@ -255,11 +488,42 @@ def aggregate(sweep_dir: Path) -> list[dict]:
     for cell in manifest["cells"]:
         run_dir = sweep_dir / cell["name"]
         base = {**cell["overrides"], "seed": cell["seed"]}
-        if _is_bridge_run(run_dir):
-            rows.append({**base, **bridge_run_metrics(run_dir)})
-        elif (run_dir / "packets.parquet").exists():
-            rows.append({**base, **run_metrics(run_dir)})
-        # else: incomplete / missing run — skip silently
+        status = cell.get("status", "unknown")
+        try:
+            run_manifest = json.loads(
+                (run_dir / "manifest.json").read_text())
+            if run_manifest.get("topology") == "centralized":
+                metrics = centralized_run_metrics(run_dir)
+            elif _is_bridge_run(run_dir):
+                metrics = bridge_run_metrics(run_dir)
+            elif (run_dir / "packets.parquet").exists():
+                metrics = run_metrics(run_dir)
+            else:
+                raise ValueError("no recognized result artifacts")
+            exit_codes = run_manifest.get("agent_exit_codes", {})
+            faulted = {
+                event.get("server_id")
+                for event in run_manifest.get("fault_events", [])
+                if event.get("type") == "primary_failure"}
+            complete = (
+                bool(exit_codes)
+                and not run_manifest.get("resource_abort_reason")
+                and all(code == 0 or nid in faulted
+                        for nid, code in exit_codes.items()))
+            rows.append({
+                **base, **metrics, "cell_name": cell["name"],
+                "cell_status": "complete" if complete else "failed",
+                "complete": complete,
+                "failure_reason": (
+                    None if complete else
+                    "missing or non-zero agent exit codes"),
+            })
+        except Exception as exc:
+            rows.append({
+                **base, "cell_name": cell["name"], "cell_status": status,
+                "complete": False,
+                "failure_reason": f"{type(exc).__name__}: {exc}",
+            })
     return rows
 
 

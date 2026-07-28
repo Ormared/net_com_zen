@@ -46,6 +46,7 @@ def expand(sweep: dict) -> list[tuple[dict[str, object], int]]:
     stays constant; a cartesian product over those would create nonsense cells.
     """
     axes: dict[str, list] = sweep.get("axes", {})
+    explicit: list[dict[str, object]] = sweep.get("cells", [{}])
     zip_axes: dict[str, list] = sweep.get("zip_axes", {})
     seeds: list[int] = sweep.get("seeds", [0])
     if zip_axes:
@@ -58,11 +59,13 @@ def expand(sweep: dict) -> list[tuple[dict[str, object], int]]:
     else:
         zipped = [{}]
     cells = []
-    for z in zipped:
-        for combo in itertools.product(*axes.values()) if axes else [()]:
-            overrides = {**z, **dict(zip(axes.keys(), combo))}
-            for seed in seeds:
-                cells.append((overrides, seed))
+    for fixed in explicit:
+        for z in zipped:
+            for combo in itertools.product(*axes.values()) if axes else [()]:
+                overrides = {
+                    **fixed, **z, **dict(zip(axes.keys(), combo))}
+                for seed in seeds:
+                    cells.append((overrides, seed))
     return cells
 
 
@@ -75,6 +78,15 @@ async def run_sweep(sweep_path: str | Path, out_root: str | Path) -> Path:
 
     cells = expand(sweep)
     done = []
+    # Write the complete plan before the first expensive cell.  If the process
+    # is interrupted, reporting can still distinguish planned from completed.
+    (out_root / "sweep_manifest.json").write_text(json.dumps({
+        "sweep": sweep,
+        "cells": [
+            {"name": cell_name(o, s), "overrides": o, "seed": s,
+             "status": "planned"}
+            for o, s in cells],
+    }, indent=2))
     for i, (overrides, seed) in enumerate(cells, 1):
         cfg = copy.deepcopy(base)
         for k, v in overrides.items():
@@ -85,12 +97,37 @@ async def run_sweep(sweep_path: str | Path, out_root: str | Path) -> Path:
         run_dir = out_root / name
         if (run_dir / "manifest.json").exists():
             print(f"[{i}/{len(cells)}] {name} — exists, skipping")
-            done.append({"name": name, "overrides": overrides, "seed": seed})
+            done.append({"name": name, "overrides": overrides, "seed": seed,
+                         "status": "complete"})
             continue
         print(f"[{i}/{len(cells)}] {name} ({scenario.duration_s:.0f}s)")
         engine = ScenarioEngine(scenario, run_dir)
-        await engine.run()
-        done.append({"name": name, "overrides": overrides, "seed": seed})
+        # Fast DDS uses POSIX shared-memory files and the workload deliberately
+        # terminates via os._exit() to avoid RMW shutdown hangs.  Snapshot the
+        # namespace so only IPC artifacts created by this cell are removed;
+        # pre-existing files from other applications are never touched.
+        shm_root = Path("/dev/shm")
+        shm_before = (
+            {p.name for p in shm_root.glob("fastrtps_*")}
+            if scenario.ros2.rmw == "fastrtps" else set())
+        try:
+            await engine.run()
+        finally:
+            if scenario.ros2.rmw == "fastrtps":
+                for path in shm_root.glob("fastrtps_*"):
+                    if path.name not in shm_before:
+                        try:
+                            path.unlink()
+                        except FileNotFoundError:
+                            pass
+        done.append({"name": name, "overrides": overrides, "seed": seed,
+                     "status": "complete"})
+        (out_root / "sweep_manifest.json").write_text(json.dumps({
+            "sweep": sweep, "cells": done + [
+                {"name": cell_name(o, s), "overrides": o, "seed": s,
+                 "status": "planned"}
+                for o, s in cells[i:]],
+        }, indent=2))
 
     (out_root / "sweep_manifest.json").write_text(json.dumps({
         "sweep": sweep, "cells": done}, indent=2))

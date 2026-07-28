@@ -136,6 +136,62 @@ class AgentConfig(BaseModel):
     sync_mode: Literal["delta", "state"] = "delta"  # CRDT sync strategy (A/B)
 
 
+class CentralizedWorkloadConfig(BaseModel):
+    """Mixed client/server workload used by the centralized RMW study.
+
+    ``server_ids`` names ordinary Scenario nodes; every remaining node is a
+    client.  Middleware discovery/router processes are infrastructure and are
+    deliberately kept separate from these application-server roles.
+    """
+    server_ids: list[str] = Field(default_factory=list, max_length=2)
+    profile_label: Literal["stock", "candidate", "tuned"] = "tuned"
+    mode: Literal["single", "active_active", "active_passive", "sharded"] = "single"
+    primary_server_id: str = ""
+    failure_at_s: float | None = Field(default=None, gt=0)
+    discovery_mode: Literal["native", "centralized"] = "centralized"
+    telemetry_period_ms: int = Field(gt=0, default=200)
+    telemetry_payload_bytes: int = Field(gt=0, default=255)
+    telemetry_reliability: Literal["reliable", "best_effort"] = "best_effort"
+    command_period_ms: int = Field(gt=0, default=1000)
+    command_payload_bytes: int = Field(gt=0, default=255)
+    rpc_period_ms: int = Field(gt=0, default=1000)
+    rpc_timeout_ms: int = Field(gt=0, default=2000)
+    # Active-passive keeps the standby subscribed to telemetry but creates its
+    # command publisher and service only after this scenario-relative time.
+    standby_activate_after_s: float | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _shape(self):
+        expected = 1 if self.mode == "single" else 2
+        if len(self.server_ids) != expected:
+            raise ValueError(
+                f"centralized mode={self.mode!r} requires exactly {expected} "
+                f"server_ids (got {len(self.server_ids)})")
+        if len(set(self.server_ids)) != len(self.server_ids):
+            raise ValueError("centralized server_ids must be unique")
+        if self.primary_server_id not in self.server_ids:
+            raise ValueError(
+                "centralized primary_server_id must name one of server_ids")
+        if self.mode == "single":
+            if self.failure_at_s is not None:
+                raise ValueError(
+                    "centralized single mode does not support failure_at_s")
+            if self.standby_activate_after_s is not None:
+                raise ValueError(
+                    "centralized single mode has no standby")
+        elif self.failure_at_s is None and self.mode in {
+                "active_active", "active_passive"}:
+            raise ValueError(
+                f"centralized mode={self.mode!r} requires failure_at_s")
+        if self.mode == "active_passive":
+            if self.standby_activate_after_s is None:
+                self.standby_activate_after_s = self.failure_at_s
+        elif self.standby_activate_after_s is not None:
+            raise ValueError(
+                "standby_activate_after_s is active_passive only")
+        return self
+
+
 class Ros2WorkloadConfig(BaseModel):
     """R3 wiring B (ADR-0006): stock ROS 2 telemetry over a configurable RMW.
     On substrate=channel it peers across the emulated channel via one zenoh
@@ -191,13 +247,16 @@ class Ros2WorkloadConfig(BaseModel):
     # shared = one aggregation topic /swarm/telemetry that collapses the SEDP
     # matrix to O(N); star = one hub node + N-1 spokes with 2(N-1) directed
     # links, also O(N).  Validated against hub_id at the Scenario level below.
-    topology: Literal["mesh", "shared", "star"] = "mesh"
+    topology: Literal["mesh", "shared", "star", "centralized"] = "mesh"
     # Hub node id for topology=star.  The hub subscribes to /swarm/telemetry
     # (spoke→hub direction) and publishes /swarm/command (hub→spoke direction).
     # Must equal one of the Scenario node ids when topology='star'; must be
     # empty for topology='mesh'/'shared' (a stray hub_id silently means nothing
     # and almost certainly indicates a misconfigured scenario).
     hub_id: str = ""
+    # Populated only for topology=centralized.  None for every historical
+    # workload so old scenarios and result manifests retain their meaning.
+    centralized: CentralizedWorkloadConfig | None = None
     # ROS_DOMAIN_ID cluster partitioning (docs/dds-topology-plan.md P5,
     # implication #1 from the DDS benchmark results). 0 = single domain
     # (default; all existing behavior is unchanged).  K>0 = split the N nodes
@@ -529,6 +588,29 @@ class Scenario(BaseModel):
             raise ValueError(
                 f"ros2.hub_id={hub!r} requires ros2.topology='star' "
                 f"(got topology={topo!r}); clear hub_id or set topology='star'")
+        central = self.ros2.centralized
+        if topo == "centralized":
+            if central is None:
+                raise ValueError(
+                    "ros2.topology='centralized' requires ros2.centralized")
+            missing = sorted(set(central.server_ids) - ids)
+            if missing:
+                raise ValueError(
+                    f"centralized server_ids are not scenario nodes: {missing}")
+            if len(ids - set(central.server_ids)) < 1:
+                raise ValueError(
+                    "centralized workload requires at least one client node")
+            if (central.failure_at_s is not None
+                    and central.failure_at_s >= self.duration_s):
+                raise ValueError(
+                    "centralized failure_at_s must be before scenario duration_s")
+            if (central.standby_activate_after_s is not None
+                    and central.standby_activate_after_s >= self.duration_s):
+                raise ValueError(
+                    "centralized standby activation must be before duration_s")
+        elif central is not None:
+            raise ValueError(
+                "ros2.centralized requires ros2.topology='centralized'")
         return self
 
     @model_validator(mode="after")

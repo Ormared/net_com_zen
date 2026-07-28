@@ -3,6 +3,7 @@ inside a vehicle netns with RMW_IMPLEMENTATION=rmw_zenoh_cpp."""
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import time
@@ -65,6 +66,7 @@ class TelemetryNode(Node):
         super().__init__(f"telemetry_{args.id}")
         self.args = args
         self.seq = 0
+        self._started_mono = time.monotonic()
         self.metrics = open(args.metrics, "a", buffering=1)
         qos = build_qos(args)
         self._manual_liveliness = args.liveliness == "manual_by_topic"
@@ -114,8 +116,11 @@ class TelemetryNode(Node):
                     String, "/swarm/command", qos)
                 self.create_subscription(
                     String, "/swarm/telemetry", self._on_msg, qos)
+        elif topo == "centralized":
+            self._setup_centralized()
 
-        self.create_timer(args.period_ms / 1e3, self._tick)
+        if topo != "centralized":
+            self.create_timer(args.period_ms / 1e3, self._tick)
         # record the effective QoS + topology so each run's metrics are self-describing
         self._log({"type": "start", "id": args.id, "ts_us": now_us(),
                    "topology": args.topology, "role": args.role,
@@ -126,6 +131,169 @@ class TelemetryNode(Node):
                            "lifespan_ms": args.lifespan_ms,
                            "liveliness": args.liveliness,
                            "liveliness_lease_ms": args.liveliness_lease_ms}})
+
+    def _qos_with_reliability(self, reliability: str) -> QoSProfile:
+        ns = copy.copy(self.args)
+        ns.reliability = reliability
+        return build_qos(ns)
+
+    def _setup_centralized(self) -> None:
+        """Wire the mixed telemetry + command + service workload."""
+        from std_srvs.srv import Trigger
+
+        args = self.args
+        self._Trigger = Trigger
+        self._central_active = args.role == "server"
+        self._central_activated = False
+        self._pending_rpc: dict[int, tuple[int, object]] = {}
+        self._rpc_seq = 0
+        self._seen_commands: set[int] = set()
+        self._server_rpc_count = 0
+
+        shard = args.central_mode == "sharded"
+        target = args.assigned_server
+        telemetry_topic = (
+            f"/central/{target}/telemetry" if shard and args.role == "client"
+            else f"/central/{args.id}/telemetry" if shard
+            else "/central/telemetry")
+        command_topic = (
+            f"/central/{target}/command" if shard and args.role == "client"
+            else f"/central/{args.id}/command" if shard
+            else "/central/command")
+        service_name = (
+            f"/central/{target}/request" if shard and args.role == "client"
+            else f"/central/{args.id}/request" if shard
+            else "/central/request")
+        self._central_command_topic = command_topic
+        self._central_service_name = service_name
+
+        telemetry_qos = self._qos_with_reliability(
+            args.telemetry_reliability)
+        command_qos = self._qos_with_reliability("reliable")
+
+        if args.role == "client":
+            self.telemetry_pub = self.create_publisher(
+                String, telemetry_topic, telemetry_qos)
+            self.create_subscription(
+                String, command_topic, self._on_command, command_qos)
+            self.rpc_client = self.create_client(Trigger, service_name)
+            self.create_timer(
+                args.telemetry_period_ms / 1e3, self._telemetry_tick)
+            self.create_timer(args.rpc_period_ms / 1e3, self._rpc_tick)
+            self.create_timer(0.05, self._expire_rpc)
+        else:
+            self.create_subscription(
+                String, telemetry_topic, self._on_telemetry, telemetry_qos)
+            if self._central_active:
+                self._activate_server()
+            else:
+                self.create_timer(0.05, self._activation_check)
+
+    def _activate_server(self) -> None:
+        if self._central_activated:
+            return
+        self._central_activated = True
+        command_qos = self._qos_with_reliability("reliable")
+        self.command_pub = self.create_publisher(
+            String, self._central_command_topic, command_qos)
+        self.rpc_service = self.create_service(
+            self._Trigger, self._central_service_name, self._on_rpc)
+        self.create_timer(
+            self.args.command_period_ms / 1e3, self._command_tick)
+        self._log({"type": "server_active", "id": self.args.id,
+                   "ts_us": now_us()})
+
+    def _activation_check(self) -> None:
+        activate_at = self.args.activate_after_s
+        if (activate_at >= 0
+                and time.monotonic() - self._started_mono >= activate_at):
+            self._activate_server()
+
+    def _telemetry_tick(self) -> None:
+        self.seq += 1
+        ts_us = now_us()
+        data = pack(
+            self.args.id, self.seq, ts_us,
+            self.args.telemetry_payload_bytes)
+        self.telemetry_pub.publish(String(data=data))
+        self._log({"type": "telemetry_pub", "id": self.args.id,
+                   "seq": self.seq, "ts_us": ts_us, "bytes": len(data)})
+
+    def _on_telemetry(self, msg: String) -> None:
+        peer, seq, ts_us = unpack(msg.data)
+        self._log({"type": "telemetry_recv", "id": self.args.id,
+                   "from": peer, "peer_seq": seq, "peer_ts_us": ts_us,
+                   "ts_us": now_us(), "bytes": len(msg.data)})
+
+    def _command_tick(self) -> None:
+        self.seq += 1
+        ts_us = now_us()
+        data = pack(
+            self.args.id, self.seq, ts_us,
+            self.args.command_payload_bytes)
+        self.command_pub.publish(String(data=data))
+        self._log({"type": "command_pub", "id": self.args.id,
+                   "seq": self.seq, "ts_us": ts_us, "bytes": len(data)})
+
+    def _on_command(self, msg: String) -> None:
+        server, seq, ts_us = unpack(msg.data)
+        duplicate = seq in self._seen_commands
+        self._seen_commands.add(seq)
+        self._log({"type": "command_duplicate" if duplicate
+                   else "command_recv",
+                   "id": self.args.id, "from": server, "peer_seq": seq,
+                   "peer_ts_us": ts_us, "ts_us": now_us(),
+                   "bytes": len(msg.data)})
+
+    def _rpc_tick(self) -> None:
+        self._rpc_seq += 1
+        seq = self._rpc_seq
+        started_us = now_us()
+        if not self.rpc_client.service_is_ready():
+            self._log({"type": "rpc_unavailable", "id": self.args.id,
+                       "seq": seq, "ts_us": started_us})
+            return
+        future = self.rpc_client.call_async(self._Trigger.Request())
+        self._pending_rpc[seq] = (started_us, future)
+        self._log({"type": "rpc_start", "id": self.args.id,
+                   "seq": seq, "ts_us": started_us})
+
+        def done(fut, request_seq=seq):
+            pending = self._pending_rpc.pop(request_seq, None)
+            if pending is None:
+                return
+            try:
+                response = fut.result()
+                self._log({
+                    "type": "rpc_success", "id": self.args.id,
+                    "seq": request_seq, "server": response.message,
+                    "started_us": pending[0], "ts_us": now_us(),
+                })
+            except Exception as exc:
+                self._log({"type": "rpc_error", "id": self.args.id,
+                           "seq": request_seq, "error": type(exc).__name__,
+                           "started_us": pending[0], "ts_us": now_us()})
+
+        future.add_done_callback(done)
+
+    def _expire_rpc(self, force: bool = False) -> None:
+        now = now_us()
+        timeout_us = self.args.rpc_timeout_ms * 1000
+        for seq, (started, future) in list(self._pending_rpc.items()):
+            if not force and now - started < timeout_us:
+                continue
+            self._pending_rpc.pop(seq, None)
+            future.cancel()
+            self._log({"type": "rpc_timeout", "id": self.args.id,
+                       "seq": seq, "started_us": started, "ts_us": now})
+
+    def _on_rpc(self, request, response):
+        self._server_rpc_count += 1
+        response.success = True
+        response.message = f"{self.args.id}:{self._server_rpc_count}"
+        self._log({"type": "rpc_served", "id": self.args.id,
+                   "seq": self._server_rpc_count, "ts_us": now_us()})
+        return response
 
     def _log(self, ev: dict) -> None:
         # compact separators: the harness greps for '"type":"pub"' (report.py)
@@ -163,14 +331,34 @@ def main() -> None:
     ap.add_argument("--id", required=True)
     ap.add_argument("--peers", required=False, default="",
                     help="comma-separated peer ids (mesh only; unused for shared/star)")
-    ap.add_argument("--topology", choices=["mesh", "shared", "star"], default="mesh",
+    ap.add_argument("--topology",
+                    choices=["mesh", "shared", "star", "centralized"],
+                    default="mesh",
                     help="endpoint topology: mesh=O(N²) all-to-all (default); "
                          "shared=one aggregation topic O(N); star=hub+spokes O(N)")
-    ap.add_argument("--role", choices=["spoke", "hub"], default="spoke",
+    ap.add_argument("--role",
+                    choices=["spoke", "hub", "client", "server", "standby"],
+                    default="spoke",
                     help="star role: spoke publishes telemetry up, hub fans commands "
                          "down (ignored for mesh/shared)")
     ap.add_argument("--period-ms", type=int, default=500)
     ap.add_argument("--payload-bytes", type=int, default=255)
+    ap.add_argument("--central-mode",
+                    choices=["single", "active_active", "active_passive",
+                             "sharded"],
+                    default="single")
+    ap.add_argument("--server-ids", default="")
+    ap.add_argument("--assigned-server", default="")
+    ap.add_argument("--activate-after-s", type=float, default=-1.0)
+    ap.add_argument("--telemetry-period-ms", type=int, default=200)
+    ap.add_argument("--telemetry-payload-bytes", type=int, default=255)
+    ap.add_argument("--telemetry-reliability",
+                    choices=["reliable", "best_effort"],
+                    default="best_effort")
+    ap.add_argument("--command-period-ms", type=int, default=1000)
+    ap.add_argument("--command-payload-bytes", type=int, default=255)
+    ap.add_argument("--rpc-period-ms", type=int, default=1000)
+    ap.add_argument("--rpc-timeout-ms", type=int, default=2000)
     ap.add_argument("--reliability", choices=["reliable", "best_effort"],
                     default="reliable")
     ap.add_argument("--durability", choices=["volatile", "transient_local"],
@@ -195,6 +383,8 @@ def main() -> None:
     end = time.time() + args.duration_s
     while time.time() < end:
         rclpy.spin_once(node, timeout_sec=0.2)
+    if args.topology == "centralized" and args.role == "client":
+        node._expire_rpc(force=True)
     node._log({"type": "final_state", "id": args.id, "ts_us": now_us()})
     node.metrics.flush()
     # rmw_cyclonedds_cpp (and occasionally fastrtps) can hang for seconds in

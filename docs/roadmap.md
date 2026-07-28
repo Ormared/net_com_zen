@@ -9,6 +9,13 @@ hardening), and the full M5 track (M5.1–M5.3) are done. Remaining work:
 
 # Roadmap
 
+## Centralized ROS 2 RMW comparison
+
+The new centralized client/server track is specified in
+[centralized-rmw-plan.md](centralized-rmw-plan.md).  Its harness is implemented;
+the full measurement matrix remains to be executed and written up in
+[results/dds-centralized.md](results/dds-centralized.md).
+
 | Milestone | Scope | Exit criteria |
 |---|---|---|
 | **M1 — Channel core** | Mobility, propagation, FHSS/jammer models, channel engine forwarder, netns plumbing, validation suite | 2-node smoke test passes (zenoh pub/sub through the engine); validation report clean; deterministic replay test green |
@@ -34,4 +41,3 @@ Testing discipline throughout: unit tests per module; the model validation suite
 results, rendered as a report — it is the artifact that makes benchmark results
 defensible. Integration smoke test runs in CI (requires CAP_NET_ADMIN; user-namespace
 or privileged runner).
-

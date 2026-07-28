@@ -40,6 +40,7 @@ echo "==> [1/5] Syncing repo to ${target}:~/net_com_zen ..."
 rsync -az --delete \
     --exclude='.git' \
     --exclude='.pixi' \
+    --exclude='.pixi_env_stamp' \
     --exclude='results' \
     --exclude='agent/target' \
     --exclude='__pycache__' \

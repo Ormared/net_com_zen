@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import pwd
 import shlex
 import subprocess
 import sys
@@ -52,7 +53,9 @@ def _cluster_of(idx: int, n: int, k: int) -> int:
 
 
 def _cyclonedds_xml(socket_buffer_bytes: int = 0, iface_name: str = "",
-                    internal: dict[str, str] | None = None) -> str:
+                    internal: dict[str, str] | None = None,
+                    peers: list[str] | None = None,
+                    allow_multicast: bool = True) -> str:
     """Cyclone DDS config for the bridge or lan substrate: SHM/Iceoryx off
     (force real UDP, no same-host shortcut) and multicast on so native
     discovery floods across the bridge. Domain id="any" applies under any
@@ -81,10 +84,18 @@ def _cyclonedds_xml(socket_buffer_bytes: int = 0, iface_name: str = "",
            if internal_elems else "")
     # Interface element: explicit NIC name when pinning is requested, otherwise
     # autodetermine (safe in netns where the only non-lo interface is the veth).
+    multicast = str(allow_multicast).lower()
     if iface_name:
-        iface_elem = f'        <NetworkInterface name="{iface_name}" multicast="true"/>\n'
+        iface_elem = (f'        <NetworkInterface name="{iface_name}" '
+                      f'multicast="{multicast}"/>\n')
     else:
-        iface_elem = '        <NetworkInterface autodetermine="true" multicast="true"/>\n'
+        iface_elem = (f'        <NetworkInterface autodetermine="true" '
+                      f'multicast="{multicast}"/>\n')
+    peer_xml = "".join(
+        f'        <Peer Address="{addr}"/>\n' for addr in (peers or []))
+    peers_block = (
+        f'      <Peers>\n{peer_xml}      </Peers>\n'
+        if peers is not None else "")
     return ('<?xml version="1.0" encoding="UTF-8" ?>\n'
             '<CycloneDDS xmlns="https://cdds.io/config"\n'
             '    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"\n'
@@ -96,7 +107,7 @@ def _cyclonedds_xml(socket_buffer_bytes: int = 0, iface_name: str = "",
             '      <Interfaces>\n'
             f'{iface_elem}'
             '      </Interfaces>\n'
-            '      <AllowMulticast>true</AllowMulticast>\n'
+            f'      <AllowMulticast>{multicast}</AllowMulticast>\n'
             '    </General>\n'
             '    <SharedMemory>\n'
             '      <Enable>false</Enable>\n'
@@ -110,6 +121,7 @@ def _cyclonedds_xml(socket_buffer_bytes: int = 0, iface_name: str = "",
             # every node its own IP (index 0) and never hit this.
             '    <Discovery>\n'
             '      <MaxAutoParticipantIndex>150</MaxAutoParticipantIndex>\n'
+            f'{peers_block}'
             '    </Discovery>\n'
             '  </Domain>\n'
             '</CycloneDDS>\n')
@@ -216,6 +228,28 @@ def _git_hash() -> str:
         return "unknown"
 
 
+def _ssh_base() -> list[str]:
+    """SSH transport, reusing the invoking user's credentials under sudo.
+
+    LAN orchestration needs root for local network setup, but home-mini trusts
+    the interactive user's SSH key and known_hosts file, not /root/.ssh.
+    Referencing those files in place avoids copying private credentials.
+    """
+    cmd = ["ssh", "-o", "BatchMode=yes"]
+    sudo_user = os.environ.get("SUDO_USER")
+    if os.geteuid() == 0 and sudo_user and sudo_user != "root":
+        home = Path(pwd.getpwnam(sudo_user).pw_dir)
+        known_hosts = home / ".ssh" / "known_hosts"
+        if known_hosts.exists():
+            cmd += ["-o", f"UserKnownHostsFile={known_hosts}"]
+        for name in ("id_ed25519", "id_rsa", "id_ecdsa"):
+            identity = home / ".ssh" / name
+            if identity.exists():
+                cmd += ["-o", "IdentitiesOnly=yes", "-i", str(identity)]
+                break
+    return cmd
+
+
 def _ssh_cmd(target: str, remote_argv: list[str]) -> list[str]:
     """Build an ssh argv that reconstructs the remote command exactly.
 
@@ -233,7 +267,7 @@ def _ssh_cmd(target: str, remote_argv: list[str]) -> list[str]:
         ssh target 'docker exec -e "K=v" container cmd arg'
     but constructed programmatically without manual quoting.
     """
-    return ["ssh", "-o", "BatchMode=yes", target, shlex.join(remote_argv)]
+    return [*_ssh_base(), target, shlex.join(remote_argv)]
 
 
 @dataclass
@@ -357,13 +391,15 @@ class ScenarioEngine:
             )
         else:
             peers = ",".join(p for p in self.topo.nodes if p != nid)
-        role = "hub" if nid == cfg.hub_id else "spoke"
+        role, assigned_server, activate_after = self._workload_role(nid)
         return ["ip", "netns", "exec", self.topo.ns_names[nid],
                 sys.executable, "-m", "netcom_zen.ros2_workload",
                 "--id", nid,
                 "--peers", peers,
                 "--topology", cfg.topology,
                 "--role", role,
+                *self._centralized_workload_args(
+                    assigned_server, activate_after),
                 "--period-ms", str(cfg.period_ms),
                 "--payload-bytes", str(cfg.payload_bytes),
                 "--reliability", cfg.reliability,
@@ -376,6 +412,49 @@ class ScenarioEngine:
                 "--liveliness-lease-ms", str(cfg.liveliness_lease_ms),
                 "--duration-s", str(self.scenario.duration_s),
                 "--metrics", str(self.out_dir / f"agent_{nid}.jsonl")]
+
+    def _workload_role(self, nid: str) -> tuple[str, str, float]:
+        """Return workload role, shard assignment, and standby activation."""
+        cfg = self.scenario.ros2
+        if cfg.topology != "centralized":
+            return ("hub" if nid == cfg.hub_id else "spoke", "", -1.0)
+        central = cfg.centralized
+        assert central is not None
+        if nid in central.server_ids:
+            if (central.mode == "active_passive"
+                    and nid != central.primary_server_id):
+                return ("standby", nid,
+                        float(central.standby_activate_after_s))
+            return ("server", nid, -1.0)
+        clients = [
+            n.id for n in self.scenario.nodes
+            if n.id not in central.server_ids
+        ]
+        assigned = central.server_ids[
+            clients.index(nid) % len(central.server_ids)]
+        return "client", assigned, -1.0
+
+    def _centralized_workload_args(
+            self, assigned_server: str, activate_after: float) -> list[str]:
+        cfg = self.scenario.ros2
+        if cfg.topology != "centralized":
+            return []
+        central = cfg.centralized
+        assert central is not None
+        return [
+            "--central-mode", central.mode,
+            "--server-ids", ",".join(central.server_ids),
+            "--assigned-server", assigned_server,
+            "--activate-after-s", str(activate_after),
+            "--telemetry-period-ms", str(central.telemetry_period_ms),
+            "--telemetry-payload-bytes",
+            str(central.telemetry_payload_bytes),
+            "--telemetry-reliability", central.telemetry_reliability,
+            "--command-period-ms", str(central.command_period_ms),
+            "--command-payload-bytes", str(central.command_payload_bytes),
+            "--rpc-period-ms", str(central.rpc_period_ms),
+            "--rpc-timeout-ms", str(central.rpc_timeout_ms),
+        ]
 
     def _spawn_ros2(self) -> dict[str, subprocess.Popen]:
         """Stock-ROS2 telemetry workload under the configured RMW (DDS benchmark
@@ -393,10 +472,16 @@ class ScenarioEngine:
         log_dir = self.out_dir / "ros_logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         if rmw == "zenoh":
+            if self.scenario.ros2.topology == "centralized":
+                return self._spawn_zenoh_centralized(log_dir)
             return self._spawn_zenoh(log_dir)
         buf = self.scenario.ros2.socket_buffer_bytes
         alloc = self.scenario.ros2.fastdds_allocation_participants
         if rmw == "fastrtps":
+            if (self.scenario.ros2.topology == "centralized"
+                    and self.scenario.ros2.centralized.discovery_mode
+                    == "centralized"):
+                return self._spawn_fastdds_servers(log_dir)
             if self.scenario.ros2.discovery_server:
                 return self._spawn_fastdds_server(log_dir)
             if buf > 0 or alloc > 0:
@@ -415,6 +500,10 @@ class ScenarioEngine:
                 "rmw_fastrtps_cpp", log_dir,
                 lambda nid: {"FASTDDS_BUILTIN_TRANSPORTS": "UDPv4"})
         if rmw == "cyclonedds":
+            if (self.scenario.ros2.topology == "centralized"
+                    and self.scenario.ros2.centralized.discovery_mode
+                    == "centralized"):
+                return self._spawn_cyclone_centralized(log_dir)
             xml = self.out_dir / "cyclonedds.xml"
             xml.write_text(_cyclonedds_xml(
                 buf, internal=self.scenario.ros2.cyclonedds_internal))
@@ -422,6 +511,25 @@ class ScenarioEngine:
                 "rmw_cyclonedds_cpp", log_dir,
                 lambda nid: {"CYCLONEDDS_URI": f"file://{xml}"})
         raise RuntimeError(f"unknown rmw {rmw!r}")
+
+    def _spawn_cyclone_centralized(
+            self, log_dir: Path) -> dict[str, subprocess.Popen]:
+        central = self.scenario.ros2.centralized
+        assert central is not None
+        server_addrs = [self.topo.addrs[s] for s in central.server_ids]
+        base = self._ros2_base_env("rmw_cyclonedds_cpp", log_dir)
+        agents: dict[str, subprocess.Popen] = {}
+        for nid in self.topo.nodes:
+            xml = self.out_dir / f"cyclonedds_{nid}.xml"
+            xml.write_text(_cyclonedds_xml(
+                self.scenario.ros2.socket_buffer_bytes,
+                internal=self.scenario.ros2.cyclonedds_internal,
+                peers=[a for a in server_addrs if a != self.topo.addrs[nid]],
+                allow_multicast=False))
+            agents[nid] = subprocess.Popen(
+                self._workload_cmd(nid),
+                env={**base, "CYCLONEDDS_URI": f"file://{xml}"})
+        return agents
 
     def _spawn_routerless(self, rmw_impl: str, log_dir: Path,
                           extra_env) -> dict[str, subprocess.Popen]:
@@ -449,6 +557,41 @@ class ScenarioEngine:
     # binds this on node 0's bridge address; every client unicasts discovery to
     # it instead of flooding SPDP multicast.
     _DS_PORT = 11811
+
+    def _spawn_fastdds_servers(
+            self, log_dir: Path) -> dict[str, subprocess.Popen]:
+        """One discovery server per application server for centralized runs."""
+        central = self.scenario.ros2.centralized
+        assert central is not None
+        prefix = Path(sys.executable).resolve().parents[1]
+        server_bin = prefix / "bin" / "fast-discovery-server"
+        if not server_bin.exists():
+            raise RuntimeError(
+                f"{server_bin} not found: centralized Fast DDS needs the "
+                "ros2 pixi environment")
+        base = self._ros2_base_env("rmw_fastrtps_cpp", log_dir)
+        endpoints: list[str] = []
+        for i, nid in enumerate(central.server_ids):
+            addr = self.topo.addrs[nid]
+            port = self._DS_PORT + i
+            endpoints.append(f"{addr}:{port}")
+            self._routers[f"ds:{nid}"] = subprocess.Popen(
+                ["ip", "netns", "exec", self.topo.ns_names[nid],
+                 str(server_bin), "-i", str(i), "-l", addr,
+                 "-p", str(port)],
+                env=base,
+                stdout=(self.out_dir / f"fastdds_ds_{nid}.log").open("w"),
+                stderr=subprocess.STDOUT)
+        time.sleep(1.0)
+        client_env = {
+            "FASTDDS_BUILTIN_TRANSPORTS": "UDPv4",
+            "ROS_DISCOVERY_SERVER": ";".join(endpoints),
+        }
+        return {
+            nid: subprocess.Popen(
+                self._workload_cmd(nid), env={**base, **client_env})
+            for nid in self.topo.nodes
+        }
 
     def _spawn_fastdds_server(self, log_dir: Path) -> dict[str, subprocess.Popen]:
         """Fast DDS client-server discovery (tuning experiment, dds-rmw-tuning.md
@@ -553,6 +696,46 @@ class ScenarioEngine:
             agents[nid] = subprocess.Popen(self._workload_cmd(nid),
                                            env=node_env)
         return agents
+
+    def _spawn_zenoh_centralized(
+            self, log_dir: Path) -> dict[str, subprocess.Popen]:
+        """Run one central router per application server, never per client."""
+        cfg = self.scenario.ros2
+        central = cfg.centralized
+        assert central is not None
+        prefix = Path(sys.executable).resolve().parents[1]
+        zenohd = prefix / "lib" / "rmw_zenoh_cpp" / "rmw_zenohd"
+        if not zenohd.exists():
+            raise RuntimeError(
+                f"{zenohd} not found: centralized zenoh needs the ros2 pixi env")
+        base = self._ros2_base_env("rmw_zenoh_cpp", log_dir)
+        endpoints = [
+            f"tcp/{self.topo.addrs[nid]}:{cfg.port + i}"
+            for i, nid in enumerate(central.server_ids)
+        ]
+        for i, nid in enumerate(central.server_ids):
+            listen = (
+                f'listen/endpoints=["{endpoints[i]}",'
+                f'"tcp/127.0.0.1:{cfg.port + i}"]')
+            connect = (
+                f';connect/endpoints=["{endpoints[0]}"]' if i > 0 else "")
+            routing = ";routing/router/peers_failover_brokering=true"
+            self._routers[f"central:{nid}"] = subprocess.Popen(
+                ["ip", "netns", "exec", self.topo.ns_names[nid], str(zenohd)],
+                env={**base, "ZENOH_CONFIG_OVERRIDE":
+                     listen + connect + routing},
+                stdout=(self.out_dir / f"router_{nid}.log").open("w"),
+                stderr=subprocess.STDOUT)
+        time.sleep(1.0)
+        connect = (
+            f'mode="client";connect/endpoints=['
+            f'{",".join(json.dumps(e) for e in endpoints)}]')
+        return {
+            nid: subprocess.Popen(
+                self._workload_cmd(nid),
+                env={**base, "ZENOH_CONFIG_OVERRIDE": connect})
+            for nid in self.topo.nodes
+        }
 
     async def run(self) -> None:
         self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -713,6 +896,7 @@ class ScenarioEngine:
         self._routers = {}
         agents: dict[str, subprocess.Popen] = {}
         agent_exit: dict[str, int | None] = {}
+        fault_events: list[dict] = []
         samples: list[dict] = []
         sample_dt = 1.0  # resource sampling cadence (s)
         # raise host socket-buffer ceilings BEFORE any DDS proc starts, else a
@@ -738,14 +922,48 @@ class ScenarioEngine:
             duration = self.scenario.duration_s
             grace = duration + 10.0  # let agents finish past duration (logged)
             tick = 0
+            fault_injected = False
+            low_mem_since: float | None = None
+            resource_abort_reason: str | None = None
             # keep sampling until duration elapsed AND agents exited (a dead
             # agent mid-run is a logged event, not an abort), capped by grace
             while True:
                 elapsed = time.monotonic() - wall0
+                central = self.scenario.ros2.centralized
+                if (not fault_injected and central is not None
+                        and central.failure_at_s is not None
+                        and elapsed >= central.failure_at_s):
+                    primary = central.primary_server_id
+                    proc = agents.get(primary)
+                    if proc is not None and proc.poll() is None:
+                        proc.kill()
+                    for key, infra in self._routers.items():
+                        if primary in key and infra.poll() is None:
+                            infra.kill()
+                    fault_events.append({
+                        "type": "primary_failure",
+                        "server_id": primary,
+                        "elapsed_s": round(elapsed, 3),
+                    })
+                    fault_injected = True
                 alive = any(p.poll() is None for p in agents.values())
                 if (elapsed >= duration and not alive) or elapsed >= grace:
                     break
-                samples.append(self._sample_resources(round(elapsed, 3), meters))
+                sample = self._sample_resources(round(elapsed, 3), meters)
+                samples.append(sample)
+                if central is not None:
+                    floor = int(os.environ.get(
+                        "NETCOM_CENTRAL_MEM_ABORT_BYTES",
+                        str(6 * 1024**3)))
+                    if sample["host_mem_avail"] < floor:
+                        low_mem_since = low_mem_since or time.monotonic()
+                        if time.monotonic() - low_mem_since >= 10:
+                            resource_abort_reason = (
+                                "available memory remained below "
+                                f"{floor} bytes for 10 seconds")
+                            break
+                    else:
+                        low_mem_since = None
                 tick += 1
                 # deadline-paced like the channel tick loop, so per-sample work
                 # doesn't accumulate as drift (orchestrator-tick-pacing)
@@ -803,6 +1021,8 @@ class ScenarioEngine:
                 if self.scenario.ros2.cluster_domains > 0 else {}
             ),
             "agent_exit_codes": agent_exit,
+            "fault_events": fault_events,
+            "resource_abort_reason": resource_abort_reason,
         }, indent=2))
 
     @staticmethod
@@ -1011,7 +1231,7 @@ class ScenarioEngine:
         # loudly if it accidentally enters mesh mode with an empty peer list.
         peers = (",".join(p for p in all_ids if p != nid)
                  if cfg.topology == "mesh" else "")
-        role = "hub" if nid == cfg.hub_id else "spoke"
+        role, assigned_server, activate_after = self._workload_role(nid)
 
         # Workload arguments are identical across local and remote; only the
         # interpreter prefix, --metrics path, and env-injection method differ.
@@ -1021,6 +1241,8 @@ class ScenarioEngine:
             "--peers", peers,
             "--topology", cfg.topology,
             "--role", role,
+            *self._centralized_workload_args(
+                assigned_server, activate_after),
             "--period-ms", str(cfg.period_ms),
             "--payload-bytes", str(cfg.payload_bytes),
             "--reliability", cfg.reliability,
@@ -1123,7 +1345,7 @@ class ScenarioEngine:
             all_ids = [n.id for n in self.scenario.nodes]
             peers = (",".join(p for p in all_ids if p != nid)
                      if cfg.topology == "mesh" else "")
-            role = "hub" if nid == cfg.hub_id else "spoke"
+            role, assigned_server, activate_after = self._workload_role(nid)
             remote_metrics = f"{run_dir}/agent_{nid}.jsonl"
             node_log = f"{run_dir}/node_{nid}.log"
 
@@ -1133,6 +1355,8 @@ class ScenarioEngine:
                 "--peers", peers,
                 "--topology", cfg.topology,
                 "--role", role,
+                *self._centralized_workload_args(
+                    assigned_server, activate_after),
                 "--period-ms", str(cfg.period_ms),
                 "--payload-bytes", str(cfg.payload_bytes),
                 "--reliability", cfg.reliability,
@@ -1188,6 +1412,8 @@ class ScenarioEngine:
         """
         cfg = self.scenario.ros2
         rmw = cfg.rmw
+        central = (cfg.centralized
+                   if cfg.topology == "centralized" else None)
         hosts = self.scenario.hosts          # dict[str, LanHostConfig]
         all_nodes = self.scenario.nodes
         node_ids = [n.id for n in all_nodes]
@@ -1205,6 +1431,7 @@ class ScenarioEngine:
         self._routers: dict[str, subprocess.Popen] = {}
         agents: dict[str, subprocess.Popen] = {}
         agent_exit: dict[str, int | None] = {}
+        fault_events: list[dict] = []
         samples: list[dict] = []
         sample_dt = 1.0  # resource sampling cadence (s) — same as bridge
 
@@ -1284,13 +1511,19 @@ class ScenarioEngine:
                             "FASTDDS_DEFAULT_PROFILES_FILE": remote_xml}
 
             elif rmw == "cyclonedds":
+                central_peer_addrs = (
+                    [hosts[host_of[s]].addr for s in central.server_ids]
+                    if central is not None
+                    and central.discovery_mode == "centralized" else None)
                 for name, h in hosts.items():
                     # iface_name pins Cyclone to the correct NIC; without it,
                     # Cyclone announces locators on every interface (including
                     # zerotier and tailscale) which breaks cross-host discovery.
                     xml_content = _cyclonedds_xml(
                         0, iface_name=h.iface,
-                        internal=self.scenario.ros2.cyclonedds_internal)
+                        internal=self.scenario.ros2.cyclonedds_internal,
+                        peers=central_peer_addrs,
+                        allow_multicast=central_peer_addrs is None)
                     if h.ssh == "":
                         xml_path = out_dir / f"cyclonedds_{name}.xml"
                         xml_path.write_text(xml_content)
@@ -1308,13 +1541,56 @@ class ScenarioEngine:
                         xml_env[name] = {
                             "CYCLONEDDS_URI": f"file://{remote_xml}"}
 
-            # --- 3. Spawn zenoh routers (ONE per host, not per node) ---------
+            # Centralized Fast DDS uses one discovery server colocated with
+            # each application server.  Native mode keeps the historical
+            # multicast path.
+            if (rmw == "fastrtps" and central is not None
+                    and central.discovery_mode == "centralized"):
+                prefix = Path(sys.executable).resolve().parents[1]
+                ds_local = prefix / "bin" / "fast-discovery-server"
+                ds_remote = f"{remote_ament}/bin/fast-discovery-server"
+                ds_endpoints = []
+                for i, sid in enumerate(central.server_ids):
+                    host_name = host_of[sid]
+                    h = hosts[host_name]
+                    port = self._DS_PORT + i
+                    ds_endpoints.append(f"{h.addr}:{port}")
+                    log = (out_dir / f"fastdds_ds_{sid}.log").open("w")
+                    argv = [
+                        str(ds_local), "-i", str(i), "-l", h.addr,
+                        "-p", str(port)]
+                    if h.ssh:
+                        argv = _ssh_cmd(h.ssh, [
+                            "docker", "exec",
+                            "-e", f"AMENT_PREFIX_PATH={remote_ament}",
+                            h.container, ds_remote, "-i", str(i),
+                            "-l", h.addr, "-p", str(port)])
+                    self._routers[f"ds:{sid}"] = subprocess.Popen(
+                        argv, env=(local_base if not h.ssh else None),
+                        stdout=log, stderr=subprocess.STDOUT)
+                ds_env = {
+                    "FASTDDS_BUILTIN_TRANSPORTS": "UDPv4",
+                    "ROS_DISCOVERY_SERVER": ";".join(ds_endpoints),
+                }
+                for name in hosts:
+                    xml_env[name] = {**xml_env.get(name, {}), **ds_env}
+                time.sleep(1.0)
+
+            # --- 3. Spawn zenoh routers --------------------------------------
             # The host-level lower-index mesh mirrors _spawn_zenoh's node-level
             # mesh: host i connects to all hosts[0..i-1].  Every workload node
             # then connects to tcp/127.0.0.1:<port> on its own host's router
             # (the container uses --network host so loopback is shared).
             if rmw == "zenoh":
-                host_list = list(hosts.items())   # insertion order = mesh order
+                if central is not None:
+                    router_specs = [
+                        (f"central:{sid}", host_of[sid],
+                         cfg.port + i, sid)
+                        for i, sid in enumerate(central.server_ids)]
+                else:
+                    router_specs = [
+                        (name, name, cfg.port, "")
+                        for name in hosts]
                 prefix = Path(sys.executable).resolve().parents[1]
                 zenohd_local = (
                     prefix / "lib" / "rmw_zenoh_cpp" / "rmw_zenohd")
@@ -1324,20 +1600,28 @@ class ScenarioEngine:
                         "rmw=zenoh needs the ros2 pixi env")
                 zenohd_remote = (
                     f"{remote_ament}/lib/rmw_zenoh_cpp/rmw_zenohd")
-                for i, (host_name, h) in enumerate(host_list):
+                endpoint_by_key = {
+                    key: f"tcp/{hosts[host_name].addr}:{port}"
+                    for key, host_name, port, _ in router_specs}
+                for i, (key, host_name, port, sid) in enumerate(router_specs):
+                    h = hosts[host_name]
                     listen = (
                         f'listen/endpoints=['
-                        f'"tcp/{h.addr}:{cfg.port}",'
-                        f'"tcp/127.0.0.1:{cfg.port}"]')
-                    lower = [
-                        f'"tcp/{host_list[j][1].addr}:{cfg.port}"'
-                        for j in range(i)]
+                        f'"tcp/{h.addr}:{port}",'
+                        f'"tcp/127.0.0.1:{port}"]')
+                    lower = [f'"{endpoint_by_key[router_specs[j][0]]}"'
+                             for j in range(i)]
                     override = listen + (
                         f';connect/endpoints=[{",".join(lower)}]'
                         if lower else '')
-                    router_log = (out_dir / f"router_{host_name}.log").open("w")
+                    if central is not None:
+                        override += (
+                            ";routing/router/"
+                            "peers_failover_brokering=true")
+                    safe_key = key.replace(":", "_")
+                    router_log = (out_dir / f"router_{safe_key}.log").open("w")
                     if h.ssh == "":
-                        self._routers[host_name] = subprocess.Popen(
+                        self._routers[key] = subprocess.Popen(
                             [str(zenohd_local)],
                             env={**local_base,
                                  "ZENOH_CONFIG_OVERRIDE": override},
@@ -1346,7 +1630,7 @@ class ScenarioEngine:
                         # Remote router: env travels as docker exec -e flags.
                         # override contains quoted endpoint lists; _ssh_cmd's
                         # shlex.join keeps them intact through the remote shell.
-                        self._routers[host_name] = subprocess.Popen(
+                        self._routers[key] = subprocess.Popen(
                             _ssh_cmd(h.ssh, [
                                 "docker", "exec",
                                 "-e", f"ZENOH_CONFIG_OVERRIDE={override}",
@@ -1358,6 +1642,10 @@ class ScenarioEngine:
                 # Give all routers time to bind and accept before sessions
                 # connect (same 1-second grace as _spawn_zenoh).
                 time.sleep(1.0)
+                zenoh_central_connect = (
+                    f'mode="client";connect/endpoints=['
+                    f'{",".join(json.dumps(v) for v in endpoint_by_key.values())}]'
+                    if central is not None else "")
 
             # --- 4. Spawn workload nodes ----------------------------------------
             # Local nodes: one Popen per node (unchanged).
@@ -1382,8 +1670,9 @@ class ScenarioEngine:
                     # All nodes connect to loopback; the router on each host
                     # exposes loopback + its LAN IP for cross-host transport.
                     node_extra = {"ZENOH_CONFIG_OVERRIDE":
-                                  f'connect/endpoints=['
-                                  f'"tcp/127.0.0.1:{cfg.port}"]'}
+                                  (zenoh_central_connect if central is not None
+                                   else f'connect/endpoints=['
+                                        f'"tcp/127.0.0.1:{cfg.port}"]')}
                 else:
                     node_extra = xml_env.get(host_name, {})
                 cmd = self._lan_node_cmd(nid, host_name)
@@ -1404,8 +1693,10 @@ class ScenarioEngine:
                         continue
                     if rmw == "zenoh":
                         node_extra = {"ZENOH_CONFIG_OVERRIDE":
-                                      f'connect/endpoints=['
-                                      f'"tcp/127.0.0.1:{cfg.port}"]'}
+                                      (zenoh_central_connect
+                                       if central is not None
+                                       else f'connect/endpoints=['
+                                            f'"tcp/127.0.0.1:{cfg.port}"]')}
                     else:
                         node_extra = xml_env.get(host_name, {})
                     node_envs[nid] = {
@@ -1457,7 +1748,10 @@ class ScenarioEngine:
             local_pids.update({
                 f"router:{name}": p
                 for name, p in self._routers.items()
-                if hosts[name].ssh == ""})
+                if hosts[
+                    host_of[name.split(":", 1)[1]]
+                    if ":" in name else name
+                ].ssh == ""})
             meters = {
                 name: psutil.Process(p.pid)
                 for name, p in local_pids.items()
@@ -1470,15 +1764,68 @@ class ScenarioEngine:
             duration = self.scenario.duration_s
             grace = duration + 10.0
             tick = 0
+            fault_injected = False
+            low_mem_since: float | None = None
+            resource_abort_reason: str | None = None
             # Run until duration elapsed AND all agents exited, or grace expired.
             # Remote nodes exit on --duration-s; the ssh Popen exits with them.
             while True:
                 elapsed = time.monotonic() - wall0
+                if (not fault_injected and central is not None
+                        and central.failure_at_s is not None
+                        and elapsed >= central.failure_at_s):
+                    primary = central.primary_server_id
+                    primary_host = hosts[host_of[primary]]
+                    if primary_host.ssh == "":
+                        proc = agents.get(primary)
+                        if proc is not None and proc.poll() is None:
+                            proc.kill()
+                    else:
+                        subprocess.run(
+                            _ssh_cmd(primary_host.ssh, [
+                                "docker", "exec", primary_host.container,
+                                "pkill", "-f",
+                                f"netcom_zen.ros2_workload.*--id {primary}"]),
+                            capture_output=True)
+                        # The local Popen for remote infrastructure is only an
+                        # SSH channel; killing it does not terminate the
+                        # container child.  A redundancy LAN scenario places
+                        # one server per host, so removing both middleware
+                        # processes on the primary host models that host loss.
+                        for target in (
+                                "rmw_zenohd", "fast-discovery-server"):
+                            subprocess.run(
+                                _ssh_cmd(primary_host.ssh, [
+                                    "docker", "exec", primary_host.container,
+                                    "pkill", "-f", target]),
+                                capture_output=True)
+                    for key, proc in self._routers.items():
+                        if primary in key and proc.poll() is None:
+                            proc.kill()
+                    fault_events.append({
+                        "type": "primary_failure",
+                        "server_id": primary,
+                        "elapsed_s": round(elapsed, 3),
+                    })
+                    fault_injected = True
                 alive = any(p.poll() is None for p in agents.values())
                 if (elapsed >= duration and not alive) or elapsed >= grace:
                     break
-                samples.append(
-                    self._sample_resources(round(elapsed, 3), meters))
+                sample = self._sample_resources(round(elapsed, 3), meters)
+                samples.append(sample)
+                if central is not None:
+                    floor = int(os.environ.get(
+                        "NETCOM_CENTRAL_MEM_ABORT_BYTES",
+                        str(6 * 1024**3)))
+                    if sample["host_mem_avail"] < floor:
+                        low_mem_since = low_mem_since or time.monotonic()
+                        if time.monotonic() - low_mem_since >= 10:
+                            resource_abort_reason = (
+                                "available memory remained below "
+                                f"{floor} bytes for 10 seconds")
+                            break
+                    else:
+                        low_mem_since = None
                 tick += 1
                 # Deadline-paced (per orchestrator-tick-pacing): per-sample work
                 # does not accumulate as drift.
@@ -1504,7 +1851,9 @@ class ScenarioEngine:
             # Popen does not SIGKILL the remote child.  Ignore failures (the
             # process may have already exited normally).
             for name, h in remote_hosts.items():
-                for target in ("netcom_zen.ros2_workload", "rmw_zenohd"):
+                for target in (
+                        "netcom_zen.ros2_workload", "rmw_zenohd",
+                        "fast-discovery-server"):
                     subprocess.run(
                         _ssh_cmd(h.ssh,
                                  ["docker", "exec", h.container,
@@ -1519,7 +1868,7 @@ class ScenarioEngine:
             # Derive host path: container's /work == ~/net_com_zen on the host.
             host_results = h.workdir.replace("/work", "~/net_com_zen", 1)
             subprocess.run(
-                ["rsync", "-a",
+                ["rsync", "-a", "-e", shlex.join(_ssh_base()),
                  f"{h.ssh}:{host_results}/results/lan/{run_name}/",
                  str(out_dir) + "/"],
                 check=True)
@@ -1589,4 +1938,6 @@ class ScenarioEngine:
             # itself failed, e.g. docker exec error).  Distinct from per-node
             # codes in agent_exit_codes, which come from exits_<host>.txt.
             "remote_launcher_exit": remote_launcher_exit,
+            "fault_events": fault_events,
+            "resource_abort_reason": resource_abort_reason,
         }, indent=2))
