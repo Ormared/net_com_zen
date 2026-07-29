@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import csv
 import hashlib
 import json
@@ -27,7 +28,7 @@ import yaml
 from ..config import Scenario
 from .dds_scenarios import _MINIMAL_RADIO
 from . import report
-from .sweep import expand, run_sweep
+from .sweep import apply_override, cell_name, expand, run_sweep
 
 RMWS = ["fastrtps", "cyclonedds", "zenoh"]
 CAPACITY_CLIENTS = [4, 16, 32, 64, 96, 128]
@@ -328,6 +329,27 @@ def preflight(
             "bridge evaluation needs root; rerun with the ros2 Python under sudo")
 
 
+def _middleware_packages() -> list[dict]:
+    """Read exact ROS/RMW versions from the Pixi environment metadata."""
+    prefix = REPO_ROOT / ".pixi/envs/ros2"
+    tokens = (
+        "rmw", "fastrtps", "cyclonedds", "zenoh", "fastcdr",
+        "libzenohc")
+    packages = []
+    for path in sorted((prefix / "conda-meta").glob("*.json")):
+        try:
+            item = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        name = str(item.get("name", "")).lower()
+        if any(token in name for token in tokens):
+            packages.append({
+                key: item.get(key)
+                for key in ("name", "version", "build", "channel")
+            })
+    return packages
+
+
 def write_provenance(out_root: Path) -> Path:
     out_root.mkdir(parents=True, exist_ok=True)
 
@@ -356,18 +378,29 @@ def write_provenance(out_root: Path) -> Path:
         "disk": command("df", "-B1", "."),
         "network_interfaces": command("ip", "-details", "-brief", "address"),
         "swap_counters": vmstat,
-        "middleware_packages": command(
-            str(REPO_ROOT / ".pixi/envs/ros2/bin/python"), "-c",
-            "import importlib.metadata as m; "
-            "print('\\n'.join(sorted("
-            "f'{d.metadata[\"Name\"]}=={d.version}' "
-            "for d in m.distributions() "
-            "if any(x in d.metadata['Name'].lower() "
-            "for x in ('rmw','fast','cyclone','zenoh','ros'))))"),
+        "middleware_packages": _middleware_packages(),
     }
     path = out_root / "provenance.json"
     path.write_text(json.dumps(data, indent=2))
     return path
+
+
+def finalize_provenance(out_root: Path) -> None:
+    """Repair/version the preserved run-start provenance at report time."""
+    path = out_root / "provenance.json"
+    if not path.exists():
+        return
+    data = json.loads(path.read_text())
+    vmstat = {}
+    for line in Path("/proc/vmstat").read_text().splitlines():
+        key, value = line.split()
+        if key in {"pswpin", "pswpout"}:
+            vmstat[key] = int(value)
+    data["middleware_packages"] = _middleware_packages()
+    data["report_generated_at"] = time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    data["swap_counters_at_report"] = vmstat
+    path.write_text(json.dumps(data, indent=2))
 
 
 def _profile_key(row: dict) -> tuple:
@@ -477,6 +510,39 @@ def _result_name(relative: str) -> str:
     return relative.removesuffix("_sweep.yaml").replace("lan/", "")
 
 
+def _planned_metadata(
+        sweep_path: Path, sweep: dict, overrides: dict) -> dict:
+    """Canonical fields for a cell, even when its artifacts are malformed."""
+    fallback = {
+        "rmw": overrides.get("ros2.rmw"),
+        "profile_label": overrides.get(
+            "ros2.centralized.profile_label"),
+        "server_mode": None,
+        "n_clients": None,
+        "n_servers": None,
+    }
+    try:
+        cfg = yaml.safe_load(
+            (sweep_path.parent / sweep["base"]).read_text())
+        for key, value in overrides.items():
+            apply_override(cfg, key, value)
+        scenario = Scenario.model_validate(cfg)
+        central = scenario.ros2.centralized
+        if central is None:
+            return fallback
+        servers = set(central.server_ids)
+        return {
+            "rmw": scenario.ros2.rmw,
+            "profile_label": central.profile_label,
+            "server_mode": central.mode,
+            "n_clients": sum(
+                node.id not in servers for node in scenario.nodes),
+            "n_servers": len(servers),
+        }
+    except Exception:
+        return fallback
+
+
 async def run_phase(
         phase: str, scenario_root: Path, out_root: Path) -> None:
     phase_root = out_root / phase
@@ -502,12 +568,76 @@ async def run_phase(
                 await asyncio.sleep(2)
 
 
-def combined_report(out_root: Path) -> dict:
+def combined_report(
+        out_root: Path, scenario_root: Path | None = None) -> dict:
+    scenario_root = scenario_root or REPO_ROOT / "scenarios/centralized"
+    out_root.mkdir(parents=True, exist_ok=True)
+    finalize_provenance(out_root)
     rows = []
-    for manifest in sorted(out_root.glob("*/**/sweep_manifest.json")):
-        phase = manifest.relative_to(out_root).parts[0]
-        for row in report.aggregate(manifest.parent):
-            rows.append({"phase": phase, **row})
+    for phase, relatives in PHASE_SWEEPS.items():
+        for relative in relatives:
+            sweep_path = scenario_root / relative
+            result_dir = out_root / phase / _result_name(relative)
+            sweep_name = result_dir.name
+            try:
+                sweep = yaml.safe_load(sweep_path.read_text())
+                expected = expand(sweep)
+            except Exception as exc:
+                rows.append({
+                    "phase": phase,
+                    "sweep": sweep_name,
+                    "cell_name": None,
+                    "cell_status": "malformed_plan",
+                    "complete": False,
+                    "failure_reason": (
+                        f"cannot expand planned sweep {relative}: "
+                        f"{type(exc).__name__}: {exc}"),
+                })
+                continue
+            expected_metadata = {
+                cell_name(overrides, seed):
+                    _planned_metadata(sweep_path, sweep, overrides)
+                for overrides, seed in expected}
+            manifest = result_dir / "sweep_manifest.json"
+            if not manifest.exists():
+                for overrides, seed in expected:
+                    name = cell_name(overrides, seed)
+                    rows.append({
+                        "phase": phase,
+                        "sweep": sweep_name,
+                        **expected_metadata[name],
+                        **overrides,
+                        "seed": seed,
+                        "cell_name": name,
+                        "cell_status": "missing",
+                        "complete": False,
+                        "failure_reason": (
+                            f"missing sweep manifest: "
+                            f"{manifest.relative_to(out_root)}"),
+                    })
+                continue
+            try:
+                aggregated = report.aggregate(result_dir)
+            except Exception as exc:
+                aggregated = [{
+                    **overrides,
+                    "seed": seed,
+                    "cell_name": cell_name(overrides, seed),
+                    "cell_status": "malformed",
+                    "complete": False,
+                    "failure_reason": (
+                        f"malformed sweep results: "
+                        f"{type(exc).__name__}: {exc}"),
+                } for overrides, seed in expected]
+            for row in aggregated:
+                metadata = expected_metadata.get(
+                    row.get("cell_name"), {})
+                rows.append({
+                    "phase": phase,
+                    "sweep": sweep_name,
+                    **metadata,
+                    **row,
+                })
     summary = {
         "planned": len(rows),
         "complete": sum(bool(r.get("complete")) for r in rows),
@@ -522,13 +652,269 @@ def combined_report(out_root: Path) -> dict:
         writer = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
+    summary["artifacts"] = write_analysis_artifacts(rows, out_root)
+    (out_root / "summary_all.json").write_text(
+        json.dumps(summary, indent=2))
     return summary
 
 
+def _write_rows(out_root: Path, stem: str, rows: list[dict]) -> list[str]:
+    json_path = out_root / f"{stem}.json"
+    csv_path = out_root / f"{stem}.csv"
+    json_path.write_text(json.dumps(rows, indent=2))
+    keys = sorted({key for row in rows for key in row})
+    with csv_path.open("w", newline="") as stream:
+        writer = csv.DictWriter(
+            stream, fieldnames=keys, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    return [json_path.name, csv_path.name]
+
+
+def _replicate_tables(rows: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Return explicit SLO-capacity and replicate-variance summaries."""
+    group_keys = (
+        "phase", "sweep", "rmw", "profile_label", "server_mode",
+        "n_clients", "n_servers",
+        "ros2.centralized.telemetry_period_ms",
+        "ros2.centralized.rpc_period_ms",
+    )
+    grouped: dict[tuple, list[dict]] = {}
+    for row in rows:
+        key = tuple(row.get(name) for name in group_keys)
+        grouped.setdefault(key, []).append(row)
+
+    slo_rows = []
+    variance_rows = []
+    variance_metrics = (
+        "telemetry_delivery_ratio", "telemetry_received_per_s",
+        "rpc_success_ratio", "rpc_success_per_s", "rpc_rtt_p99_ms",
+        "ready_time_s", "command_gap_p99_ms", "command_duplicate_ratio",
+        "command_failover_gap_s", "rpc_failover_gap_s",
+        "server_cpu_peak_pct", "server_rss_peak_mb",
+        "infrastructure_cpu_peak_pct", "infrastructure_rss_peak_mb",
+    )
+    for key, group in sorted(grouped.items(), key=lambda item: str(item[0])):
+        base = dict(zip(group_keys, key))
+        planned = len(group)
+        complete_group = [row for row in group if row.get("complete")]
+        complete_count = len(complete_group)
+        relaxed_passes = sum(
+            bool(r.get("slo_relaxed")) for r in complete_group)
+        tight_passes = sum(
+            bool(r.get("slo_tight_control")) for r in complete_group)
+        slo_rows.append({
+            **base,
+            "replicates_planned": planned,
+            "replicates_complete": complete_count,
+            "all_complete": complete_count == planned,
+            "relaxed_passes": relaxed_passes,
+            "relaxed_pass_fraction": relaxed_passes / planned,
+            "tight_passes": tight_passes,
+            "tight_pass_fraction": tight_passes / planned,
+        })
+        for metric in variance_metrics:
+            values = [
+                float(row[metric]) for row in complete_group
+                if row.get(metric) is not None]
+            if not values:
+                continue
+            mean = statistics.mean(values)
+            stdev = statistics.stdev(values) if len(values) > 1 else 0.0
+            variance_rows.append({
+                **base,
+                "metric": metric,
+                "replicates_with_value": len(values),
+                "mean": mean,
+                "stdev": stdev,
+                "cv": abs(stdev / mean) if mean else None,
+                "minimum": min(values),
+                "maximum": max(values),
+            })
+    return slo_rows, variance_rows
+
+
+def _sustainable_frontiers(slo_rows: list[dict]) -> list[dict]:
+    """Maximum all-replicate capacity and paired offered-rate frontiers."""
+    output = []
+    for phase in ("bridge-core", "lan"):
+        phase_rows = [row for row in slo_rows if row["phase"] == phase]
+        for rmw in RMWS:
+            rmw_rows = [row for row in phase_rows if row["rmw"] == rmw]
+            for slo, fraction_key in (
+                    ("relaxed", "relaxed_pass_fraction"),
+                    ("tight_control", "tight_pass_fraction")):
+                capacity = [
+                    row for row in rmw_rows
+                    if str(row["sweep"]).startswith("single_n")
+                    and "inverted" not in str(row["sweep"])
+                    and row["profile_label"] == "tuned"
+                    and row["all_complete"]
+                    and row[fraction_key] == 1.0]
+                rates = [
+                    row for row in rmw_rows
+                    if row["sweep"] == "rate_n64"
+                    and row["profile_label"] == "tuned"
+                    and row["all_complete"]
+                    and row[fraction_key] == 1.0]
+                max_rate = max(
+                    rates,
+                    key=lambda row: (
+                        1000 / row[
+                            "ros2.centralized.telemetry_period_ms"],
+                        1000 / row["ros2.centralized.rpc_period_ms"]),
+                    default=None)
+                output.append({
+                    "phase": phase,
+                    "rmw": rmw,
+                    "slo": slo,
+                    "maximum_sustainable_n": max(
+                        (row["n_clients"] for row in capacity),
+                        default=None),
+                    "maximum_sustainable_telemetry_offered_per_s": (
+                        max_rate["n_clients"] * 1000
+                        / max_rate[
+                            "ros2.centralized.telemetry_period_ms"]
+                        if max_rate else None),
+                    "maximum_sustainable_rpc_offered_per_s": (
+                        max_rate["n_clients"] * 1000
+                        / max_rate["ros2.centralized.rpc_period_ms"]
+                        if max_rate else None),
+                    "rate_telemetry_period_ms": (
+                        max_rate[
+                            "ros2.centralized.telemetry_period_ms"]
+                        if max_rate else None),
+                    "rate_rpc_period_ms": (
+                        max_rate["ros2.centralized.rpc_period_ms"]
+                        if max_rate else None),
+                })
+    return output
+
+
+def _plot_metric(
+        rows: list[dict], out_root: Path, filename: str,
+        metrics: list[tuple[str, str]], *,
+        selection=None, x_key: str = "n_clients") -> str:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    chosen = [
+        row for row in rows
+        if row.get("complete", True)
+        and (selection is None or selection(row))]
+    fig, axes = plt.subplots(
+        len(metrics), 1, figsize=(9, max(4.5, 3.6 * len(metrics))),
+        squeeze=False)
+    for ax, (metric, label) in zip(axes[:, 0], metrics):
+        series: dict[tuple, dict[float, list[float]]] = {}
+        for row in chosen:
+            x = row.get(x_key)
+            value = row.get(metric)
+            if x is None or value is None:
+                continue
+            key = (
+                row.get("phase"), row.get("rmw"),
+                row.get("profile_label"), row.get("server_mode"))
+            series.setdefault(key, {}).setdefault(float(x), []).append(
+                float(value))
+        for key, points in sorted(series.items(), key=lambda item: str(item[0])):
+            xs = sorted(points)
+            ys = [statistics.mean(points[x]) for x in xs]
+            errors = [
+                statistics.stdev(points[x]) if len(points[x]) > 1 else 0
+                for x in xs]
+            ax.errorbar(
+                xs, ys, yerr=errors, marker="o", capsize=2,
+                label="/".join(str(part) for part in key if part is not None))
+        ax.set_xlabel(x_key)
+        ax.set_ylabel(label)
+        ax.grid(True, alpha=0.3)
+        if series:
+            ax.legend(fontsize=7, ncol=2)
+    fig.tight_layout()
+    path = out_root / filename
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+    return path.name
+
+
+def write_analysis_artifacts(rows: list[dict], out_root: Path) -> list[str]:
+    """Write the required auditable tables and consolidated result plots."""
+    artifacts: list[str] = []
+    failures = [{
+        key: row.get(key) for key in (
+            "phase", "sweep", "cell_name", "cell_status", "rmw",
+            "profile_label", "n_clients", "seed", "failure_reason")
+    } for row in rows if not row.get("complete")]
+    artifacts.extend(_write_rows(out_root, "failure_accounting", failures))
+    slo_rows, variance_rows = _replicate_tables(rows)
+    artifacts.extend(_write_rows(out_root, "slo_capacity", slo_rows))
+    artifacts.extend(_write_rows(
+        out_root, "replicate_variance", variance_rows))
+    artifacts.extend(_write_rows(
+        out_root, "sustainable_frontiers",
+        _sustainable_frontiers(slo_rows)))
+
+    capacity = lambda row: (
+        str(row.get("sweep", "")).startswith("single_n")
+        and "inverted" not in str(row.get("sweep", "")))
+    ha = lambda row: row.get("server_mode") in {
+        "active_active", "active_passive", "sharded"}
+    rate = lambda row: row.get("sweep") == "rate_n64"
+    artifacts.extend([
+        _plot_metric(rows, out_root, "plot_delivery.png", [
+            ("telemetry_delivery_ratio", "Telemetry delivery ratio"),
+            ("command_delivery_ratio", "Command delivery ratio")],
+            selection=capacity),
+        _plot_metric(rows, out_root, "plot_throughput.png", [
+            ("telemetry_received_per_s", "Telemetry delivered/s"),
+            ("rpc_success_per_s", "Successful RPC/s")],
+            selection=capacity),
+        _plot_metric(
+            rows, out_root, "plot_rate_frontier.png", [
+                ("telemetry_delivery_ratio", "Telemetry delivery ratio"),
+                ("rpc_success_ratio", "RPC success ratio"),
+                ("rpc_rtt_p99_ms", "RPC RTT p99 (ms)")],
+            selection=rate,
+            x_key="ros2.centralized.telemetry_period_ms"),
+        _plot_metric(rows, out_root, "plot_rpc.png", [
+            ("rpc_success_ratio", "RPC success ratio"),
+            ("rpc_rtt_p99_ms", "RPC RTT p99 (ms)")],
+            selection=capacity),
+        _plot_metric(rows, out_root, "plot_readiness.png", [
+            ("ready_time_s", "Ready time (s)")], selection=capacity),
+        _plot_metric(rows, out_root, "plot_lan_rtt.png", [
+            ("link_rtt_mini_ms", "Wi-Fi link RTT (ms)")],
+            selection=lambda row: row.get("phase") == "lan"),
+        _plot_metric(rows, out_root, "plot_commands.png", [
+            ("command_gap_p99_ms", "Command gap p99 (ms)"),
+            ("command_duplicate_ratio", "Command duplicate ratio")],
+            selection=capacity),
+        _plot_metric(rows, out_root, "plot_failover.png", [
+            ("command_failover_gap_s", "Command failover gap (s)"),
+            ("rpc_failover_gap_s", "RPC failover gap (s)")], selection=ha),
+        _plot_metric(rows, out_root, "plot_resources.png", [
+            ("server_cpu_peak_pct", "Server CPU peak (%)"),
+            ("server_rss_peak_mb", "Server RSS peak (MB)"),
+            ("infrastructure_cpu_peak_pct", "Infrastructure CPU peak (%)"),
+            ("infrastructure_rss_peak_mb", "Infrastructure RSS peak (MB)")],
+            selection=capacity),
+        _plot_metric(slo_rows, out_root, "plot_slo_capacity.png", [
+            ("relaxed_pass_fraction", "Relaxed SLO pass fraction"),
+            ("tight_pass_fraction", "Tight SLO pass fraction")],
+            selection=capacity),
+    ])
+    return artifacts
+
+
 def evaluate(command: str, scenario_root: Path, out_root: Path) -> None:
-    preflight(
-        REPO_ROOT, resumed=(out_root / "provenance.json").exists())
-    write_provenance(out_root)
+    provenance_exists = (out_root / "provenance.json").exists()
+    preflight(REPO_ROOT, resumed=provenance_exists)
+    # Resumes must retain the original run-start snapshot. Report-time
+    # counters and package metadata are appended by finalize_provenance().
+    if not provenance_exists:
+        write_provenance(out_root)
     generate(scenario_root, (
         json.loads((out_root / "locked_profiles.json").read_text())
         if (out_root / "locked_profiles.json").exists() else None))
@@ -539,7 +925,7 @@ def evaluate(command: str, scenario_root: Path, out_root: Path) -> None:
         asyncio.run(run_phase(phase, scenario_root, out_root))
         if phase == "tune":
             lock_profiles(out_root, scenario_root)
-        combined_report(out_root)
+        combined_report(out_root, scenario_root)
 
 
 def main() -> None:
@@ -563,7 +949,7 @@ def main() -> None:
         for path in generate(scenario_root):
             print(path)
     elif args.command == "report":
-        summary = combined_report(results_root)
+        summary = combined_report(results_root, scenario_root)
         print(json.dumps({k: v for k, v in summary.items() if k != "rows"},
                          indent=2))
     else:

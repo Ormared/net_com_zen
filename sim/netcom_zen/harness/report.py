@@ -117,6 +117,10 @@ def centralized_run_metrics(run_dir: Path) -> dict:
     client_order = [
         n["id"] for n in scenario["nodes"] if n["id"] not in server_ids]
     client_ids = set(client_order)
+    host_placement = manifest.get("hosts", {})
+    client_host_distribution = collections.Counter(
+        host_placement.get(nid, "unknown") for nid in client_ids)
+    link_rtt = manifest.get("rtt_ms", {})
     if central["mode"] == "sharded":
         expected_clients_by_server = {
             sid: {
@@ -305,6 +309,12 @@ def centralized_run_metrics(run_dir: Path) -> dict:
         "n_clients": len(client_ids),
         "n_servers": len(server_ids),
         "server_mode": central["mode"],
+        "server_host_placement": {
+            sid: host_placement.get(sid) for sid in server_ids},
+        "client_host_distribution": dict(client_host_distribution),
+        "link_rtt_mini_ms": (
+            link_rtt.get("mini") if isinstance(link_rtt, dict) else None),
+        "remote_resources_sampled": manifest.get("remote_sampled"),
         "profile_label": central.get("profile_label", "stock"),
         "discovery_mode": central.get("discovery_mode"),
         "telemetry_reliability": central.get("telemetry_reliability"),
@@ -501,22 +511,45 @@ def aggregate(sweep_dir: Path) -> list[dict]:
             else:
                 raise ValueError("no recognized result artifacts")
             exit_codes = run_manifest.get("agent_exit_codes", {})
+            remote_exits = run_manifest.get("remote_launcher_exit", {})
             faulted = {
                 event.get("server_id")
                 for event in run_manifest.get("fault_events", [])
                 if event.get("type") == "primary_failure"}
+            bad_agents = {
+                nid: code for nid, code in exit_codes.items()
+                if code != 0 and nid not in faulted}
+            bad_remote = {
+                host: code for host, code in remote_exits.items()
+                if code != 0}
+            resource_abort = run_manifest.get("resource_abort_reason")
             complete = (
                 bool(exit_codes)
-                and not run_manifest.get("resource_abort_reason")
-                and all(code == 0 or nid in faulted
-                        for nid, code in exit_codes.items()))
+                and not resource_abort
+                and not bad_agents
+                and not bad_remote)
+            reasons = []
+            if not exit_codes:
+                reasons.append("missing agent exit codes")
+            if resource_abort:
+                reasons.append(f"resource abort: {resource_abort}")
+            if bad_agents:
+                reasons.append(
+                    "non-zero agent exits: "
+                    + ", ".join(
+                        f"{nid}={code}"
+                        for nid, code in sorted(bad_agents.items())))
+            if bad_remote:
+                reasons.append(
+                    "non-zero remote launcher exits: "
+                    + ", ".join(
+                        f"{host}={code}"
+                        for host, code in sorted(bad_remote.items())))
             rows.append({
                 **base, **metrics, "cell_name": cell["name"],
                 "cell_status": "complete" if complete else "failed",
                 "complete": complete,
-                "failure_reason": (
-                    None if complete else
-                    "missing or non-zero agent exit codes"),
+                "failure_reason": None if complete else "; ".join(reasons),
             })
         except Exception as exc:
             rows.append({
