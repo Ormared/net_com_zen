@@ -127,6 +127,59 @@ def _cyclonedds_xml(socket_buffer_bytes: int = 0, iface_name: str = "",
             '</CycloneDDS>\n')
 
 
+def _zenoh_bridge_env() -> dict[str, str]:
+    """Env every zenoh-bridge-ros2dds process needs, on any substrate.
+
+    ROS_DISTRO: the bridge reads it to pick the `ros_discovery_info` wire format,
+    which changed across distros. Unset, it logs "Assuming 'iron'" and can then
+    misread Jazzy discovery data. sudo strips the pixi activation that would
+    normally provide it, so it has to be passed explicitly.
+
+    RUST_LOG is forwarded when set so a run can be re-executed with bridge-side
+    DDS tracing without an engine edit."""
+    env = {"ROS_DISTRO": "jazzy"}
+    if "RUST_LOG" in os.environ:
+        env["RUST_LOG"] = os.environ["RUST_LOG"]
+    return env
+
+
+def _zenoh_bridge_version(flavor: str) -> str | None:
+    """Version string of the vendored bridge, for the result manifest.
+
+    Bridge behaviour is version-sensitive and the binary is fetched out-of-band
+    rather than pinned in pixi.lock, so the manifest is the only place a run's
+    bridge version is recorded. Returns None when the flavour does not use it,
+    and on any read failure -- a missing version string must not abort a run
+    that has already produced its data."""
+    if flavor != "bridge":
+        return None
+    try:
+        return (_zenoh_bridge_bin().parent / "VERSION").read_text().strip()
+    except Exception:
+        return None
+
+
+def _zenoh_bridge_bin() -> Path:
+    """Resolve the vendored zenoh-bridge-ros2dds binary.
+
+    Not a pixi dependency: zenoh-plugin-ros2dds is absent from conda-forge and
+    robostack-jazzy, so scripts/fetch_zenoh_bridge.sh pulls the upstream release
+    into vendor/.  That path is repo-relative on purpose -- dds_lan_deploy.sh
+    rsyncs the repo and the container bind-mounts it at /work, so both hosts run
+    the same bit-for-bit binary without an image rebuild.
+
+    The binary is self-contained (libc/libm/libgcc only) and embeds its own
+    CycloneDDS; it does NOT link the ros2 pixi env's DDS libraries."""
+    # orchestrator.py lives at sim/netcom_zen/, so the repo root is 2 up.
+    root = Path(__file__).resolve().parents[2]
+    binary = root / "vendor" / "zenoh-bridge-ros2dds" / "zenoh-bridge-ros2dds"
+    if not binary.exists():
+        raise RuntimeError(
+            f"{binary} not found: zenoh_flavor='bridge' needs the vendored "
+            "zenoh-bridge-ros2dds. Run scripts/fetch_zenoh_bridge.sh")
+    return binary
+
+
 def _fastdds_profiles_xml(socket_buffer_bytes: int = 0,
                           allocation_participants: int = 0,
                           whitelist_addr: str = "") -> str:
@@ -472,6 +525,8 @@ class ScenarioEngine:
         log_dir = self.out_dir / "ros_logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         if rmw == "zenoh":
+            if self.scenario.ros2.zenoh_flavor == "bridge":
+                return self._spawn_zenoh_bridge(log_dir)
             if self.scenario.ros2.topology == "centralized":
                 return self._spawn_zenoh_centralized(log_dir)
             return self._spawn_zenoh(log_dir)
@@ -695,6 +750,120 @@ class ScenarioEngine:
                 node_env["ROS_DOMAIN_ID"] = str(self._domain_of(nid))
             agents[nid] = subprocess.Popen(self._workload_cmd(nid),
                                            env=node_env)
+        return agents
+
+    def _zenoh_bridge_local_dds_env(self) -> tuple[str, dict]:
+        """(rmw_impl, env) for the LOCAL DDS side of zenoh_flavor='bridge'.
+
+        The DDS domain is pinned to LOOPBACK. That is not tuning, it is the
+        invariant that makes the experiment mean anything: substrate=bridge puts
+        every netns on one L2 broadcast domain, so a DDS config that multicasts
+        on the veth lets every node's "local" domain discover every other node's
+        directly over SPDP. The bridges then route peer telemetry as LOCAL
+        publishers and the traffic that is supposed to cross zenoh never does --
+        a run that completes, reports healthy delivery, and measures nothing.
+        (Observed exactly once, before this was pinned: bridge d1 created
+        `Route Publisher (ROS:/swarm/d2/telemetry -> ...)` for all four nodes.)
+
+        Loopback is the right boundary on both substrates because it follows the
+        netns: on substrate=bridge each node has its own netns and therefore its
+        own lo, giving one participant per domain; on substrate=lan the container
+        is --network host, so lo is shared by that host's nodes and the domain is
+        exactly one host's worth of participants.
+
+        ROS_AUTOMATIC_DISCOVERY_RANGE is set as well, but it is belt-and-braces
+        only -- it does NOT override an explicit CYCLONEDDS_URI, which is how the
+        leak above got through. The XML/profile is what actually confines."""
+        cfg = self.scenario.ros2
+        if cfg.zenoh_bridge_local_dds == "fastrtps":
+            # Confinement here rides on ROS_AUTOMATIC_DISCOVERY_RANGE, which
+            # rmw_fastrtps DOES honour at the rcl layer -- unlike the Cyclone
+            # arm, where an explicit CYCLONEDDS_URI silently overrides it.
+            #
+            # Deliberately NOT an interfaceWhiteList profile pinned to 127.0.0.1:
+            # that confines Fast DDS so hard it stops announcing anywhere the
+            # Cyclone-based bridge can hear it (measured: bridge discovered 0
+            # participants over a full run). UDPv4-only still drops SHM so the
+            # transport matches the routerless baseline.
+            return "rmw_fastrtps_cpp", {
+                "FASTDDS_BUILTIN_TRANSPORTS": "UDPv4",
+                "ROS_AUTOMATIC_DISCOVERY_RANGE": "LOCALHOST",
+            }
+        # Cyclone: pin to lo, multicast off, single localhost peer. The
+        # MaxAutoParticipantIndex=150 this helper emits also matters here -- the
+        # bridge binary ships a built-in default of 32, the same per-IP ceiling
+        # that killed same-IP participants 33+ in P4.
+        xml = self.out_dir / "cyclonedds.xml"
+        xml.write_text(_cyclonedds_xml(
+            cfg.socket_buffer_bytes, iface_name="lo",
+            internal=cfg.cyclonedds_internal,
+            peers=["localhost"], allow_multicast=False))
+        return "rmw_cyclonedds_cpp", {
+            "CYCLONEDDS_URI": f"file://{xml}",
+            "ROS_AUTOMATIC_DISCOVERY_RANGE": "LOCALHOST",
+        }
+
+    def _spawn_zenoh_bridge(self, log_dir: Path) -> dict[str, subprocess.Popen]:
+        """zenoh_flavor='bridge' on substrate=bridge: per netns one
+        zenoh-bridge-ros2dds plus a telemetry node that reaches it over the
+        netns-local DDS domain, with the bridges wired into the same explicit
+        TCP router graph rmw_zenohd uses.
+
+        Router graph parity with _spawn_zenoh is deliberate: zenoh_router_topology
+        stays the controlled variable so a bridge-vs-rmw delta is attributable to
+        the flavour and not to a different link graph.
+
+        EXPECTED DEGENERACY (state it in the write-up, do not present it as a
+        finding): one node per netns means each local DDS domain has exactly one
+        application participant, so the bridge has nothing to aggregate and this
+        configuration is rmw_zenoh plus a DDS serialise/deserialise hop.  It is
+        measured for completeness of the recommendation table; substrate=lan is
+        where the flavour is architecturally distinct."""
+        cfg = self.scenario.ros2
+        binary = _zenoh_bridge_bin()
+        nodes = list(self.topo.nodes)
+        # The same confined DDS config goes to the nodes AND to the bridge
+        # processes: the bridge is a DDS participant too, and leaving it on its
+        # built-in default would both re-open multicast and reinstate its baked
+        # in MaxAutoParticipantIndex=32.
+        rmw_impl, local_env = self._zenoh_bridge_local_dds_env()
+
+        for i, nid in enumerate(nodes):
+            listen = (f'tcp/{self.topo.addrs[nid]}:{cfg.port}')
+            if cfg.zenoh_router_topology == "star":
+                connect = ([f"tcp/{self.topo.addrs[nodes[0]]}:{cfg.port}"]
+                           if i > 0 else [])
+            else:
+                connect = [f"tcp/{self.topo.addrs[p]}:{cfg.port}"
+                           for p in nodes[:i]]
+            argv = ["ip", "netns", "exec", self.topo.ns_names[nid],
+                    str(binary),
+                    "-d", str(self._domain_of(nid)),
+                    "--ros-automatic-discovery-range", "LOCALHOST",
+                    "-l", listen, "-l", f"tcp/127.0.0.1:{cfg.port}"]
+            for c in connect:
+                argv += ["-e", c]
+            bridge_env = {**self._ros2_base_env(rmw_impl, log_dir),
+                          **local_env, **_zenoh_bridge_env()}
+            # The bridge is a DDS participant in its own right; it must not be
+            # told to speak zenoh as its RMW.
+            bridge_env.pop("RMW_IMPLEMENTATION", None)
+            self._routers[nid] = subprocess.Popen(
+                argv, env=bridge_env,
+                stdout=(self.out_dir / f"bridge_{nid}.log").open("w"),
+                stderr=subprocess.STDOUT)
+        # Bridges need longer than rmw_zenohd's 1.0 s: each one starts a DDS
+        # participant and completes local SPDP before it can accept sessions.
+        time.sleep(3.0)
+
+        agents: dict[str, subprocess.Popen] = {}
+        base_env = {**self._ros2_base_env(rmw_impl, log_dir), **local_env}
+        for nid in nodes:
+            node_env = dict(base_env)
+            if cfg.cluster_domains > 0:
+                node_env["ROS_DOMAIN_ID"] = str(self._domain_of(nid))
+            agents[nid] = subprocess.Popen(
+                self._workload_cmd(nid), env=node_env)
         return agents
 
     def _spawn_zenoh_centralized(
@@ -998,6 +1167,16 @@ class ScenarioEngine:
             # zenoh router graph shape (mesh = full lower-index mesh); records
             # the P5 lever so a star-router run can't be mistaken for a mesh one
             "zenoh_router_topology": self.scenario.ros2.zenoh_router_topology,
+            # Zenoh flavour axis. The full scenario dump above already carries
+            # it, but the report groups on top-level manifest keys -- without
+            # these a bridge-flavour run is indistinguishable from an
+            # rmw_zenoh_cpp one at the grouping level, and the two are different
+            # products with different profiles.
+            "zenoh_flavor": self.scenario.ros2.zenoh_flavor,
+            "zenoh_bridge_local_dds": (
+                self.scenario.ros2.zenoh_bridge_local_dds
+                if self.scenario.ros2.zenoh_flavor == "bridge" else None),
+            "zenoh_bridge_version": _zenoh_bridge_version(self.scenario.ros2.zenoh_flavor),
             "cyclonedds_internal": self.scenario.ros2.cyclonedds_internal,
             "resource_samples": len(samples),
             "peak_host_mem_used_bytes": peak_mem,
@@ -1412,6 +1591,16 @@ class ScenarioEngine:
         """
         cfg = self.scenario.ros2
         rmw = cfg.rmw
+        # zenoh_flavor='bridge' keeps a native DDS domain on each host and puts
+        # zenoh only on the cross-link, so on this substrate the ROS nodes' RMW
+        # is a DDS impl and the zenoh process is a bridge rather than a router.
+        # substrate=lan is where the flavour is architecturally distinct: the
+        # container runs --network host, so a host's nodes share one netns and
+        # the local DDS domain actually has something to aggregate.
+        zbridge = (rmw == "zenoh" and cfg.zenoh_flavor == "bridge")
+        # What the workload nodes actually speak. Drives the per-host XML
+        # config, RMW_IMPLEMENTATION, and the AMENT prefix derivation below.
+        local_dds = cfg.zenoh_bridge_local_dds if zbridge else rmw
         central = (cfg.centralized
                    if cfg.topology == "centralized" else None)
         hosts = self.scenario.hosts          # dict[str, LanHostConfig]
@@ -1450,7 +1639,7 @@ class ScenarioEngine:
             "zenoh": "rmw_zenoh_cpp",
             "fastrtps": "rmw_fastrtps_cpp",
             "cyclonedds": "rmw_cyclonedds_cpp",
-        }[rmw]
+        }[local_dds]
         local_base = self._ros2_base_env(rmw_impl, log_dir)
 
         # xml_env[host_name] = {ENV_KEY: "value"} that activates the per-host
@@ -1484,10 +1673,17 @@ class ScenarioEngine:
             # LAN IP).  Local files land in out_dir; remote files are streamed
             # into the container via stdin to avoid a separate scp step (the
             # bind mount makes them immediately visible to the container).
-            if rmw == "fastrtps":
+            if local_dds == "fastrtps":
                 for name, h in hosts.items():
+                    # Under zenoh_flavor='bridge' the local DDS domain must
+                    # not leave the host: both hosts sit on one Wi-Fi subnet, so
+                    # a LAN-IP whitelist would let the two "local" domains
+                    # discover each other directly over SPDP and carry traffic
+                    # that is supposed to cross zenoh.  Loopback-only is the
+                    # same confinement ROS_LOCALHOST_ONLY applies.
                     xml_content = _fastdds_profiles_xml(
-                        0, 0, whitelist_addr=h.addr)
+                        0, 0,
+                        whitelist_addr="127.0.0.1" if zbridge else h.addr)
                     if h.ssh == "":
                         xml_path = out_dir / f"fastdds_profiles_{name}.xml"
                         xml_path.write_text(xml_content)
@@ -1510,7 +1706,7 @@ class ScenarioEngine:
                         xml_env[name] = {
                             "FASTDDS_DEFAULT_PROFILES_FILE": remote_xml}
 
-            elif rmw == "cyclonedds":
+            elif local_dds == "cyclonedds":
                 central_peer_addrs = (
                     [hosts[host_of[s]].addr for s in central.server_ids]
                     if central is not None
@@ -1519,11 +1715,19 @@ class ScenarioEngine:
                     # iface_name pins Cyclone to the correct NIC; without it,
                     # Cyclone announces locators on every interface (including
                     # zerotier and tailscale) which breaks cross-host discovery.
+                    # zenoh_flavor='bridge': pin to lo with multicast off and
+                    # a localhost peer, so the DDS domain is bounded by the host
+                    # and every cross-host sample must traverse the bridge.
+                    # Otherwise: pin to the real NIC and let SPDP multicast do
+                    # native cross-host discovery (the routerless baseline).
                     xml_content = _cyclonedds_xml(
-                        0, iface_name=h.iface,
+                        0,
+                        iface_name="lo" if zbridge else h.iface,
                         internal=self.scenario.ros2.cyclonedds_internal,
-                        peers=central_peer_addrs,
-                        allow_multicast=central_peer_addrs is None)
+                        peers=["localhost"] if zbridge else central_peer_addrs,
+                        allow_multicast=(
+                            False if zbridge
+                            else central_peer_addrs is None))
                     if h.ssh == "":
                         xml_path = out_dir / f"cyclonedds_{name}.xml"
                         xml_path.write_text(xml_content)
@@ -1581,7 +1785,52 @@ class ScenarioEngine:
             # mesh: host i connects to all hosts[0..i-1].  Every workload node
             # then connects to tcp/127.0.0.1:<port> on its own host's router
             # (the container uses --network host so loopback is shared).
-            if rmw == "zenoh":
+            if zbridge:
+                # One zenoh-bridge-ros2dds per HOST, wired in the same
+                # lower-index host mesh the rmw_zenohd path uses so the link
+                # graph stays the controlled variable across flavours.
+                # /work is the container's bind-mount of the repo, so the
+                # vendored binary is the same bytes on every host.
+                bridge_local = _zenoh_bridge_bin()
+                bridge_remote = "/work/vendor/zenoh-bridge-ros2dds/zenoh-bridge-ros2dds"
+                host_names = list(hosts)
+                for i, name in enumerate(host_names):
+                    h = hosts[name]
+                    argv = [
+                        "-d", "0",
+                        "--ros-automatic-discovery-range", "LOCALHOST",
+                        "-l", f"tcp/{h.addr}:{cfg.port}",
+                        "-l", f"tcp/127.0.0.1:{cfg.port}",
+                    ]
+                    for j in range(i):
+                        argv += ["-e",
+                                 f"tcp/{hosts[host_names[j]].addr}:{cfg.port}"]
+                    blog = (out_dir / f"bridge_{name}.log").open("w")
+                    if h.ssh == "":
+                        benv = {**local_base, **xml_env.get(name, {}),
+                                **_zenoh_bridge_env()}
+                        # The bridge is a DDS participant, not a ROS node; an
+                        # RMW_IMPLEMENTATION would be meaningless to it.
+                        benv.pop("RMW_IMPLEMENTATION", None)
+                        self._routers[name] = subprocess.Popen(
+                            [str(bridge_local)] + argv, env=benv,
+                            stdout=blog, stderr=subprocess.STDOUT)
+                    else:
+                        eflags = []
+                        for k, v in xml_env.get(name, {}).items():
+                            eflags += ["-e", f"{k}={v}"]
+                        self._routers[name] = subprocess.Popen(
+                            _ssh_cmd(h.ssh, [
+                                "docker", "exec",
+                                *eflags,
+                                "-e", "PYTHONNOUSERSITE=1",
+                                h.container, bridge_remote, *argv]),
+                            stdout=blog, stderr=subprocess.STDOUT)
+                # Bridges each stand up a DDS participant and settle local SPDP
+                # before accepting sessions -- slower than rmw_zenohd's 1.0 s.
+                time.sleep(3.0)
+                zenoh_central_connect = ""
+            elif rmw == "zenoh":
                 if central is not None:
                     router_specs = [
                         (f"central:{sid}", host_of[sid],
@@ -1666,7 +1915,14 @@ class ScenarioEngine:
                               if hosts[host_of[nid]].ssh == ""]
             for i, nid in enumerate(local_node_ids):
                 host_name = host_of[nid]
-                if rmw == "zenoh":
+                if zbridge:
+                    # Bridge flavour: the node is a plain DDS participant. It
+                    # never speaks zenoh and never learns the bridge's endpoint
+                    # -- it just publishes into the host-local DDS domain and
+                    # the bridge picks the sample up off SPDP.
+                    node_extra = {**xml_env.get(host_name, {}),
+                                  "ROS_AUTOMATIC_DISCOVERY_RANGE": "LOCALHOST"}
+                elif rmw == "zenoh":
                     # All nodes connect to loopback; the router on each host
                     # exposes loopback + its LAN IP for cross-host transport.
                     node_extra = {"ZENOH_CONFIG_OVERRIDE":
@@ -1691,7 +1947,11 @@ class ScenarioEngine:
                 for nid in node_ids:
                     if host_of[nid] != host_name:
                         continue
-                    if rmw == "zenoh":
+                    if zbridge:
+                        node_extra = {
+                            **xml_env.get(host_name, {}),
+                            "ROS_AUTOMATIC_DISCOVERY_RANGE": "LOCALHOST"}
+                    elif rmw == "zenoh":
                         node_extra = {"ZENOH_CONFIG_OVERRIDE":
                                       (zenoh_central_connect
                                        if central is not None
@@ -1793,7 +2053,8 @@ class ScenarioEngine:
                         # one server per host, so removing both middleware
                         # processes on the primary host models that host loss.
                         for target in (
-                                "rmw_zenohd", "fast-discovery-server"):
+                                "rmw_zenohd", "fast-discovery-server",
+                                "zenoh-bridge-ros2dds"):
                             subprocess.run(
                                 _ssh_cmd(primary_host.ssh, [
                                     "docker", "exec", primary_host.container,
@@ -1853,7 +2114,7 @@ class ScenarioEngine:
             for name, h in remote_hosts.items():
                 for target in (
                         "netcom_zen.ros2_workload", "rmw_zenohd",
-                        "fast-discovery-server"):
+                        "fast-discovery-server", "zenoh-bridge-ros2dds"):
                     subprocess.run(
                         _ssh_cmd(h.ssh,
                                  ["docker", "exec", h.container,
@@ -1912,6 +2173,16 @@ class ScenarioEngine:
             "git_hash": _git_hash(),
             "substrate": "lan",
             "rmw": rmw,
+            # Zenoh flavour axis. The full scenario dump above already carries
+            # it, but the report groups on top-level manifest keys -- without
+            # these a bridge-flavour run is indistinguishable from an
+            # rmw_zenoh_cpp one at the grouping level, and the two are different
+            # products with different profiles.
+            "zenoh_flavor": cfg.zenoh_flavor,
+            "zenoh_bridge_local_dds": (
+                cfg.zenoh_bridge_local_dds
+                if cfg.zenoh_flavor == "bridge" else None),
+            "zenoh_bridge_version": _zenoh_bridge_version(cfg.zenoh_flavor),
             "n_nodes": len(all_nodes),
             # topology determines the pair-count denominator for report.py:
             # mesh N(N-1); star 2(N-1); shared N(N-1) logical but O(N) SEDP endpoints

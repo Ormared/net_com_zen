@@ -7,3 +7,9 @@ validation/report.md
 # Rust build artifacts (regenerable)
 target/
 agent/target/
+# Vendored upstream binaries (regenerable via scripts/fetch_zenoh_bridge.sh).
+# NOTE: deliberately NOT excluded from the dds_lan_deploy.sh rsync -- the
+# remote host gets vendor/ over the wire and sees it via the /work bind mount.
+# Adding vendor/ to that script's --exclude list breaks substrate=lan runs with
+# zenoh_flavor=bridge.
+vendor/

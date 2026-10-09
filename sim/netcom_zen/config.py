@@ -278,6 +278,33 @@ class Ros2WorkloadConfig(BaseModel):
     # zenoh + bridge only: fastrtps/cyclonedds have no routers, and the lan
     # substrate already runs one router per HOST (its graph is per-host).
     zenoh_router_topology: Literal["mesh", "star"] = "mesh"
+    # Zenoh FLAVOUR axis. The two zenoh products have fundamentally different
+    # profiles and the whole DDS track to date has measured only the first:
+    #   "rmw"    - rmw_zenoh_cpp. Replaces DDS entirely; nodes speak zenoh and
+    #              reach a per-netns (bridge) or per-host (lan) rmw_zenohd.
+    #   "bridge" - zenoh-bridge-ros2dds. Keeps a NATIVE DDS domain locally and
+    #              bridges only the cross-link, so intra-host traffic never
+    #              touches zenoh. Only architecturally distinct where several
+    #              nodes share a netns (substrate=lan, where the container is
+    #              --network host); on substrate=bridge each node has its own
+    #              netns, so the local DDS domain has exactly one participant
+    #              and the flavour degenerates to "rmw" plus a DDS hop.
+    # Requires rmw="zenoh" (it selects between two zenoh products, not RMWs).
+    zenoh_flavor: Literal["rmw", "bridge"] = "rmw"
+    # Local DDS implementation the ROS NODES use under zenoh_flavor="bridge".
+    #
+    # IMPORTANT ASYMMETRY: the zenoh-bridge-ros2dds binary is itself always a
+    # CycloneDDS participant - it statically links cyclors (verified against the
+    # 1.10.0 x86_64 release: 1375 CycloneDDS symbols, 0 Fast DDS symbols, no
+    # dynamic DDS deps). There is no Fast DDS build of the bridge. So:
+    #   "cyclonedds" - single-vendor: nodes and bridge are both Cyclone.
+    #   "fastrtps"   - CROSS-VENDOR: nodes run rmw_fastrtps_cpp and reach the
+    #                  Cyclone-based bridge over vendor-neutral RTPS. Verified
+    #                  to work (the bridge discovers 010f/eProsima participants
+    #                  and builds routes), but a result on this arm partly
+    #                  measures RTPS interop quality, NOT Fast DDS's own
+    #                  scaling - say so wherever the number is reported.
+    zenoh_bridge_local_dds: Literal["cyclonedds", "fastrtps"] = "cyclonedds"
     # Extra CycloneDDS <Internal> tuning elements (docs/dds-topology-plan.md
     # P5: retransmit/pacing behaviour on lossy links — e.g. NackDelay,
     # RetransmitMerging, MaxQueuedRexmitBytes). Rendered verbatim as
@@ -296,6 +323,16 @@ class Ros2WorkloadConfig(BaseModel):
                 f"fastdds_allocation_participants={self.fastdds_allocation_participants}"
                 f" is Fast DDS only, not rmw={self.rmw!r} "
                 "(cyclonedds and zenoh have no equivalent allocation attribute)")
+        if self.zenoh_flavor != "rmw" and self.rmw != "zenoh":
+            raise ValueError(
+                f"zenoh_flavor={self.zenoh_flavor!r} selects between the two "
+                f"zenoh products and needs rmw='zenoh', not rmw={self.rmw!r}")
+        if (self.zenoh_bridge_local_dds != "cyclonedds"
+                and self.zenoh_flavor != "bridge"):
+            raise ValueError(
+                f"zenoh_bridge_local_dds={self.zenoh_bridge_local_dds!r} "
+                "applies only to zenoh_flavor='bridge' (rmw_zenoh_cpp has no "
+                "local DDS domain at all)")
         if self.zenoh_router_topology != "mesh" and self.rmw != "zenoh":
             raise ValueError(
                 f"zenoh_router_topology={self.zenoh_router_topology!r} is zenoh "

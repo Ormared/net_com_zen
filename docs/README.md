@@ -22,3 +22,8 @@ See also [emane_spike/FINDINGS.md](../emane_spike/FINDINGS.md) for the full spik
   satellite, live link quality) + AoI/PDR panels, with A/B compare mode.
 - A/B result write-ups in [results/](results/): transport (TCP vs UDP), sync
   (delta vs state).
+
+## Results
+
+- [results/dds-summary.md](results/dds-summary.md) — **start here** for the
+  DDS/RMW track: which RMW to use where, in one page.
